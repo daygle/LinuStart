@@ -1,0 +1,49 @@
+version: 2
+registries:
+  pypi:
+    type: pip
+    url: https://pypi.org/simple
+
+updates:
+  # Python: the panel itself plus the dev tooling. pip and setuptools get
+  # weekly churn; the web stack is pinned to the major.
+  - package-ecosystem: "pip"
+    directory: "/"
+    registry: "pypi"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      pip-security:
+        applies-to: security-updates
+        update-types:
+          - "patch"
+      pip-minor-and-major:
+        applies-to: "version-updates"
+        exclude-patterns: []
+    ignore:
+      - dependency-name: "setuptools"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # JavaScript: the panel's only web dependency is websockets, but keep the
+  # tooling that lints and builds the panel current.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+
+  # OS packages: the Debian family targets these utilities, so security
+  # fixes for them land first.
+  - package-ecosystem: "deb"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    ignore:
+      - dependency-name: "unattended-upgrades"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "iproute2"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
