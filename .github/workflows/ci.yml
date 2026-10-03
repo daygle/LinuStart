@@ -48,3 +48,18 @@ jobs:
       - name: Confirm the installed package actually imports
         run: |
           .venv/Scripts/python -c "import linustart.updater, linustart.modules.cron, linustart.modules.sysctl; print('imports ok')"
+
+  # The shell always returns the status of the last command in the pipeline,
+  # so a failing earlier step is reported here as a failing gate.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - name: Confirm the gate
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "CI failed: the test and static-check steps above did not pass"
+            exit 1
+          fi
+          echo "OK: tests and static checks passed"
