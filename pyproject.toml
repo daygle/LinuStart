@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    "websockets>=12",  # WebSocket support for the web terminal (uvicorn ws protocol)
     "PyYAML>=6.0",
 ]
 

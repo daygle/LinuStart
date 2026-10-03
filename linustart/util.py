@@ -40,13 +40,16 @@ async def run(
 ) -> CmdResult:
     """Run a command and capture its output."""
     merged = {**os.environ, **dict(env or {})}
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-        env=merged,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
+            env=merged,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"could not run {argv[0]}: {exc}")
     payload = input_text.encode("utf-8") if input_text is not None else None
     try:
         out, err = await asyncio.wait_for(proc.communicate(input=payload), timeout=timeout)
