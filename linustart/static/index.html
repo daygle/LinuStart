@@ -13,11 +13,17 @@
       <nav id="nav">
         <button class="nav-item active" data-view="overview">Overview</button>
         <button class="nav-item" data-view="network">Networking</button>
+        <button class="nav-item" data-view="firewall">Firewall</button>
+        <button class="nav-item" data-view="ssh">SSH Hardening</button>
         <button class="nav-item" data-view="system">Hostname &amp; Time</button>
         <button class="nav-item" data-view="updates">Unattended Updates</button>
         <button class="nav-item" data-view="email">Email</button>
         <button class="nav-item" data-view="users">Users</button>
+        <button class="nav-item" data-view="services">Services</button>
         <button class="nav-item" data-view="software">Software</button>
+        <button class="nav-item" data-view="storage">Storage</button>
+        <button class="nav-item" data-view="logs">Logs &amp; Processes</button>
+        <button class="nav-item" data-view="terminal">Terminal</button>
         <button class="nav-item" data-view="jobs">Jobs</button>
         <button class="nav-item" data-view="audit">Audit Log</button>
       </nav>
@@ -115,17 +121,46 @@
                 </select>
               </label>
               <label class="switch-row">
+                <input type="checkbox" id="uu-download"> <span>Download upgrades in advance</span>
+              </label>
+              <label>Cache cleanup interval (days) <span class="muted">(0 disables autoclean)</span>
+                <input type="number" id="uu-autoclean" min="0" max="365" step="1" placeholder="7">
+              </label>
+              <h2 class="spaced">Reboot</h2>
+              <label class="switch-row">
                 <input type="checkbox" id="uu-reboot"> <span>Reboot automatically when required</span>
               </label>
               <label>Reboot time (HH:MM)
                 <input type="text" id="uu-reboot-time" placeholder="02:00" maxlength="5">
               </label>
               <label class="switch-row">
+                <input type="checkbox" id="uu-reboot-users"> <span>Reboot even when users are logged in</span>
+              </label>
+              <h2 class="spaced">Cleanup &amp; Recovery</h2>
+              <label class="switch-row">
                 <input type="checkbox" id="uu-remove-unused"> <span>Remove unused kernel packages</span>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="uu-remove-new-deps"> <span>Remove newly unused dependencies</span>
               </label>
               <label class="switch-row">
                 <input type="checkbox" id="uu-remove-deps"> <span>Remove unused dependencies</span>
               </label>
+              <label class="switch-row">
+                <input type="checkbox" id="uu-fix-dpkg"> <span>Auto-fix an interrupted dpkg</span>
+              </label>
+              <h2 class="spaced">Email Reports</h2>
+              <label>Send reports to <span class="muted">(leave empty to use the from address from the Email page)</span>
+                <input type="text" id="uu-report-to" placeholder="admin@example.com or root" autocomplete="off">
+              </label>
+              <label>Report frequency
+                <select id="uu-report-mode">
+                  <option value="only-on-error">Only on error</option>
+                  <option value="on-change">On every change</option>
+                  <option value="always">Always</option>
+                </select>
+              </label>
+              <p class="muted">Reports are delivered through the SMTP relay on the Email page, from the mail account configured there. "Only on error" mails you when an upgrade run fails. A local name like <code>root</code> delivers on this machine.</p>
               <div class="form-row">
                 <button class="btn btn-primary" type="submit">Save settings</button>
                 <button class="btn" type="button" id="uu-dry-run">Run dry run</button>
@@ -133,9 +168,27 @@
             </form>
           </div>
           <div class="card">
-            <h2>Allowed Origins</h2>
-            <ul class="list" id="uu-origins"></ul>
-            <h2>Recent Activity</h2>
+            <h2>Upgrade Origins</h2>
+            <form id="uu-origins-form" class="form">
+              <label>Origins style
+                <select id="uu-origins-style">
+                  <option value="pattern">Origins-Pattern (recommended)</option>
+                  <option value="allowed">Allowed-Origins (legacy)</option>
+                </select>
+              </label>
+              <label>Origins <span class="muted">(one per line; third-party repos are never auto-upgraded unless listed)</span>
+                <textarea id="uu-origins" rows="6" spellcheck="false" placeholder="origin=Debian,codename=${distro_codename},label=Debian"></textarea>
+              </label>
+              <label>Package blacklist <span class="muted">(packages to never auto-upgrade, one per line)</span>
+                <textarea id="uu-blacklist" rows="3" spellcheck="false" placeholder="linux-image-generic"></textarea>
+              </label>
+              <div class="form-row">
+                <button class="btn btn-primary" type="submit">Save origins</button>
+              </div>
+            </form>
+            <h2 class="spaced">Configuration Files</h2>
+            <ul class="list" id="uu-files"></ul>
+            <h2 class="spaced">Recent Activity</h2>
             <pre class="log" id="uu-log"></pre>
           </div>
         </div>
@@ -144,12 +197,19 @@
       <!-- EMAIL -->
       <section class="view hidden" id="view-email">
         <div class="toolbar">
-          <span id="mail-status-badge" class="badge"></span>
-          <button class="btn hidden" id="mail-install" type="button">Install postfix</button>
+          <div class="form-row">
+            <span id="mail-status-badge" class="badge"></span>
+            <span class="muted" id="mail-transport"></span>
+          </div>
+          <div class="form-row">
+            <button class="btn btn-danger hidden" id="mail-remove-conflicts" type="button">Remove conflicting mailers</button>
+            <button class="btn hidden" id="mail-install" type="button">Install postfix</button>
+          </div>
         </div>
         <div class="cards">
           <div class="card">
             <h2>Mail Delivery (SMTP relay)</h2>
+            <p id="mail-msmtp-hint" class="muted hidden"></p>
             <form id="mail-form" class="form">
               <label>SMTP server (your mail server)
                 <input type="text" id="mail-host" placeholder="mail.example.com" autocomplete="off">
@@ -267,6 +327,25 @@
           </div>
         </div>
 
+        <h2 class="section-title">LinuStart Updates</h2>
+        <div class="cards">
+          <div class="card">
+            <h2>Panel Version</h2>
+            <div id="update-info" class="muted">Not checked yet.</div>
+            <div class="form-row">
+              <button class="btn" id="update-check" type="button">Check for updates</button>
+              <button class="btn btn-primary" id="update-install" type="button" disabled>Install update</button>
+              <button class="btn btn-danger" id="update-rollback" type="button">Roll back</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Latest Release</h2>
+            <div id="update-notes" class="muted">Check for updates to see release notes.</div>
+            <p class="muted"><a id="update-link" class="hidden" href="#" target="_blank" rel="noopener">Open the release page</a></p>
+            <p class="muted">Installing downloads the release from GitHub, backs up the current application to <code>/var/lib/linustart/backups</code>, re-installs it and restarts the panel a few seconds later. Roll back restores the most recent backup.</p>
+          </div>
+        </div>
+
         <h2 class="section-title">APT Maintenance</h2>
         <div class="cards">
           <div class="card">
@@ -288,6 +367,202 @@
             <h2>Autoremove Candidates</h2>
             <ul class="list" id="apt-autoremove-list"></ul>
           </div>
+        </div>
+      </section>
+
+      <!-- FIREWALL -->
+      <section class="view hidden" id="view-firewall">
+        <div class="toolbar">
+          <div class="form-row">
+            <span id="fw-backend" class="badge"></span>
+            <span id="fw-status" class="badge"></span>
+          </div>
+          <span class="muted">Every change is applied with a 90-second confirm-or-revert window.</span>
+        </div>
+        <div class="cards">
+          <div class="card">
+            <h2>Rules</h2>
+            <table class="table" id="fw-rules-table"></table>
+          </div>
+          <div class="card">
+            <h2>Add Rule</h2>
+            <form id="fw-rule-form" class="form">
+              <label>Action
+                <select id="fw-action"><option value="allow">Allow</option><option value="deny">Deny</option></select>
+              </label>
+              <label>Direction
+                <select id="fw-direction"><option value="in">Incoming</option><option value="out">Outgoing</option></select>
+              </label>
+              <label>Protocol
+                <select id="fw-protocol"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="any">Any</option></select>
+              </label>
+              <label>Port(s) <span class="muted">e.g. 22 or 80,443 or 8000:8100</span>
+                <input type="text" id="fw-port" placeholder="22" autocomplete="off">
+              </label>
+              <label>Address <span class="muted">source for incoming, destination for outgoing</span>
+                <input type="text" id="fw-address" placeholder="any or 10.0.0.0/8" autocomplete="off">
+              </label>
+              <button class="btn btn-primary" type="submit">Add rule (with auto-revert)</button>
+            </form>
+            <h2 class="spaced">Default Policies</h2>
+            <form id="fw-policy-form" class="form">
+              <label>Incoming
+                <select id="fw-incoming"><option value="deny">Deny</option><option value="allow">Allow</option></select>
+              </label>
+              <label>Outgoing
+                <select id="fw-outgoing"><option value="allow">Allow</option><option value="deny">Deny</option></select>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="fw-enabled"> <span>Firewall enabled</span>
+              </label>
+              <p class="muted">When switching incoming to deny, an allow rule for the SSH port is added automatically if none exists.</p>
+              <button class="btn btn-primary" type="submit">Apply policies (with auto-revert)</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- SSH -->
+      <section class="view hidden" id="view-ssh">
+        <div class="toolbar">
+          <div class="form-row">
+            <span id="ssh-badge" class="badge"></span>
+            <span id="ssh-validation" class="badge"></span>
+          </div>
+          <span class="muted">Settings are validated with <code>sshd -t</code> and auto-revert after 90 seconds.</span>
+        </div>
+        <div class="cards">
+          <div class="card">
+            <h2>Access</h2>
+            <form id="ssh-form" class="form">
+              <label>Port
+                <input type="text" id="ssh-port" placeholder="22" maxlength="5">
+              </label>
+              <label>PermitRootLogin
+                <select id="ssh-root-login">
+                  <option value="prohibit-password">prohibit-password (keys only)</option>
+                  <option value="yes">yes</option>
+                  <option value="without-password">without-password</option>
+                  <option value="no">no</option>
+                </select>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="ssh-password-auth"> <span>Password authentication</span>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="ssh-pubkey-auth"> <span>Public key authentication</span>
+              </label>
+              <p class="muted">Turning off both password and key auth locks everyone out — the panel validates the config, but you still confirm the change within 90 seconds.</p>
+            </form>
+          </div>
+          <div class="card">
+            <h2>Hardening</h2>
+            <form id="ssh-extra-form" class="form">
+              <label class="switch-row">
+                <input type="checkbox" id="ssh-x11"> <span>X11 forwarding</span>
+              </label>
+              <label>Max auth tries
+                <input type="text" id="ssh-max-auth" placeholder="6" maxlength="2">
+              </label>
+              <label>Client alive interval (seconds)
+                <input type="text" id="ssh-alive-interval" placeholder="0" maxlength="5">
+              </label>
+              <label>Client alive count max
+                <input type="text" id="ssh-alive-count" placeholder="3" maxlength="2">
+              </label>
+              <button class="btn btn-primary" type="submit">Apply hardening (with auto-revert)</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- SERVICES -->
+      <section class="view hidden" id="view-services">
+        <div class="toolbar">
+          <div class="form-row">
+            <input type="text" id="svc-filter" class="input-wide" placeholder="Filter services…">
+            <button class="btn" id="svc-refresh">Refresh</button>
+          </div>
+          <span class="muted" id="svc-count"></span>
+        </div>
+        <div class="card">
+          <table class="table" id="svc-table"></table>
+        </div>
+      </section>
+
+      <!-- STORAGE -->
+      <section class="view hidden" id="view-storage">
+        <div class="cards">
+          <div class="card">
+            <h2>Filesystems</h2>
+            <table class="table" id="disk-table"></table>
+          </div>
+        </div>
+        <h2 class="section-title">Directory Sizes</h2>
+        <div class="card">
+          <form id="du-form" class="form form-inline">
+            <input type="text" id="du-path" placeholder="/var" autocomplete="off">
+            <button class="btn btn-primary" type="submit">Scan</button>
+            <span class="muted" id="du-status">Scans run as a background job and list one directory level at a time.</span>
+          </form>
+          <table class="table" id="du-table"></table>
+        </div>
+      </section>
+
+      <!-- LOGS & PROCESSES -->
+      <section class="view hidden" id="view-logs">
+        <div class="toolbar">
+          <div class="tabs" id="logs-tabs">
+            <button class="tab active" data-tab="journal">System Logs</button>
+            <button class="tab" data-tab="processes">Processes</button>
+          </div>
+        </div>
+        <div class="card tab-panel" id="tab-journal">
+          <form id="log-form" class="form form-inline">
+            <select id="log-source"></select>
+            <input type="text" id="log-unit" placeholder="unit filter (e.g. ssh.service)" autocomplete="off">
+            <select id="log-priority">
+              <option value="">any priority</option>
+              <option value="err">err and worse</option>
+              <option value="warning">warning and worse</option>
+              <option value="info">info and worse</option>
+              <option value="debug">debug</option>
+            </select>
+            <select id="log-lines">
+              <option value="100">100 lines</option>
+              <option value="250" selected>250 lines</option>
+              <option value="500">500 lines</option>
+              <option value="1000">1000 lines</option>
+            </select>
+            <button class="btn btn-primary" type="submit">Load</button>
+          </form>
+          <pre class="log log-tall" id="log-output">Select a source and press Load.</pre>
+        </div>
+        <div class="card tab-panel hidden" id="tab-processes">
+          <div class="form-row">
+            <select id="proc-sort"><option value="cpu">Sort by CPU</option><option value="mem">Sort by memory</option></select>
+            <button class="btn" id="proc-refresh">Refresh</button>
+            <span class="muted" id="proc-count"></span>
+          </div>
+          <table class="table" id="proc-table"></table>
+        </div>
+      </section>
+
+      <!-- TERMINAL -->
+      <section class="view hidden" id="view-terminal">
+        <div class="toolbar">
+          <div class="form-row">
+            <label class="muted">Run as
+              <select id="term-user"></select>
+            </label>
+            <button class="btn btn-primary" id="term-connect">Connect</button>
+            <button class="btn" id="term-disconnect">Disconnect</button>
+          </div>
+          <span class="muted" id="term-status">Not connected</span>
+        </div>
+        <div class="card">
+          <pre class="term" id="term-screen" tabindex="0"></pre>
+          <p class="muted">Click the terminal and start typing. Every session is recorded to <code>/var/lib/linustart/terminal/</code> and noted in the audit log.</p>
         </div>
       </section>
 
@@ -362,6 +637,19 @@
             </label>
             <button class="btn" type="submit">Set password</button>
           </form>
+          <h2 class="spaced">Password Aging</h2>
+          <form id="user-aging-form" class="form">
+            <label>Maximum password age (days)
+              <input type="text" id="aging-max-days" placeholder="90" maxlength="5">
+            </label>
+            <label>Warning before expiry (days)
+              <input type="text" id="aging-warn-days" placeholder="14" maxlength="2">
+            </label>
+            <label>Account expires (YYYY-MM-DD or never)
+              <input type="text" id="aging-expiry" placeholder="never" autocomplete="off">
+            </label>
+            <button class="btn" type="submit">Save aging policy</button>
+          </form>
         </div>
         <div class="card">
           <h2>SSH Keys</h2>
@@ -372,6 +660,17 @@
             </label>
             <button class="btn" type="submit">Add key</button>
           </form>
+          <h2 class="spaced">Sudo Rule</h2>
+          <label class="switch-row">
+            <input type="checkbox" id="sudo-nopasswd"> <span>Passwordless sudo (NOPASSWD)</span>
+          </label>
+          <div class="form-row">
+            <button class="btn" id="sudo-save" type="button">Install sudo rule</button>
+            <button class="btn btn-danger" id="sudo-remove" type="button">Remove sudo rule</button>
+          </div>
+          <p class="muted" id="sudo-status"></p>
+          <h2 class="spaced">Login History</h2>
+          <table class="table" id="user-history-table"></table>
           <h2 class="spaced">Danger Zone</h2>
           <label class="switch-row">
             <input type="checkbox" id="delete-remove-home"> <span>Also delete home directory and mail</span>
@@ -379,6 +678,26 @@
           <button class="btn btn-danger" id="user-delete" type="button">Delete this user</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Service detail modal -->
+  <div id="service-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 id="service-modal-title">Service</h2>
+        <button class="btn btn-ghost" id="service-modal-close">Close</button>
+      </div>
+      <div class="muted" id="service-modal-meta"></div>
+      <div class="form-row">
+        <button class="btn" data-svc-action="start">Start</button>
+        <button class="btn" data-svc-action="stop">Stop</button>
+        <button class="btn" data-svc-action="restart">Restart</button>
+        <button class="btn" data-svc-action="enable">Enable</button>
+        <button class="btn" data-svc-action="disable">Disable</button>
+      </div>
+      <h2 class="spaced">Recent Journal</h2>
+      <pre class="log log-tall" id="service-modal-log"></pre>
     </div>
   </div>
 

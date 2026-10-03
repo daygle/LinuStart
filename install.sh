@@ -61,6 +61,25 @@ if ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
+echo "==> Checking for conflicting mail transfer agents"
+# LinuStart delivers mail through Postfix; other MTAs that provide 'sendmail'
+# (msmtp-mta, ssmtp, nullmailer, exim4, ...) would silently swallow reports.
+# Client-only packages like plain 'msmtp' are harmless and left alone.
+CONFLICTS=""
+for pkg in msmtp-mta ssmtp nullmailer exim4 exim4-base exim4-daemon-heavy exim4-daemon-light sendmail-bin dma; do
+    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+        CONFLICTS="$CONFLICTS $pkg"
+    fi
+done
+if [[ -n "$CONFLICTS" ]]; then
+    echo "    Found:$CONFLICTS"
+    echo "    These provide their own 'sendmail' and compete with LinuStart's recommended"
+    echo "    Postfix setup. They are left in place for now so mail keeps working."
+    echo "    The LinuStart Email page imports /etc/msmtprc, switches delivery to Postfix"
+    echo "    in one step (password picked up from the msmtp password file), and offers"
+    echo "    to remove these packages once Postfix is active."
+fi
+
 echo "==> Installing system dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq

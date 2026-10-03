@@ -14,6 +14,12 @@ const state = {
   installed: [],
   shells: [],
   editUser: null,
+  svcEdit: null,
+  logFiles: [],
+  duJob: null,
+  duTimer: null,
+  updateChecked: false,
+  updateTag: "",
 };
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -112,11 +118,17 @@ $("#logout").addEventListener("click", () => {
 const TITLES = {
   overview: "Overview",
   network: "Networking",
+  firewall: "Firewall",
+  ssh: "SSH Hardening",
   system: "Hostname & Time",
   updates: "Unattended Updates",
   email: "Email",
   users: "Users",
+  services: "Services",
   software: "Software",
+  storage: "Storage",
+  logs: "Logs & Processes",
+  terminal: "Terminal",
   jobs: "Jobs",
   audit: "Audit Log",
 };
@@ -124,11 +136,17 @@ const TITLES = {
 const LOADERS = {
   overview: loadOverview,
   network: loadNetwork,
+  firewall: loadFirewall,
+  ssh: loadSsh,
   system: loadSystem,
   updates: loadUpdates,
   email: loadMail,
   users: loadUsers,
+  services: loadServices,
   software: loadSoftware,
+  storage: loadStorage,
+  logs: loadLogsView,
+  terminal: loadTerminal,
   jobs: loadJobs,
   audit: loadAudit,
 };
@@ -272,7 +290,7 @@ function startRevertBar(session) {
   const bar = $("#revert-bar");
   bar.classList.remove("hidden");
   $("#revert-text").textContent =
-    `Network changes applied to ${session.interface}. Confirm to keep them — otherwise they revert automatically.`;
+    `Changes applied (${session.label || "system"}). Confirm to keep them — otherwise they revert automatically.`;
   let left = session.seconds_left;
   const tick = () => {
     $("#revert-countdown").textContent = `revert in ${left}s`;
@@ -286,8 +304,8 @@ function startRevertBar(session) {
 $("#revert-confirm").addEventListener("click", async () => {
   if (!state.session) return;
   try {
-    await api(`/network/sessions/${state.session.id}/confirm`, { method: "POST" });
-    toast("Network configuration saved", "success");
+    await api(`/sessions/${state.session.id}/confirm`, { method: "POST" });
+    toast("Configuration saved", "success");
   } catch (err) {
     toast(err.message, "error");
   }
@@ -297,13 +315,13 @@ $("#revert-confirm").addEventListener("click", async () => {
 $("#revert-discard").addEventListener("click", async () => {
   if (!state.session) return;
   try {
-    await api(`/network/sessions/${state.session.id}/revert`, { method: "POST" });
-    toast("Network changes reverted", "info");
+    await api(`/sessions/${state.session.id}/revert`, { method: "POST" });
+    toast("Changes reverted", "info");
   } catch (err) {
     toast(err.message, "error");
   }
   hideRevertBar();
-  loadNetwork();
+  loadView();
 });
 
 /* ----------------------------------------------------------------- system */
@@ -354,12 +372,22 @@ async function loadUpdates() {
   $("#uu-warning").classList.toggle("hidden", data.package_installed !== false);
   $("#uu-enabled").checked = !!data.enabled;
   $("#uu-frequency").value = String(data.update_frequency_days || "1");
+  $("#uu-download").checked = data.download_upgradeable_packages !== false;
+  $("#uu-autoclean").value = String(data.autoclean_interval ?? "0");
   $("#uu-reboot").checked = !!data.auto_reboot;
   $("#uu-reboot-time").value = data.auto_reboot_time || "";
+  $("#uu-reboot-users").checked = data.auto_reboot_withusers !== false;
   $("#uu-remove-unused").checked = data.remove_unused !== false;
+  $("#uu-remove-new-deps").checked = data.remove_new_unused_dependencies !== false;
   $("#uu-remove-deps").checked = !!data.remove_unused_dependencies;
-  $("#uu-origins").innerHTML = (data.allowed_origins || []).map((o) => `<li><code>${esc(o)}</code></li>`).join("")
-    || "<li class='muted'>No Allowed-Origins configured</li>";
+  $("#uu-fix-dpkg").checked = data.auto_fix_interrupted_dpkg !== false;
+  $("#uu-report-to").value = data.report_to || "";
+  $("#uu-report-mode").value = data.report_mode || "only-on-error";
+  $("#uu-origins-style").value = data.origins_style || "pattern";
+  $("#uu-origins").value = (data.origins || []).join("\n");
+  $("#uu-blacklist").value = (data.package_blacklist || []).join("\n");
+  $("#uu-files").innerHTML = Object.values(data.files || {})
+    .map((f) => `<li><code>${esc(f)}</code></li>`).join("");
   $("#uu-log").textContent = (data.log || []).slice(-60).join("\n") || "No unattended-upgrades activity yet.";
 }
 
@@ -371,13 +399,37 @@ $("#updates-form").addEventListener("submit", async (event) => {
       body: {
         enabled: $("#uu-enabled").checked,
         update_frequency_days: $("#uu-frequency").value,
+        download_upgradeable_packages: $("#uu-download").checked,
+        autoclean_interval: $("#uu-autoclean").value.trim(),
         auto_reboot: $("#uu-reboot").checked,
         auto_reboot_time: $("#uu-reboot-time").value.trim(),
+        auto_reboot_withusers: $("#uu-reboot-users").checked,
         remove_unused: $("#uu-remove-unused").checked,
+        remove_new_unused_dependencies: $("#uu-remove-new-deps").checked,
         remove_unused_dependencies: $("#uu-remove-deps").checked,
+        auto_fix_interrupted_dpkg: $("#uu-fix-dpkg").checked,
+        report_to: $("#uu-report-to").value.trim(),
+        report_mode: $("#uu-report-mode").value,
       },
     });
     toast("Unattended updates configuration saved", "success");
+    loadUpdates();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#uu-origins-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const lines = (value) => value.split("\n").map((s) => s.trim()).filter(Boolean);
+  try {
+    await api("/updates", {
+      method: "POST",
+      body: {
+        origins_style: $("#uu-origins-style").value,
+        origins: lines($("#uu-origins").value),
+        package_blacklist: lines($("#uu-blacklist").value),
+      },
+    });
+    toast("Upgrade origins saved", "success");
     loadUpdates();
   } catch (err) { toast(err.message, "error"); }
 });
@@ -420,6 +472,36 @@ async function loadMail() {
   $("#mail-report-to").value = data.report_to || "";
   $("#mail-report-mode").value = data.report_mode || "only-on-error";
   $("#mail-password-hint").textContent = data.credentials_set ? "(password on file)" : "";
+  const msmtp = data.msmtp || {};
+  const msmtpHint = $("#mail-msmtp-hint");
+  if (msmtp.detected && !data.relayhost) {
+    msmtpHint.classList.remove("hidden");
+    msmtpHint.textContent =
+      "Existing msmtp configuration found — the form is pre-filled from /etc/msmtprc. " +
+      (msmtp.password_available
+        ? "Leave the password blank and the msmtp password file is used automatically. "
+        : "") +
+      "After saving, use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
+    $("#mail-host").value = msmtp.host || $("#mail-host").value;
+    $("#mail-port").value = msmtp.port || $("#mail-port").value;
+    $("#mail-security").value = msmtp.security || $("#mail-security").value;
+    $("#mail-username").value = msmtp.username || $("#mail-username").value;
+    if (!$("#mail-from").value) $("#mail-from").value = msmtp.from_address || "";
+  } else {
+    msmtpHint.classList.add("hidden");
+  }
+  const mailer = data.mailer || {};
+  const conflicts = mailer.conflicts || [];
+  const transport = $("#mail-transport");
+  let transportText = mailer.sendmail
+    ? `sendmail provided by ${mailer.sendmail_provider} (${mailer.sendmail})`
+    : "no sendmail provider found";
+  if (conflicts.length) transportText += ` · conflicts with: ${conflicts.join(", ")}`;
+  if (mailer.msmtp_client && !conflicts.length) {
+    transportText += " · msmtp client present (not used for delivery, left untouched)";
+  }
+  transport.textContent = transportText;
+  $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
   $("#mail-summary").textContent = data.relayhost
     ? `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "—"} (sender domain ${data.myorigin || "—"}).`
     : "No relay configured yet.";
@@ -461,6 +543,17 @@ $("#mail-install").addEventListener("click", async () => {
   try {
     const job = await api("/mail/install", { method: "POST" });
     toast("Installing postfix…", "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#mail-remove-conflicts").addEventListener("click", async () => {
+  if (!window.confirm(
+    "Remove the conflicting mail transfer agent(s)? Postfix (or its installer) will handle mail delivery afterwards. Their config files are kept.",
+  )) return;
+  try {
+    const job = await api("/mail/remove-conflicts", { method: "POST" });
+    toast("Removing conflicting mailers…", "success");
     openJob(job.id);
   } catch (err) { toast(err.message, "error"); }
 });
@@ -507,7 +600,40 @@ async function openUser(name) {
     $("#edit-key").value = "";
     renderKeys(data.keys || []);
     $("#user-modal").classList.remove("hidden");
+    loadUserDepth(name);
   } catch (err) { toast(err.message, "error"); }
+}
+
+async function loadUserDepth(name) {
+  try {
+    const data = await api(`/users/${encodeURIComponent(name)}/aging`);
+    const aging = data.aging || {};
+    $("#aging-max-days").value = aging.max_days || "";
+    $("#aging-warn-days").value = aging.warn_days || "";
+    $("#aging-expiry").value = aging.account_expires || "never";
+  } catch (err) { /* non-fatal */ }
+  try {
+    const data = await api(`/users/${encodeURIComponent(name)}/history?limit=15`);
+    const rows = (data.entries || []).map((entry) => `
+      <tr>
+        <td class="muted">${esc(entry.login)}</td>
+        <td><code>${esc(entry.terminal)}</code></td>
+        <td class="muted">${esc(entry.source || "local")}</td>
+        <td><span class="badge ${entry.status === "logged in" ? "ok" : "muted"}">${esc(entry.status)}</span></td>
+        <td class="muted">${esc(entry.duration || "")}</td>
+      </tr>`).join("");
+    $("#user-history-table").innerHTML = `
+      <thead><tr><th>When</th><th>Terminal</th><th>From</th><th>Status</th><th>Duration</th></tr></thead>
+      <tbody>${rows || "<tr><td colspan='5' class='muted'>No logins recorded</td></tr>"}</tbody>`;
+  } catch (err) { /* non-fatal */ }
+  try {
+    const data = await api("/sudoers");
+    const hit = (data.dropins || []).find((d) => d.managed && d.user === name);
+    $("#sudo-nopasswd").checked = !!(hit && hit.nopasswd);
+    $("#sudo-status").textContent = hit
+      ? `Sudo rule installed in ${hit.file} (${hit.nopasswd ? "NOPASSWD" : "password required"}).`
+      : "No panel-managed sudo rule (this user may still sudo via the sudo group).";
+  } catch (err) { /* non-fatal */ }
 }
 
 function renderKeys(keys) {
@@ -607,6 +733,45 @@ $("#user-keys-table").addEventListener("click", async (event) => {
   } catch (err) { toast(err.message, "error"); }
 });
 
+$("#user-aging-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.editUser) return;
+  const maxDays = $("#aging-max-days").value.trim();
+  const warnDays = $("#aging-warn-days").value.trim();
+  try {
+    await api(`/users/${encodeURIComponent(state.editUser)}/aging`, {
+      method: "POST",
+      body: {
+        max_days: maxDays === "" ? null : parseInt(maxDays, 10),
+        warn_days: warnDays === "" ? null : parseInt(warnDays, 10),
+        expiry: $("#aging-expiry").value.trim() || null,
+      },
+    });
+    toast("Password aging updated", "success");
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#sudo-save").addEventListener("click", async () => {
+  if (!state.editUser) return;
+  try {
+    await api(`/sudoers/${encodeURIComponent(state.editUser)}`, {
+      method: "POST",
+      body: { nopasswd: $("#sudo-nopasswd").checked },
+    });
+    toast("Sudo rule installed", "success");
+    loadUserDepth(state.editUser);
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#sudo-remove").addEventListener("click", async () => {
+  if (!state.editUser) return;
+  try {
+    await api(`/sudoers/${encodeURIComponent(state.editUser)}`, { method: "DELETE" });
+    toast("Sudo rule removed", "info");
+    loadUserDepth(state.editUser);
+  } catch (err) { toast(err.message, "error"); }
+});
+
 $("#user-delete").addEventListener("click", async () => {
   if (!state.editUser) return;
   const removeHome = $("#delete-remove-home").checked;
@@ -626,7 +791,7 @@ $("#software-tabs").addEventListener("click", (event) => {
   const tab = event.target.closest(".tab");
   if (!tab) return;
   $$("#software-tabs .tab").forEach((t) => t.classList.toggle("active", t === tab));
-  $$(".tab-panel").forEach((panel) => panel.classList.add("hidden"));
+  $$("#view-software .tab-panel").forEach((panel) => panel.classList.add("hidden"));
   $(`#tab-${tab.dataset.tab}`).classList.remove("hidden");
 });
 
@@ -660,7 +825,65 @@ async function loadSoftware() {
     <tbody>${(upgradable.packages || []).map((p) => pkgRow(p, "Install", "btn-primary")).join("")
       || "<tr><td colspan='4' class='muted'>System is up to date</td></tr>"}</tbody>`;
   renderInstalled();
+  if (!state.updateChecked) checkUpdate();
 }
+
+/* ------------------------------------------------------ linustart updates */
+
+async function checkUpdate() {
+  const info = $("#update-info");
+  info.textContent = "Checking GitHub…";
+  try {
+    const data = await api("/update/check");
+    state.updateChecked = true;
+    state.updateTag = data.tag || "";
+    if (data.no_releases) {
+      info.innerHTML =
+        `Installed: <code>${esc(data.current)}</code> <span class="badge muted">no releases yet</span>` +
+        `<br><span class="muted">${esc(data.detail || "")} — publish a GitHub release (e.g. v0.2.0) to enable in-panel updates.</span>`;
+      $("#update-install").disabled = true;
+      return;
+    }
+    info.innerHTML =
+      `Installed: <code>${esc(data.current)}</code> · Latest: <code>${esc(data.latest)}</code> ` +
+      (data.newer_available
+        ? '<span class="badge warn">update available</span>'
+        : '<span class="badge ok">up to date</span>') +
+      (data.update_supported
+        ? ""
+        : '<br><span class="muted">Source checkout — updates apply to install.sh installs; use git pull here.</span>');
+    $("#update-install").disabled = !data.newer_available || !data.update_supported;
+    $("#update-notes").textContent = data.notes || "This release has no notes.";
+    const link = $("#update-link");
+    if (data.release_url) {
+      link.href = data.release_url;
+      link.classList.remove("hidden");
+    }
+  } catch (err) {
+    info.textContent = err.message;
+    $("#update-install").disabled = true;
+  }
+}
+
+$("#update-check").addEventListener("click", checkUpdate);
+
+$("#update-install").addEventListener("click", async () => {
+  if (!window.confirm("Install the update and restart the panel? The panel is unreachable for a few seconds during the restart.")) return;
+  try {
+    const job = await api("/update/install", { method: "POST", body: { tag: state.updateTag } });
+    toast("Update started", "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#update-rollback").addEventListener("click", async () => {
+  if (!window.confirm("Roll back to the most recent application backup and restart the panel?")) return;
+  try {
+    const job = await api("/update/rollback", { method: "POST" });
+    toast("Rollback started", "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
 
 function renderInstalled(filter = "") {
   const needle = filter.toLowerCase();
@@ -825,6 +1048,520 @@ async function loadAudit() {
   $("#audit-table").innerHTML = `
     <thead><tr><th>Time</th><th>Action</th><th>Detail</th><th>Result</th></tr></thead>
     <tbody>${rows || "<tr><td colspan='4' class='muted'>Nothing recorded yet</td></tr>"}</tbody>`;
+}
+
+/* ------------------------------------------------------------------- init */
+
+/* --------------------------------------------------------------- firewall */
+
+async function loadFirewall() {
+  const data = await api("/firewall");
+  $("#fw-backend").textContent = `backend: ${data.backend}`;
+  const status = $("#fw-status");
+  status.textContent = data.enabled ? "enabled" : "disabled";
+  status.className = `badge ${data.enabled ? "ok" : "warn"}`;
+  $("#fw-incoming").value = data.default_incoming || "deny";
+  $("#fw-outgoing").value = data.default_outgoing || "allow";
+  $("#fw-enabled").checked = !!data.enabled;
+  const rows = (data.rules || []).map((rule, index) => {
+    const target = rule.to
+      ? `<code>${esc(rule.to)}</code>`
+      : `<code>${esc((rule.protocol === "any" ? "all" : rule.protocol) + (rule.port ? `/${rule.port}` : ""))}</code>`;
+    const side = rule.direction === "out" ? "to" : "from";
+    const address = rule.to ? rule.from : rule.address;
+    return `<tr>
+      <td><span class="badge">${rule.direction === "out" ? "out" : "in"}</span></td>
+      <td><span class="badge ${rule.action === "allow" ? "ok" : "danger"}">${esc(rule.action)}</span></td>
+      <td>${target}</td>
+      <td class="muted">${side} ${esc(address || "any")}${rule.ipv6 ? " (v6)" : ""}</td>
+      <td><button class="btn btn-small btn-danger" data-fw-remove="${index}">Remove</button></td>
+    </tr>`;
+  }).join("");
+  $("#fw-rules-table").innerHTML = `
+    <thead><tr><th>Dir</th><th>Action</th><th>Target</th><th>Peer</th><th></th></tr></thead>
+    <tbody>${rows || "<tr><td colspan='5' class='muted'>No rules configured</td></tr>"}</tbody>`;
+}
+
+$("#fw-rules-table").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-fw-remove]");
+  if (!button) return;
+  if (!window.confirm("Remove this firewall rule?")) return;
+  try {
+    const result = await api(`/firewall/rules/${button.dataset.fwRemove}`, { method: "DELETE" });
+    toast("Rule removed — confirm within 90s to keep it", "success");
+    startRevertBar(result.session);
+    loadFirewall();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#fw-rule-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api("/firewall/rules", {
+      method: "POST",
+      body: {
+        action: $("#fw-action").value,
+        direction: $("#fw-direction").value,
+        protocol: $("#fw-protocol").value,
+        port: $("#fw-port").value.trim(),
+        address: $("#fw-address").value.trim() || "any",
+      },
+    });
+    toast("Rule added — confirm within 90s to keep it", "success");
+    startRevertBar(result.session);
+    $("#fw-rule-form").reset();
+    loadFirewall();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#fw-policy-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api("/firewall", {
+      method: "POST",
+      body: {
+        enabled: $("#fw-enabled").checked,
+        default_incoming: $("#fw-incoming").value,
+        default_outgoing: $("#fw-outgoing").value,
+      },
+    });
+    toast(
+      result.ssh_rule_added
+        ? "Policies applied — an SSH allow rule was added automatically"
+        : "Policies applied — confirm within 90s to keep them",
+      "success",
+    );
+    startRevertBar(result.session);
+    loadFirewall();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+/* --------------------------------------------------------------------- ssh */
+
+async function loadSsh() {
+  const data = await api("/ssh");
+  const typed = data.typed || {};
+  $("#ssh-port").value = typed.Port;
+  $("#ssh-root-login").value = typed.PermitRootLogin;
+  $("#ssh-password-auth").checked = !!typed.PasswordAuthentication;
+  $("#ssh-pubkey-auth").checked = !!typed.PubkeyAuthentication;
+  $("#ssh-x11").checked = !!typed.X11Forwarding;
+  $("#ssh-max-auth").value = typed.MaxAuthTries;
+  $("#ssh-alive-interval").value = typed.ClientAliveInterval;
+  $("#ssh-alive-count").value = typed.ClientAliveCountMax;
+  const badge = $("#ssh-badge");
+  badge.textContent = data.service_active === false ? "sshd not active" : "sshd active";
+  badge.className = `badge ${data.service_active === false ? "warn" : "ok"}`;
+  const validation = $("#ssh-validation");
+  validation.textContent = data.validation_error ? "config problem" : "config valid";
+  validation.className = `badge ${data.validation_error ? "danger" : "ok"}`;
+  validation.title = data.validation_error || "";
+}
+
+async function submitSsh(body, message) {
+  try {
+    const result = await api("/ssh", { method: "POST", body });
+    toast(message, "success");
+    startRevertBar(result.session);
+    loadSsh();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+$("#ssh-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitSsh(
+    {
+      port: parseInt($("#ssh-port").value.trim(), 10),
+      permit_root_login: $("#ssh-root-login").value,
+      password_authentication: $("#ssh-password-auth").checked,
+      pubkey_authentication: $("#ssh-pubkey-auth").checked,
+    },
+    "SSH access settings applied — confirm within 90s",
+  );
+});
+
+$("#ssh-extra-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitSsh(
+    {
+      x11_forwarding: $("#ssh-x11").checked,
+      max_auth_tries: parseInt($("#ssh-max-auth").value.trim(), 10),
+      client_alive_interval: parseInt($("#ssh-alive-interval").value.trim(), 10),
+      client_alive_count_max: parseInt($("#ssh-alive-count").value.trim(), 10),
+    },
+    "SSH hardening applied — confirm within 90s",
+  );
+});
+
+/* --------------------------------------------------------------- services */
+
+async function loadServices() {
+  const query = ($("#svc-filter").value || "").trim();
+  const data = await api(`/services?q=${encodeURIComponent(query)}`);
+  $("#svc-count").textContent = `${data.count} service(s)`;
+  const rows = (data.units || []).map((unit) => `
+    <tr>
+      <td><code>${esc(unit.unit)}</code></td>
+      <td><span class="badge ${unit.active === "active" ? "ok" : unit.active === "failed" ? "danger" : "muted"}">${esc(unit.active)}</span></td>
+      <td class="muted">${esc(unit.sub)}</td>
+      <td><span class="badge ${unit.enabled === "enabled" ? "ok" : "muted"}">${esc(unit.enabled)}</span></td>
+      <td class="muted">${esc(unit.description)}</td>
+      <td><button class="btn btn-small" data-svc-unit="${esc(unit.unit)}">Details</button></td>
+    </tr>`).join("");
+  $("#svc-table").innerHTML = `
+    <thead><tr><th>Unit</th><th>Active</th><th>Sub</th><th>On boot</th><th>Description</th><th></th></tr></thead>
+    <tbody>${rows || "<tr><td colspan='6' class='muted'>No services match</td></tr>"}</tbody>`;
+}
+
+$("#svc-filter").addEventListener("input", loadServices);
+$("#svc-refresh").addEventListener("click", loadServices);
+
+$("#svc-table").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-svc-unit]");
+  if (button) openService(button.dataset.svcUnit);
+});
+
+async function openService(unit) {
+  try {
+    const data = await api(`/services/${encodeURIComponent(unit)}`);
+    state.svcEdit = unit;
+    $("#service-modal-title").textContent = data.unit;
+    $("#service-modal-meta").textContent =
+      `${data.description} · ${data.active}/${data.sub} · ${data.enabled || "unknown"} · pid ${data.main_pid || "—"}`;
+    $("#service-modal-log").textContent = (data.journal || []).join("\n") || "No journal entries.";
+    $("#service-modal").classList.remove("hidden");
+  } catch (err) { toast(err.message, "error"); }
+}
+
+$("#service-modal-close").addEventListener("click", () => $("#service-modal").classList.add("hidden"));
+
+$("#service-modal").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-svc-action]");
+  if (!button || !state.svcEdit) return;
+  const action = button.dataset.svcAction;
+  if ((action === "stop" || action === "disable") && !window.confirm(`${action} ${state.svcEdit}?`)) return;
+  try {
+    const job = await api(`/services/${encodeURIComponent(state.svcEdit)}/action/${action}`, { method: "POST" });
+    toast(`${action} requested for ${state.svcEdit}`, "success");
+    $("#service-modal").classList.add("hidden");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
+
+/* ----------------------------------------------------------------- storage */
+
+async function loadStorage() {
+  const data = await api("/disk");
+  const rows = (data.filesystems || []).map((fs) => `
+    <tr>
+      <td><code>${esc(fs.source)}</code></td>
+      <td><code>${esc(fs.target)}</code></td>
+      <td class="muted">${esc(fs.fstype)}</td>
+      <td>${fs.percent}% · ${fmtBytes(fs.used)} / ${fmtBytes(fs.size)}</td>
+      <td class="muted">${fmtBytes(fs.avail)} free</td>
+    </tr>`).join("");
+  $("#disk-table").innerHTML = `
+    <thead><tr><th>Device</th><th>Mount</th><th>Type</th><th>Usage</th><th></th></tr></thead>
+    <tbody>${rows || "<tr><td colspan='5' class='muted'>No filesystems found</td></tr>"}</tbody>`;
+}
+
+$("#du-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const path = $("#du-path").value.trim();
+  if (!path) return;
+  try {
+    const job = await api("/disk/scan", { method: "POST", body: { path } });
+    state.duJob = job.id;
+    $("#du-status").textContent = `Scanning ${path}…`;
+    clearInterval(state.duTimer);
+    pollDu();
+    state.duTimer = setInterval(pollDu, 1500);
+  } catch (err) { toast(err.message, "error"); }
+});
+
+async function pollDu() {
+  if (!state.duJob) return;
+  try {
+    const data = await api(`/disk/usage/${state.duJob}`);
+    renderDu(data.entries);
+    if (data.job.status !== "running") {
+      clearInterval(state.duTimer);
+      $("#du-status").textContent = `Scan ${data.job.status} · ${data.entries.length} subdirectory(ies) listed.`;
+      state.duJob = null;
+    }
+  } catch (err) {
+    clearInterval(state.duTimer);
+    toast(err.message, "error");
+  }
+}
+
+function renderDu(entries) {
+  const rows = (entries || []).slice(0, 100).map((entry) => `
+    <tr>
+      <td><code>${esc(entry.path)}</code></td>
+      <td>${fmtBytes(entry.size)}</td>
+    </tr>`).join("");
+  $("#du-table").innerHTML = `
+    <thead><tr><th>Directory</th><th>Size</th></tr></thead>
+    <tbody>${rows || "<tr><td colspan='2' class='muted'>Nothing scanned yet</td></tr>"}</tbody>`;
+}
+
+/* ------------------------------------------------------- logs & processes */
+
+$("#logs-tabs").addEventListener("click", (event) => {
+  const tab = event.target.closest(".tab");
+  if (!tab) return;
+  $$("#logs-tabs .tab").forEach((t) => t.classList.toggle("active", t === tab));
+  $$("#view-logs .tab-panel").forEach((panel) => panel.classList.add("hidden"));
+  $(`#tab-${tab.dataset.tab}`).classList.remove("hidden");
+  if (tab.dataset.tab === "processes") loadProcesses();
+});
+
+async function loadLogsView() {
+  try {
+    const data = await api("/logs/files");
+    state.logFiles = data.files || [];
+  } catch (err) { state.logFiles = []; }
+  const current = $("#log-source").value;
+  $("#log-source").innerHTML =
+    '<option value="journal">journalctl (systemd)</option>' +
+    state.logFiles.map((f) => `<option value="file:${esc(f.name)}">/var/log/${esc(f.name)}</option>`).join("");
+  if (current) $("#log-source").value = current;
+  await loadJournal();
+}
+
+async function loadJournal() {
+  const source = $("#log-source").value || "journal";
+  const lines = $("#log-lines").value;
+  try {
+    let data;
+    if (source === "journal") {
+      const unit = encodeURIComponent($("#log-unit").value.trim());
+      const priority = encodeURIComponent($("#log-priority").value);
+      data = await api(`/logs/journal?lines=${lines}&unit=${unit}&priority=${priority}`);
+    } else {
+      const name = source.slice("file:".length);
+      data = await api(`/logs/files/${encodeURIComponent(name)}?lines=${lines}`);
+    }
+    $("#log-output").textContent = (data.lines || []).join("\n") || "No entries.";
+  } catch (err) { toast(err.message, "error"); }
+}
+
+$("#log-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadJournal();
+});
+
+async function loadProcesses() {
+  try {
+    const data = await api(`/processes?sort=${$("#proc-sort").value}`);
+    $("#proc-count").textContent = `${data.count} processes`;
+    const rows = (data.processes || []).slice(0, 200).map((p) => `
+      <tr>
+        <td><code>${p.pid}</code></td>
+        <td>${esc(p.user)}</td>
+        <td>${p.cpu.toFixed(1)}%</td>
+        <td>${p.mem.toFixed(1)}%</td>
+        <td class="muted">${fmtBytes(p.rss_kb * 1024)}</td>
+        <td class="muted">${esc(p.args)}</td>
+        <td>
+          <button class="btn btn-small" data-kill="${p.pid}" data-signal="TERM">TERM</button>
+          <button class="btn btn-small btn-danger" data-kill="${p.pid}" data-signal="KILL">KILL</button>
+        </td>
+      </tr>`).join("");
+    $("#proc-table").innerHTML = `
+      <thead><tr><th>PID</th><th>User</th><th>CPU</th><th>MEM</th><th>RSS</th><th>Command</th><th></th></tr></thead>
+      <tbody>${rows || "<tr><td colspan='7' class='muted'>No processes found</td></tr>"}</tbody>`;
+  } catch (err) { toast(err.message, "error"); }
+}
+
+$("#proc-refresh").addEventListener("click", loadProcesses);
+$("#proc-sort").addEventListener("change", loadProcesses);
+
+$("#proc-table").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-kill]");
+  if (!button) return;
+  const pid = button.dataset.kill;
+  if (!window.confirm(`Send SIG${button.dataset.signal} to PID ${pid}?`)) return;
+  try {
+    await api("/processes/kill", {
+      method: "POST",
+      body: { pid: parseInt(pid, 10), signal: button.dataset.signal },
+    });
+    toast(`SIG${button.dataset.signal} sent to PID ${pid}`, "success");
+    loadProcesses();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+/* ---------------------------------------------------------------- terminal */
+
+const term = { ws: null, cols: 100, rows: 30, lines: [""], cx: 0, cy: 0 };
+
+function termReset() {
+  term.lines = [""];
+  term.cx = 0;
+  term.cy = 0;
+}
+
+function termEnsureRow(row) {
+  while (term.lines.length <= row) term.lines.push("");
+}
+
+function termRender() {
+  const html = term.lines.map((line, index) => {
+    if (index === term.cy) {
+      return esc(line.slice(0, term.cx)) +
+        `<span class="term-cursor">${esc(line.charAt(term.cx) || " ")}</span>` +
+        esc(line.slice(term.cx + 1));
+    }
+    return esc(line);
+  }).join("\n");
+  const screen = $("#term-screen");
+  screen.innerHTML = html;
+  screen.scrollTop = screen.scrollHeight;
+}
+
+function termPutChar(ch) {
+  termEnsureRow(term.cy);
+  const line = term.lines[term.cy];
+  term.lines[term.cy] = term.cx < line.length
+    ? line.slice(0, term.cx) + ch + line.slice(term.cx + 1)
+    : line + " ".repeat(term.cx - line.length) + ch;
+  term.cx += 1;
+}
+
+function termCsi(args, cmd) {
+  const nums = (args || "").split(";").map((n) => parseInt(n, 10) || 0);
+  const n = nums[0] || 0;
+  const m = nums[1] || 0;
+  switch (cmd) {
+    case "H": case "f":
+      term.cy = Math.max(0, (n || 1) - 1);
+      term.cx = Math.max(0, (m || 1) - 1);
+      termEnsureRow(term.cy);
+      break;
+    case "A": term.cy = Math.max(0, term.cy - Math.max(1, n)); break;
+    case "B": term.cy += Math.max(1, n); termEnsureRow(term.cy); break;
+    case "C": term.cx += Math.max(1, n); break;
+    case "D": term.cx = Math.max(0, term.cx - Math.max(1, n)); break;
+    case "J":
+      if (n === 2 || n === 3) {
+        termReset();
+      } else if (n === 0) {
+        term.lines = term.lines.slice(0, term.cy + 1);
+        term.lines[term.cy] = (term.lines[term.cy] || "").slice(0, term.cx);
+      } else {
+        termEnsureRow(term.cy);
+        for (let row = 0; row < term.cy; row += 1) term.lines[row] = "";
+        term.lines[term.cy] = term.lines[term.cy].slice(term.cx);
+        term.cx = 0;
+      }
+      break;
+    case "K":
+      termEnsureRow(term.cy);
+      if (n === 0) term.lines[term.cy] = term.lines[term.cy].slice(0, term.cx);
+      else if (n === 1) term.lines[term.cy] = " ".repeat(term.cx) + term.lines[term.cy].slice(term.cx);
+      else term.lines[term.cy] = "";
+      break;
+    default:
+      break; /* colors and rare sequences are intentionally dropped */
+  }
+}
+
+function termFeed(text) {
+  let index = 0;
+  while (index < text.length) {
+    const ch = text[index];
+    if (ch === "\x1b") {
+      const rest = text.slice(index);
+      const csi = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(rest);
+      if (csi) { termCsi(csi[1], csi[2]); index += csi[0].length; continue; }
+      const osc = /^\x1b\][^\x07\x1b]*(\x07|\x1b\\)/.exec(rest);
+      if (osc) { index += osc[0].length; continue; }
+      const simple = /^\x1b[()#][A-Za-z0-9]|^\x1b[=>78MDEHc]/.exec(rest);
+      if (simple) { index += simple[0].length; continue; }
+      index += 1;
+      continue;
+    }
+    if (ch === "\r") term.cx = 0;
+    else if (ch === "\n") { term.cy += 1; termEnsureRow(term.cy); }
+    else if (ch === "\b") term.cx = Math.max(0, term.cx - 1);
+    else if (ch === "\t") term.cx = Math.ceil((term.cx + 1) / 8) * 8;
+    else if (ch >= " " && ch !== "\x7f") termPutChar(ch);
+    index += 1;
+  }
+  termRender();
+}
+
+function termConnect() {
+  if (term.ws) return;
+  const user = $("#term-user").value;
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  const params = new URLSearchParams({
+    token: state.token,
+    user,
+    cols: String(term.cols),
+    rows: String(term.rows),
+  });
+  termReset();
+  termRender();
+  const ws = new WebSocket(`${protocol}://${location.host}/api/terminal/ws?${params}`);
+  term.ws = ws;
+  $("#term-status").textContent = "Connecting…";
+  ws.onopen = () => {
+    $("#term-status").textContent = `Connected as ${user || "root"} (session recorded)`;
+    $("#term-screen").focus();
+  };
+  ws.onmessage = (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "output") termFeed(message.data);
+    else if (message.type === "closed") { $("#term-status").textContent = "Session closed"; term.ws = null; }
+    else if (message.type === "error") { toast(message.detail, "error"); termDisconnect(); }
+  };
+  ws.onclose = () => {
+    term.ws = null;
+    if ($("#term-status").textContent !== "Session closed") $("#term-status").textContent = "Disconnected";
+  };
+}
+
+function termDisconnect() {
+  if (term.ws) {
+    try { term.ws.send(JSON.stringify({ type: "close" })); } catch (err) { /* already gone */ }
+    term.ws.close();
+    term.ws = null;
+  }
+  $("#term-status").textContent = "Disconnected";
+}
+
+$("#term-connect").addEventListener("click", termConnect);
+$("#term-disconnect").addEventListener("click", termDisconnect);
+$("#term-screen").addEventListener("click", () => $("#term-screen").focus());
+$("#term-screen").addEventListener("keydown", (event) => {
+  if (!term.ws) return;
+  event.preventDefault();
+  const map = {
+    Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b",
+    ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D",
+    Home: "\x1b[H", End: "\x1b[F", PageUp: "\x1b[5~", PageDown: "\x1b[6~", Delete: "\x1b[3~",
+  };
+  let data = map[event.key];
+  if (!data && event.ctrlKey && event.key.length === 1) {
+    const code = event.key.toUpperCase().charCodeAt(0) - 64;
+    if (code >= 1 && code <= 26) data = String.fromCharCode(code);
+  }
+  if (!data && event.key.length === 1 && !event.ctrlKey && !event.metaKey) data = event.key;
+  if (data) term.ws.send(JSON.stringify({ type: "input", data }));
+});
+
+async function loadTerminal() {
+  try {
+    const data = await api("/users");
+    const current = $("#term-user").value;
+    $("#term-user").innerHTML = (data.users || [])
+      .map((u) => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join("");
+    if (current) $("#term-user").value = current;
+  } catch (err) { toast(err.message, "error"); }
+  $("#term-status").textContent = term.ws ? "Connected" : "Not connected";
 }
 
 /* ------------------------------------------------------------------- init */

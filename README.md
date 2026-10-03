@@ -30,10 +30,17 @@ what makes the same binary behave correctly on both Debian and Ubuntu.
 | **Networking** | Detects `netplan`, `NetworkManager` or `ifupdown`; DHCP ↔ static editing, gateway, DNS; **90-second auto-revert** so a bad change can't lock you out of SSH |
 | **Hostname** | `hostnamectl` + `/etc/hosts` kept in sync (`127.0.1.1` line) |
 | **Timezone / NTP** | `timedatectl` timezone picker (all tzdata names) and NTP toggle |
-| **Unattended updates** | Enable/disable, refresh frequency, auto-reboot (+time), unused-kernel cleanup; shows `Allowed-Origins` and the activity log; dry-run button. Detects a missing `unattended-upgrades` package (common on minimal Debian) and offers to install it |
-| **Email** | Sets up Postfix as an authenticated SMTP relay (smarthost) through **your own mail server**, sending from an address hosted there; STARTTLS or SSL on any port; wires unattended-upgrades reports to a mailbox; one-click **test send** through the full mail pipeline |
+| **Unattended updates** | Full control of `20auto-upgrades` + `50unattended-upgrades`: enable/disable, package-list refresh frequency, download-in-advance, autoclean interval, auto-reboot (+time, +reboot-with-users), unused-kernel cleanup, new/unused dependency removal, auto-fix interrupted dpkg; editable **upgrade origins** (`Unattended-Upgrade::Origins-Pattern` *or* legacy `Allowed-Origins`, one per line) and **package blacklist**, so Debian-only origin patterns are one paste away; activity log and dry-run button. Detects a missing `unattended-upgrades` package (common on minimal Debian) and offers to install it. **Email reports** (always / on-change / **only-on-error**) delivered through your SMTP relay to any address *or local mailbox* (e.g. `root`) — the configuration file is created when missing and the sender is set to your relay account so hosted mail servers accept the reports |
+| **Email** | Sets up Postfix as an authenticated SMTP relay (smarthost) through **your own mail server** (the mail account hosted there), sending from an address hosted on that server; STARTTLS or SSL on any port; wires unattended-upgrades reports to a mailbox (falling back to the from address when left blank); one-click **test send** through the full mail pipeline. Detects **conflicting mail transfer agents** (`msmtp-mta`, `ssmtp`, `nullmailer`, `exim4`, `sendmail-bin`, `dma`) that would swallow reports and offers one-click removal (client-only tools like plain `msmtp`, `bsd-mailx`, `mailutils` are left untouched). **Existing `msmtp` setups are adopted, not bulldozed**: an `/etc/msmtprc` is detected and the relay form is pre-filled from it, and the password is picked up from the msmtp password file when left blank, so switching delivery to Postfix is one click |
 | **Software** | Search, install, remove APT packages; list upgradable packages; one-click upgrade; **maintenance**: `update`, `upgrade`, `autoremove`, `autoclean`, `clean` — all as background jobs with live logs, plus cache size and autoremove-candidate previews |
-| **Users** | Create/maintain accounts: passwords (via `chpasswd`), full name, login shell, sudo membership, lock/unlock, delete (optionally with home); full **SSH key management** with key validation and locked-down `~/.ssh` permissions |
+| **Users** | Create/maintain accounts: passwords (via `chpasswd`), full name, login shell, sudo membership, lock/unlock, delete (optionally with home); full **SSH key management** with key validation and locked-down `~/.ssh` permissions; **password aging** (`chage`), **login history** (`last`) and per-user **sudo rules** in `sudoers.d` (validated with `visudo -cf`) |
+| **Firewall** | UFW or nftables (auto-detected); allow/deny rules with ports and CIDRs, default policies, enable/disable; the SSH port is kept reachable automatically when switching to a deny-incoming policy; changes use the same **90-second auto-revert** as networking |
+| **SSH hardening** | `sshd_config` management: port, `PermitRootLogin`, password/key auth, `MaxAuthTries`, client-alive settings; every change is validated with `sshd -t` and applied with **90-second auto-revert** so a bad setting can't lock you out |
+| **Services** | Systemd service list with active/enabled state, one-click start/stop/restart/enable/disable as background jobs, and per-service journal output |
+| **Storage** | Filesystem usage (`df`) and a **directory-size explorer**: `du` scans run as background jobs with the results parsed into a sortable table |
+| **Logs & Processes** | `journalctl` viewer (unit + priority filters) and safe tails of `/var/log` files; process list sorted by CPU/memory with validated `kill` (TERM/KILL/HUP/INT) |
+| **Terminal** | A web terminal over WebSocket: real PTY-backed shells (optionally as another user via `runuser`), every session recorded to `/var/lib/linustart/terminal/` and noted in the audit log |
+| **Self-update** | Check for and install new LinuStart releases from GitHub in the GUI: downloads the release tarball, backs up the current application to `/var/lib/linustart/backups`, re-installs and restarts the service — with one-click **rollback** to the last backup |
 | **Safety** | Diff-friendly edits (comments/formatting preserved), automatic backups of every file it rewrites (`/var/lib/linustart/backups`), append-only audit log |
 
 ## Quick install (Debian / Ubuntu)
@@ -45,10 +52,11 @@ sudo ./install.sh
 The installer:
 
 1. verifies the system is in the Debian family (`/etc/os-release`),
-2. installs `python3` + venv, `iproute2` and `unattended-upgrades`,
-3. installs the app into `/opt/linustart`,
-4. creates `/etc/linustart/config.json` with a generated access token,
-5. installs and enables the `linustart` systemd service.
+2. checks for other mail transfer agents (`msmtp-mta`, `ssmtp`, `exim4`, …) and reports them — they are left working; the Email page switches delivery to Postfix and removes them afterwards,
+3. installs `python3` + venv, `iproute2` and `unattended-upgrades`,
+4. installs the app into `/opt/linustart`,
+5. creates `/etc/linustart/config.json` with a generated access token,
+6. installs and enables the `linustart` systemd service.
 
 Then forward the port over SSH (recommended) and open the UI:
 
@@ -58,6 +66,28 @@ ssh -L 8765:127.0.0.1:8765 user@your-server
 ```
 
 Remove it again with `sudo ./install.sh --uninstall`.
+
+### Updating LinuStart
+
+The **Software → LinuStart Updates** panel checks GitHub releases and installs
+them in place (the service restarts a few seconds later). Publishing a new
+version is just tagging a release:
+
+```bash
+git tag v0.2.0 && git push --tags
+# then create a GitHub release from the tag
+```
+
+Each update first archives the running application to
+`/var/lib/linustart/backups/`; if the new version fails to verify, the old one
+is restored automatically. Roll back manually at any time from the GUI or:
+
+```bash
+/opt/linustart/venv/bin/python -m linustart.updater rollback
+```
+
+Air-gapped servers can update from a downloaded archive:
+`python -m linustart.updater apply --tarball release.tar.gz --tag v0.2.0`.
 
 ### Exposing it on the network
 
@@ -109,6 +139,13 @@ don't click **Keep changes**, the panel restores the previous config and
 re-applies it automatically — even if your SSH connection dropped during the
 change. This is the same trick used by `nmtui` and cloud-init.
 
+**Firewall and SSH changes.** Firewall rule/policy changes and sshd
+settings get the same confirm-or-revert treatment as networking: apply,
+validate, then a 90-second countdown to keep the change — otherwise the
+previous files are restored and re-applied automatically. Enabling a
+deny-incoming firewall policy automatically allows the current SSH port
+first, so the panel can't cut off its own access.
+
 **File writes.** Every rewritten file is first copied to
 `/var/lib/linustart/backups/` with a timestamp, and writes are atomic
 (tempfile + rename), so a crash can't leave a half-written config.
@@ -131,10 +168,19 @@ linustart/
 │   ├── network.py    netplan / NetworkManager / ifupdown
 │   ├── mail.py       Postfix SMTP relay (smarthost) + SASL + TLS
 │   ├── unattended.py /etc/apt/apt.conf.d auto-upgrades
-│   ├── users.py      useradd/usermod/userdel, chpasswd, authorized_keys
+│   ├── users.py      useradd/usermod/userdel, chpasswd, authorized_keys, chage, last
+│   ├── sudoers.py    per-user sudoers.d drop-ins, validated with visudo
+│   ├── sshd.py       sshd_config hardening with sshd -t validation
+│   ├── firewall.py   UFW / nftables rules with managed-block editing
+│   ├── services.py   systemctl list/show + unit actions
+│   ├── disk.py       df parsing + du directory scans
+│   ├── logs.py       journalctl queries + safe /var/log tails
+│   ├── procs.py      ps parsing + validated kill
 │   └── packages.py   apt-get / apt-cache / dpkg-query
+terminal.py           WebSocket web terminal (PTY + session logs)
+updater.py            Self-update from GitHub releases (apply/rollback CLI)
 └── static/           Plain HTML/CSS/JS UI (no build step, no Node needed)
-tests/                Unit tests for all config-editing logic (74 tests)
+tests/                Unit tests for all config-editing logic (131 tests)
 ```
 
 The UI intentionally has **no build step and no Node dependency** — the whole
@@ -178,6 +224,7 @@ view to see exactly what happened.
 - `systemctl`, `timedatectl`, `hostnamectl`, `ip -j` (all standard on both distros)
 - Python 3.9+
 - root (the systemd service runs as root to manage the system)
+- for the web terminal: `runuser` (only when opening sessions as non-root users)
 
 ## Security notes
 

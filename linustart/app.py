@@ -12,6 +12,7 @@ from . import __version__, audit
 from .jobs import JobManager
 from .routes import SessionManager, build_router
 from .settings import Settings
+from .terminal import TerminalManager
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -20,20 +21,26 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="LinuStart", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
     jobs = JobManager()
     sessions = SessionManager()
+    terminals = TerminalManager()
 
     app.state.settings = settings
     app.state.jobs = jobs
     app.state.sessions = sessions
+    app.state.terminals = terminals
 
     @app.exception_handler(ValueError)
     async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.exception_handler(RuntimeError)
+    async def runtime_error_handler(_request: Request, exc: RuntimeError) -> JSONResponse:
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
+
     @app.get("/api/health")
     async def health() -> dict:
         return {"status": "ok", "version": __version__}
 
-    app.include_router(build_router(settings, jobs, sessions), prefix="/api")
+    app.include_router(build_router(settings, jobs, sessions, terminals), prefix="/api")
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

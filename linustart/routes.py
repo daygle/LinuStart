@@ -3,25 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from . import audit
+from . import __version__, audit
+from . import updater as updater_mod
 from .jobs import JobManager
+from .modules import disk as disk_mod
+from .modules import firewall as firewall_mod
 from .modules import hostname as hostname_mod
+from .modules import logs as logs_mod
 from .modules import mail as mail_mod
 from .modules import network as network_mod
 from .modules import packages as packages_mod
+from .modules import procs as procs_mod
+from .modules import services as services_mod
+from .modules import sshd as sshd_mod
+from .modules import sudoers as sudoers_mod
 from .modules import sysinfo as sysinfo_mod
 from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
 from .modules import users as users_mod
+from .paths import SSHD_CONFIG
 from .settings import Settings
+from .terminal import TerminalManager
 from .util import now_iso, restore_files, snapshot_files
 
 
@@ -49,12 +60,22 @@ class InterfaceBody(BaseModel):
 
 
 class UpdatesBody(BaseModel):
-    enabled: bool
+    enabled: Optional[bool] = None
     update_frequency_days: Optional[str] = None
+    download_upgradeable_packages: Optional[bool] = None
+    autoclean_interval: Optional[str] = None
     auto_reboot: Optional[bool] = None
     auto_reboot_time: Optional[str] = None
+    auto_reboot_withusers: Optional[bool] = None
+    auto_fix_interrupted_dpkg: Optional[bool] = None
     remove_unused: Optional[bool] = None
+    remove_new_unused_dependencies: Optional[bool] = None
     remove_unused_dependencies: Optional[bool] = None
+    origins: Optional[List[str]] = None
+    origins_style: Optional[str] = Field(default=None, pattern="^(pattern|allowed)$")
+    package_blacklist: Optional[List[str]] = None
+    report_to: Optional[str] = None
+    report_mode: Optional[str] = Field(default=None, pattern="^(always|only-on-error|on-change)$")
 
 
 class MailBody(BaseModel):
@@ -101,6 +122,54 @@ class KeyBody(BaseModel):
     key: str
 
 
+class SshBody(BaseModel):
+    port: Optional[int] = None
+    permit_root_login: Optional[str] = None
+    password_authentication: Optional[bool] = None
+    pubkey_authentication: Optional[bool] = None
+    x11_forwarding: Optional[bool] = None
+    max_auth_tries: Optional[int] = None
+    client_alive_interval: Optional[int] = None
+    client_alive_count_max: Optional[int] = None
+
+
+class FirewallPolicyBody(BaseModel):
+    enabled: Optional[bool] = None
+    default_incoming: Optional[str] = Field(default=None, pattern="^(allow|deny)$")
+    default_outgoing: Optional[str] = Field(default=None, pattern="^(allow|deny)$")
+
+
+class FirewallRuleBody(BaseModel):
+    action: str
+    direction: str
+    protocol: str = "any"
+    port: str = ""
+    address: str = "any"
+
+
+class DiskScanBody(BaseModel):
+    path: str
+
+
+class KillBody(BaseModel):
+    pid: int
+    signal: str = Field(default="TERM", pattern="^(TERM|KILL|HUP|INT|SIGTERM|SIGKILL|SIGHUP|SIGINT)$")
+
+
+class AgingBody(BaseModel):
+    max_days: Optional[int] = None
+    warn_days: Optional[int] = None
+    expiry: Optional[str] = None
+
+
+class SudoersBody(BaseModel):
+    nopasswd: bool = False
+
+
+class UpdateInstallBody(BaseModel):
+    tag: str = ""
+
+
 # --------------------------------------------------------------------------
 # Network change sessions (apply + auto-revert unless confirmed)
 # --------------------------------------------------------------------------
@@ -108,9 +177,10 @@ class KeyBody(BaseModel):
 @dataclass
 class RevertSession:
     id: str
-    backend: str
-    iface: str
+    kind: str
+    label: str
     snapshots: Dict[str, str]
+    reapply: Callable[[], Awaitable[None]]
     created_at: str = field(default_factory=now_iso)
     expires_at: float = 0.0
     confirmed: bool = False
@@ -120,8 +190,8 @@ class RevertSession:
     def to_dict(self) -> Dict[str, object]:
         return {
             "id": self.id,
-            "backend": self.backend,
-            "interface": self.iface,
+            "kind": self.kind,
+            "label": self.label,
             "created_at": self.created_at,
             "confirmed": self.confirmed,
             "done": self.done,
@@ -133,12 +203,20 @@ class SessionManager:
     def __init__(self) -> None:
         self.sessions: Dict[str, RevertSession] = {}
 
-    def create(self, backend: str, iface: str, snapshots: Dict[str, str], timeout: int) -> RevertSession:
+    def create(
+        self,
+        kind: str,
+        label: str,
+        snapshots: Dict[str, str],
+        timeout: int,
+        reapply: Callable[[], Awaitable[None]],
+    ) -> RevertSession:
         session = RevertSession(
             id=uuid.uuid4().hex[:12],
-            backend=backend,
-            iface=iface,
+            kind=kind,
+            label=label,
             snapshots=snapshots,
+            reapply=reapply,
             expires_at=time.monotonic() + timeout,
         )
         self.sessions[session.id] = session
@@ -152,10 +230,13 @@ class SessionManager:
         session.done = True
         restore_files(session.snapshots)
         try:
-            await network_mod.apply_backend(session.backend, session.iface)
-            audit.record("network.revert", f"changes to {session.iface} reverted automatically after {timeout}s")
+            await session.reapply()
+            audit.record(
+                f"{session.kind}.revert",
+                f"changes to {session.label} reverted automatically after {timeout}s",
+            )
         except Exception as exc:  # noqa: BLE001 - log and keep running
-            audit.record("network.revert", f"revert of {session.iface} failed: {exc}", ok=False)
+            audit.record(f"{session.kind}.revert", f"revert of {session.label} failed: {exc}", ok=False)
 
     async def confirm(self, session_id: str) -> RevertSession:
         session = self._get(session_id)
@@ -163,7 +244,7 @@ class SessionManager:
             session.task.cancel()
         session.confirmed = True
         session.done = True
-        audit.record("network.confirm", f"changes to {session.iface} confirmed")
+        audit.record(f"{session.kind}.confirm", f"changes to {session.label} confirmed")
         return session
 
     async def revert(self, session_id: str) -> RevertSession:
@@ -173,8 +254,8 @@ class SessionManager:
         if not session.done:
             session.done = True
             restore_files(session.snapshots)
-            await network_mod.apply_backend(session.backend, session.iface)
-            audit.record("network.revert", f"changes to {session.iface} reverted manually")
+            await session.reapply()
+            audit.record(f"{session.kind}.revert", f"changes to {session.label} reverted manually")
         return session
 
     def _get(self, session_id: str) -> RevertSession:
@@ -188,7 +269,12 @@ class SessionManager:
 # Router factory
 # --------------------------------------------------------------------------
 
-def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager) -> APIRouter:
+def build_router(
+    settings: Settings,
+    jobs: JobManager,
+    sessions: SessionManager,
+    terminals: TerminalManager,
+) -> APIRouter:
     router = APIRouter()
 
     async def require_auth(authorization: Optional[str] = Header(None)) -> None:
@@ -279,7 +365,13 @@ def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager)
             audit.record("network.configure", f"{name}: {exc}", ok=False)
             restore_files(snapshots)
             raise HTTPException(status_code=500, detail=str(exc))
-        session = sessions.create(backend, name, snapshots, timeout=90)
+        session = sessions.create(
+            "network",
+            f"{name} ({backend})",
+            snapshots,
+            timeout=90,
+            reapply=functools.partial(network_mod.apply_backend, backend, name),
+        )
         audit.record(
             "network.configure",
             f"{name}: {body.method} {body.address or ''} via {body.gateway or '-'}".strip(),
@@ -305,19 +397,48 @@ def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager)
             if not timezone_mod.valid_time(body.auto_reboot_time):
                 raise HTTPException(status_code=400, detail="auto_reboot_time must look like HH:MM")
         try:
-            result = unattended_mod.apply_settings(
+            unattended_mod.apply_settings(
                 enabled=body.enabled,
                 update_frequency_days=body.update_frequency_days,
+                download_upgradeable_packages=body.download_upgradeable_packages,
+                autoclean_interval=body.autoclean_interval,
                 auto_reboot=body.auto_reboot,
                 auto_reboot_time=body.auto_reboot_time or None,
+                auto_reboot_withusers=body.auto_reboot_withusers,
+                auto_fix_interrupted_dpkg=body.auto_fix_interrupted_dpkg,
                 remove_unused=body.remove_unused,
+                remove_new_unused_dependencies=body.remove_new_unused_dependencies,
                 remove_unused_dependencies=body.remove_unused_dependencies,
+                origins=body.origins,
+                origins_style=body.origins_style,
+                package_blacklist=body.package_blacklist,
             )
+        except ValueError as exc:
+            audit.record("updates.configure", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
         except OSError as exc:
             audit.record("updates.configure", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
-        audit.record("updates.configure", f"unattended-upgrades {'enabled' if body.enabled else 'disabled'}")
-        return result
+        if body.report_to is not None or body.report_mode is not None:
+            state = await mail_mod.status()
+            try:
+                await mail_mod.apply_report_settings(
+                    report_to=body.report_to or "",
+                    report_mode=body.report_mode or str(state.get("report_mode") or "only-on-error"),
+                    from_address=str(state.get("from_address") or ""),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            audit.record(
+                "updates.reports",
+                f"reports to {body.report_to or 'the from address'} ({body.report_mode or 'unchanged'})",
+            )
+        audit.record(
+            "updates.configure",
+            "unattended-upgrades settings updated"
+            + (f" ({'enabled' if body.enabled else 'disabled'})" if body.enabled is not None else ""),
+        )
+        return unattended_mod.status()
 
     @router.post("/updates/dry-run", dependencies=guard)
     async def updates_dry_run() -> Dict[str, object]:
@@ -327,7 +448,10 @@ def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager)
     # ---- mail ------------------------------------------------------------
     @router.get("/mail", dependencies=guard)
     async def mail_status() -> Dict[str, object]:
-        return await mail_mod.status()
+        data = await mail_mod.status()
+        data["mailer"] = await mail_mod.mailer_status()
+        data["msmtp"] = await mail_mod.msmtp_status()
+        return data
 
     @router.post("/mail", dependencies=guard)
     async def mail_apply(body: MailBody) -> Dict[str, object]:
@@ -354,7 +478,7 @@ def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager)
     async def mail_test(body: MailTestBody) -> Dict[str, object]:
         state = await mail_mod.status()
         recipient = (body.recipient or "").strip() or str(state.get("report_to") or "")
-        if not recipient or not mail_mod.valid_email(recipient):
+        if not recipient or not mail_mod.valid_recipient(recipient):
             raise HTTPException(status_code=400, detail="a valid test recipient is required")
         from_address = str(state.get("from_address") or "")
         job = await jobs.start(
@@ -364,6 +488,24 @@ def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager)
             stdin_text=mail_mod.test_message(recipient),
         )
         audit.record("mail.test", f"test message to {recipient}")
+        return job.to_dict()
+
+    @router.post("/mail/remove-conflicts", dependencies=guard)
+    async def mail_remove_conflicts() -> Dict[str, object]:
+        state = await mail_mod.mailer_status()
+        conflicts = list(state.get("conflicts") or [])
+        if not conflicts:
+            raise HTTPException(status_code=400, detail="no conflicting mail transfer agents found")
+        try:
+            argv = mail_mod.remove_conflicting_command(conflicts)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        job = await jobs.start(
+            "mail.remove-conflicts",
+            f"Remove conflicting mailers: {', '.join(conflicts)}",
+            argv,
+        )
+        audit.record("mail.remove-conflicts", ", ".join(conflicts))
         return job.to_dict()
 
     @router.post("/mail/install", dependencies=guard)
@@ -571,6 +713,484 @@ def build_router(settings: Settings, jobs: JobManager, sessions: SessionManager)
             raise HTTPException(status_code=400, detail=str(exc))
         audit.record("user.key.remove", f"removed SSH key {index} for {name}")
         return {"keys": keys}
+
+    # ---- generic confirm-or-revert sessions ------------------------------
+    @router.post("/sessions/{session_id}/confirm", dependencies=guard)
+    async def sessions_confirm(session_id: str) -> Dict[str, object]:
+        return (await sessions.confirm(session_id)).to_dict()
+
+    @router.post("/sessions/{session_id}/revert", dependencies=guard)
+    async def sessions_revert(session_id: str) -> Dict[str, object]:
+        return (await sessions.revert(session_id)).to_dict()
+
+    # ---- ssh hardening ---------------------------------------------------
+    @router.get("/ssh", dependencies=guard)
+    async def ssh_status() -> Dict[str, object]:
+        return await sshd_mod.status()
+
+    @router.post("/ssh", dependencies=guard)
+    async def ssh_apply(body: SshBody) -> Dict[str, object]:
+        updates: Dict[str, object] = {}
+        if body.port is not None:
+            updates["Port"] = body.port
+        if body.permit_root_login is not None:
+            updates["PermitRootLogin"] = body.permit_root_login
+        for key, flag in (
+            ("PasswordAuthentication", body.password_authentication),
+            ("PubkeyAuthentication", body.pubkey_authentication),
+            ("X11Forwarding", body.x11_forwarding),
+        ):
+            if flag is not None:
+                updates[key] = "yes" if flag else "no"
+        if body.max_auth_tries is not None:
+            updates["MaxAuthTries"] = body.max_auth_tries
+        if body.client_alive_interval is not None:
+            updates["ClientAliveInterval"] = body.client_alive_interval
+        if body.client_alive_count_max is not None:
+            updates["ClientAliveCountMax"] = body.client_alive_count_max
+        if not updates:
+            raise HTTPException(status_code=400, detail="nothing to change")
+        snapshots = snapshot_files([SSHD_CONFIG])
+        try:
+            values = await sshd_mod.apply_settings(updates)
+        except ValueError as exc:
+            restore_files(snapshots)
+            raise HTTPException(status_code=400, detail=str(exc))
+        try:
+            await sshd_mod.reload_service()
+        except RuntimeError as exc:
+            restore_files(snapshots)
+            audit.record("ssh.configure", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        session = sessions.create(
+            "ssh", "sshd settings", snapshots, timeout=90, reapply=sshd_mod.reload_service
+        )
+        audit.record("ssh.configure", ", ".join(f"{key}={value}" for key, value in values.items()))
+        return {"ok": True, "session": session.to_dict(), "applied": values}
+
+    # ---- firewall --------------------------------------------------------
+    def ssh_allow_rule() -> Dict[str, str]:
+        return {
+            "action": "allow",
+            "direction": "in",
+            "protocol": "tcp",
+            "port": str(firewall_mod.ssh_port()),
+            "address": "any",
+        }
+
+    def session_kwargs(backend: str) -> Dict[str, object]:
+        return {
+            "kind": "firewall",
+            "label": f"firewall ({backend})",
+            "timeout": 90,
+            "reapply": functools.partial(firewall_mod.reapply, backend),
+        }
+
+    @router.get("/firewall", dependencies=guard)
+    async def firewall_status() -> Dict[str, object]:
+        return await firewall_mod.status()
+
+    @router.post("/firewall", dependencies=guard)
+    async def firewall_policy(body: FirewallPolicyBody) -> Dict[str, object]:
+        backend = await firewall_mod.detect_backend()
+        state = await firewall_mod.status()
+        enabled = bool(state["enabled"]) if body.enabled is None else body.enabled
+        default_incoming = body.default_incoming or str(state["default_incoming"])
+        default_outgoing = body.default_outgoing or str(state["default_outgoing"])
+        snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
+        ssh_added = False
+        applied: List[str] = []
+        try:
+            if backend == "ufw":
+                commands: List[List[str]] = []
+                if body.default_incoming:
+                    commands.append(["ufw", "default", default_incoming, "incoming"])
+                if body.default_outgoing:
+                    commands.append(["ufw", "default", default_outgoing, "outgoing"])
+                if enabled and default_incoming == "deny" and not any(
+                    firewall_mod.rule_covers_port(rule, str(state["ssh_port"])) for rule in state["rules"]
+                ):
+                    commands.append(firewall_mod.ufw_add_argv(ssh_allow_rule()))
+                    ssh_added = True
+                if body.enabled is not None and bool(body.enabled) != bool(state["enabled"]):
+                    commands.append(["ufw", "--force", "enable" if body.enabled else "disable"])
+                for argv in commands:
+                    await firewall_mod.ufw_apply(argv)
+                applied = [" ".join(argv) for argv in commands]
+            else:
+                rules = list(state["rules"])
+                if enabled and default_incoming == "deny" and not any(
+                    firewall_mod.rule_covers_port(rule, str(state["ssh_port"])) for rule in rules
+                ):
+                    rules.insert(0, ssh_allow_rule())
+                    ssh_added = True
+                await firewall_mod.nftables_apply(
+                    enabled=enabled,
+                    default_incoming=default_incoming,
+                    default_outgoing=default_outgoing,
+                    rules=rules,
+                )
+                applied = ["nftables ruleset updated"]
+        except ValueError as exc:
+            restore_files(snapshots)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            restore_files(snapshots)
+            audit.record("firewall.configure", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
+        audit.record(
+            "firewall.configure",
+            f"enabled={enabled} default_incoming={default_incoming} default_outgoing={default_outgoing}",
+        )
+        return {
+            "ok": True,
+            "session": session.to_dict(),
+            "applied": applied,
+            "ssh_rule_added": ssh_added,
+        }
+
+    @router.post("/firewall/rules", dependencies=guard)
+    async def firewall_add_rule(body: FirewallRuleBody) -> Dict[str, object]:
+        try:
+            rule = firewall_mod.normalize_rule(
+                {
+                    "action": body.action,
+                    "direction": body.direction,
+                    "protocol": body.protocol,
+                    "port": body.port,
+                    "address": body.address,
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        backend = await firewall_mod.detect_backend()
+        state = await firewall_mod.status()
+        if backend != "ufw" and not bool(state["enabled"]):
+            raise HTTPException(status_code=400, detail="enable the firewall before editing rules")
+        snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
+        try:
+            if backend == "ufw":
+                argv = firewall_mod.ufw_add_argv(rule)
+                await firewall_mod.ufw_apply(argv)
+                applied = [" ".join(argv)]
+            else:
+                await firewall_mod.nftables_apply(
+                    enabled=True,
+                    default_incoming=str(state["default_incoming"]),
+                    default_outgoing=str(state["default_outgoing"]),
+                    rules=list(state["rules"]) + [rule],
+                )
+                applied = [firewall_mod.nft_rule_line(rule)]
+        except ValueError as exc:
+            restore_files(snapshots)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            restore_files(snapshots)
+            audit.record("firewall.rule.add", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
+        audit.record("firewall.rule.add", firewall_mod.rule_label(rule))
+        return {"ok": True, "session": session.to_dict(), "applied": applied}
+
+    @router.delete("/firewall/rules/{index}", dependencies=guard)
+    async def firewall_remove_rule(index: int) -> Dict[str, object]:
+        backend = await firewall_mod.detect_backend()
+        state = await firewall_mod.status()
+        rules = list(state["rules"])
+        if index < 0 or index >= len(rules):
+            raise HTTPException(status_code=404, detail=f"no rule at position {index}")
+        removed = rules.pop(index)
+        snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
+        try:
+            if backend == "ufw":
+                argv = firewall_mod.ufw_delete_argv(removed)
+                await firewall_mod.ufw_apply(argv)
+                applied = [" ".join(argv)]
+            else:
+                await firewall_mod.nftables_apply(
+                    enabled=bool(state["enabled"]),
+                    default_incoming=str(state["default_incoming"]),
+                    default_outgoing=str(state["default_outgoing"]),
+                    rules=rules,
+                )
+                applied = [f"removed: {firewall_mod.rule_label(removed)}"]
+        except ValueError as exc:
+            restore_files(snapshots)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            restore_files(snapshots)
+            audit.record("firewall.rule.remove", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
+        label = firewall_mod.rule_label(removed) if "action" in removed else str(removed.get("to", index))
+        audit.record("firewall.rule.remove", label)
+        return {"ok": True, "session": session.to_dict(), "applied": applied}
+
+    # ---- services --------------------------------------------------------
+    @router.get("/services", dependencies=guard)
+    async def services_list(q: str = Query("")) -> Dict[str, object]:
+        return await services_mod.list_services(q)
+
+    @router.get("/services/{unit}", dependencies=guard)
+    async def services_detail(unit: str) -> Dict[str, object]:
+        try:
+            return await services_mod.unit_detail(unit)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/services/{unit}/action/{action}", dependencies=guard)
+    async def services_action(unit: str, action: str) -> Dict[str, object]:
+        try:
+            argv = services_mod.action_argv(unit, action)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        job = await jobs.start("services.action", f"{action} {argv[-1]}", argv)
+        audit.record("services.action", f"{action} {argv[-1]}")
+        return job.to_dict()
+
+    # ---- disk usage ------------------------------------------------------
+    @router.get("/disk", dependencies=guard)
+    async def disk_filesystems() -> Dict[str, object]:
+        return await disk_mod.filesystems()
+
+    @router.post("/disk/scan", dependencies=guard)
+    async def disk_scan(body: DiskScanBody) -> Dict[str, object]:
+        try:
+            argv = disk_mod.du_command(body.path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        job = await jobs.start("disk.scan", f"Scan directory sizes under {argv[-1]}", argv)
+        audit.record("disk.scan", argv[-1])
+        return job.to_dict()
+
+    @router.get("/disk/usage/{job_id}", dependencies=guard)
+    async def disk_usage(job_id: str) -> Dict[str, object]:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        return {
+            "job": job.to_dict(),
+            "entries": disk_mod.parse_du("\n".join(job.lines), root=job.argv[-1] if job.argv else None),
+        }
+
+    # ---- logs ------------------------------------------------------------
+    @router.get("/logs/journal", dependencies=guard)
+    async def logs_journal(
+        lines: int = Query(200, ge=10, le=2000),
+        unit: str = Query(""),
+        priority: str = Query(""),
+    ) -> Dict[str, object]:
+        try:
+            return await logs_mod.journal(lines, unit, priority)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/logs/files", dependencies=guard)
+    async def logs_files() -> Dict[str, object]:
+        return logs_mod.list_log_files()
+
+    @router.get("/logs/files/{name}", dependencies=guard)
+    async def logs_file(name: str, lines: int = Query(200, ge=10, le=2000)) -> Dict[str, object]:
+        try:
+            return logs_mod.read_log_file(name, lines)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    # ---- processes -------------------------------------------------------
+    @router.get("/processes", dependencies=guard)
+    async def processes(sort: str = Query("cpu")) -> Dict[str, object]:
+        try:
+            return await procs_mod.list_processes(sort)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.post("/processes/kill", dependencies=guard)
+    async def processes_kill(body: KillBody) -> Dict[str, object]:
+        try:
+            result = await procs_mod.kill(body.pid, body.signal)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("process.kill", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("process.kill", f"signal {result['signal']} sent to PID {result['pid']}")
+        return result
+
+    # ---- users: aging, history and sudo rules ----------------------------
+    @router.get("/users/{name}/aging", dependencies=guard)
+    async def users_aging(name: str) -> Dict[str, object]:
+        try:
+            return {"aging": await users_mod.aging(name)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/users/{name}/aging", dependencies=guard)
+    async def users_set_aging(name: str, body: AgingBody) -> Dict[str, object]:
+        try:
+            aging = await users_mod.set_aging(
+                name, max_days=body.max_days, warn_days=body.warn_days, expiry=body.expiry
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("user.aging", f"{name}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("user.aging", f"updated password aging for {name}")
+        return {"aging": aging}
+
+    @router.get("/users/{name}/history", dependencies=guard)
+    async def users_history(name: str, limit: int = Query(30, ge=1, le=200)) -> Dict[str, object]:
+        try:
+            return {"entries": await users_mod.login_history(name, limit)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/sudoers", dependencies=guard)
+    async def sudoers_list() -> Dict[str, object]:
+        return sudoers_mod.list_dropins()
+
+    @router.post("/sudoers/{name}", dependencies=guard)
+    async def sudoers_set(name: str, body: SudoersBody) -> Dict[str, object]:
+        try:
+            result = await sudoers_mod.set_rule(name, nopasswd=body.nopasswd)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        audit.record("sudoers.set", f"{name}: {'NOPASSWD' if body.nopasswd else 'password required'}")
+        return result
+
+    @router.delete("/sudoers/{name}", dependencies=guard)
+    async def sudoers_remove(name: str) -> Dict[str, object]:
+        try:
+            result = sudoers_mod.remove_rule(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        audit.record("sudoers.remove", f"removed sudo rule for {name}")
+        return result
+
+    # ---- web terminal -----------------------------------------------------
+    @router.get("/terminal/sessions", dependencies=guard)
+    async def terminal_sessions() -> Dict[str, object]:
+        return {"sessions": terminals.list()}
+
+    @router.websocket("/terminal/ws")
+    async def terminal_ws(
+        websocket: WebSocket,
+        token: str = Query(""),
+        user: str = Query(""),
+        cols: int = Query(100),
+        rows: int = Query(30),
+    ) -> None:
+        if settings.auth_enabled and token != settings.token:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        try:
+            session = await terminals.create(user or None, cols, rows)
+        except (ValueError, RuntimeError) as exc:
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            await websocket.close()
+            return
+        audit.record("terminal.open", f"session {session.id} opened as {session.user}")
+
+        async def pump() -> None:
+            while True:
+                chunk = await session.output.get()
+                if chunk is None:
+                    break
+                await websocket.send_json({"type": "output", "data": chunk})
+            await websocket.send_json({"type": "closed", "detail": "shell exited"})
+
+        pump_task = asyncio.create_task(pump())
+        try:
+            while True:
+                message = await websocket.receive_json()
+                kind = message.get("type")
+                if kind == "input":
+                    terminals.write(session.id, str(message.get("data", "")))
+                elif kind == "resize":
+                    terminals.resize(session.id, message.get("cols"), message.get("rows"))
+                elif kind == "close":
+                    break
+        except (WebSocketDisconnect, RuntimeError, ValueError):
+            pass
+        finally:
+            pump_task.cancel()
+            closed = await terminals.close(session.id)
+            audit.record(
+                "terminal.close",
+                f"session {session.id} closed (user {closed['user']}, log {closed['log']})",
+            )
+
+    # ---- self-update ------------------------------------------------------
+    @router.get("/update/check", dependencies=guard)
+    async def update_check() -> Dict[str, object]:
+        try:
+            release = await asyncio.to_thread(updater_mod.latest_release, settings.update_repo)
+        except updater_mod.NoReleases as exc:
+            return {
+                "current": __version__,
+                "latest": None,
+                "tag": "",
+                "newer_available": False,
+                "no_releases": True,
+                "detail": str(exc),
+                "repo": settings.update_repo,
+                "update_supported": updater_mod.is_managed_install(),
+                "app_dir": str(updater_mod.app_source_dir()),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        return {
+            "current": __version__,
+            "latest": updater_mod.normalize_version(release["tag"]),
+            "tag": release["tag"],
+            "newer_available": updater_mod.is_newer(release["tag"], __version__),
+            "no_releases": False,
+            "release_url": release["url"],
+            "published_at": release["published_at"],
+            "notes": release["body"],
+            "repo": settings.update_repo,
+            "update_supported": updater_mod.is_managed_install(),
+            "app_dir": str(updater_mod.app_source_dir()),
+        }
+
+    @router.post("/update/install", dependencies=guard)
+    async def update_install(body: UpdateInstallBody) -> Dict[str, object]:
+        try:
+            argv = updater_mod.apply_command(settings.update_repo, body.tag)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not updater_mod.is_managed_install():
+            raise HTTPException(
+                status_code=400,
+                detail="this does not look like an install.sh install; use git pull in a source checkout",
+            )
+        job = await jobs.start(
+            "update.install",
+            f"LinuStart self-update {body.tag or 'to the latest release'}",
+            argv,
+        )
+        audit.record("update.install", f"install {body.tag or 'latest'} from {settings.update_repo}")
+        return job.to_dict()
+
+    @router.post("/update/rollback", dependencies=guard)
+    async def update_rollback() -> Dict[str, object]:
+        job = await jobs.start(
+            "update.rollback",
+            "LinuStart rollback to the most recent backup",
+            updater_mod.rollback_command(),
+        )
+        audit.record("update.rollback", "rollback to the most recent application backup")
+        return job.to_dict()
 
     # ---- audit -----------------------------------------------------------
     @router.get("/audit", dependencies=guard)
