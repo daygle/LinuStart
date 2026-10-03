@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LinuStart</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">LS</span><span>LinuStart</span></div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="overview">Overview</button>
+        <button class="nav-item" data-view="network">Networking</button>
+        <button class="nav-item" data-view="system">Hostname &amp; Time</button>
+        <button class="nav-item" data-view="updates">Unattended Updates</button>
+        <button class="nav-item" data-view="email">Email</button>
+        <button class="nav-item" data-view="users">Users</button>
+        <button class="nav-item" data-view="software">Software</button>
+        <button class="nav-item" data-view="jobs">Jobs</button>
+        <button class="nav-item" data-view="audit">Audit Log</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div id="server-label">—</div>
+        <button id="logout" class="btn btn-ghost btn-small">Forget token</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <h1 id="view-title">Overview</h1>
+        <button id="refresh" class="btn btn-ghost">Refresh</button>
+      </header>
+
+      <!-- OVERVIEW -->
+      <section class="view" id="view-overview">
+        <div class="cards" id="overview-cards"></div>
+        <div class="cards">
+          <div class="card">
+            <h2>CPU &amp; Memory</h2>
+            <div id="overview-resources"></div>
+          </div>
+          <div class="card">
+            <h2>Network Addresses</h2>
+            <div id="overview-addresses"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- NETWORK -->
+      <section class="view hidden" id="view-network">
+        <div class="toolbar">
+          <span id="net-backend" class="badge"></span>
+          <span class="muted" id="net-source"></span>
+        </div>
+        <div class="cards">
+          <div class="card">
+            <h2>Live Interfaces</h2>
+            <table class="table" id="net-runtime-table"></table>
+          </div>
+        </div>
+        <h2 class="section-title">Configured Interfaces</h2>
+        <div class="cards" id="net-config-cards"></div>
+      </section>
+
+      <!-- SYSTEM -->
+      <section class="view hidden" id="view-system">
+        <div class="cards">
+          <div class="card">
+            <h2>Hostname</h2>
+            <form id="hostname-form" class="form">
+              <label>Hostname
+                <input type="text" id="hostname-input" placeholder="my-server" autocomplete="off">
+              </label>
+              <button class="btn btn-primary" type="submit">Set hostname</button>
+            </form>
+          </div>
+          <div class="card">
+            <h2>Timezone</h2>
+            <form id="timezone-form" class="form">
+              <label>Timezone
+                <input type="text" id="timezone-input" list="timezone-list" placeholder="Europe/Amsterdam" autocomplete="off">
+                <datalist id="timezone-list"></datalist>
+              </label>
+              <button class="btn btn-primary" type="submit">Set timezone</button>
+            </form>
+            <div class="form-row">
+              <span id="ntp-status" class="muted"></span>
+              <button id="ntp-toggle" class="btn">Toggle NTP</button>
+            </div>
+            <div class="muted" id="local-time"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- UPDATES -->
+      <section class="view hidden" id="view-updates">
+        <div class="cards">
+          <div class="card">
+            <h2>Automatic Updates</h2>
+            <div id="uu-warning" class="hidden">
+              <p class="muted">The <code>unattended-upgrades</code> package is not installed on this system yet.</p>
+              <button class="btn" id="uu-install-uu" type="button">Install unattended-upgrades</button>
+            </div>
+            <form id="updates-form" class="form">
+              <label class="switch-row">
+                <input type="checkbox" id="uu-enabled"> <span>Install security updates automatically</span>
+              </label>
+              <label>Package list refresh
+                <select id="uu-frequency">
+                  <option value="1">Daily</option>
+                  <option value="2">Every 2 days</option>
+                  <option value="7">Weekly</option>
+                </select>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="uu-reboot"> <span>Reboot automatically when required</span>
+              </label>
+              <label>Reboot time (HH:MM)
+                <input type="text" id="uu-reboot-time" placeholder="02:00" maxlength="5">
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="uu-remove-unused"> <span>Remove unused kernel packages</span>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="uu-remove-deps"> <span>Remove unused dependencies</span>
+              </label>
+              <div class="form-row">
+                <button class="btn btn-primary" type="submit">Save settings</button>
+                <button class="btn" type="button" id="uu-dry-run">Run dry run</button>
+              </div>
+            </form>
+          </div>
+          <div class="card">
+            <h2>Allowed Origins</h2>
+            <ul class="list" id="uu-origins"></ul>
+            <h2>Recent Activity</h2>
+            <pre class="log" id="uu-log"></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- EMAIL -->
+      <section class="view hidden" id="view-email">
+        <div class="toolbar">
+          <span id="mail-status-badge" class="badge"></span>
+          <button class="btn hidden" id="mail-install" type="button">Install postfix</button>
+        </div>
+        <div class="cards">
+          <div class="card">
+            <h2>Mail Delivery (SMTP relay)</h2>
+            <form id="mail-form" class="form">
+              <label>SMTP server (your mail server)
+                <input type="text" id="mail-host" placeholder="mail.example.com" autocomplete="off">
+              </label>
+              <label>Port
+                <input type="text" id="mail-port" placeholder="587">
+              </label>
+              <label>Connection security
+                <select id="mail-security">
+                  <option value="starttls">STARTTLS (usually port 587)</option>
+                  <option value="ssl">SSL/TLS wrapper (usually port 465)</option>
+                  <option value="none">None (usually port 25, not recommended)</option>
+                </select>
+              </label>
+              <label>Username (mailbox on your mail server)
+                <input type="text" id="mail-username" placeholder="linustart@example.com" autocomplete="off">
+              </label>
+              <label>Password <span class="muted" id="mail-password-hint"></span>
+                <input type="password" id="mail-password" placeholder="leave empty to keep the current password" autocomplete="new-password">
+              </label>
+              <label>Send from address (hosted on your mail server)
+                <input type="text" id="mail-from" placeholder="linustart@example.com" autocomplete="off">
+              </label>
+              <label>Send unattended-upgrades reports to
+                <input type="text" id="mail-report-to" placeholder="admin@example.com" autocomplete="off">
+              </label>
+              <label>Report frequency
+                <select id="mail-report-mode">
+                  <option value="only-on-error">Only on error</option>
+                  <option value="on-change">On every change</option>
+                  <option value="always">Always</option>
+                </select>
+              </label>
+              <button class="btn btn-primary" type="submit">Save mail settings</button>
+            </form>
+          </div>
+          <div class="card">
+            <h2>Test Delivery</h2>
+            <p class="muted">Queues a message through the whole local Postfix pipeline and out via your relay.</p>
+            <form id="mail-test-form" class="form">
+              <label>Recipient
+                <input type="text" id="mail-test-to" placeholder="me@example.com" autocomplete="off">
+              </label>
+              <div class="form-row">
+                <button class="btn btn-primary" type="submit">Send test email</button>
+              </div>
+            </form>
+            <h2 class="spaced">Current Setup</h2>
+            <div class="muted" id="mail-summary"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- USERS -->
+      <section class="view hidden" id="view-users">
+        <div class="cards">
+          <div class="card">
+            <h2>Accounts</h2>
+            <table class="table" id="users-table"></table>
+          </div>
+          <div class="card">
+            <h2>Create User</h2>
+            <form id="user-create-form" class="form">
+              <label>Username
+                <input type="text" id="new-username" placeholder="deploy" autocomplete="off">
+              </label>
+              <label>Full name
+                <input type="text" id="new-full-name" placeholder="Deploy User" autocomplete="off">
+              </label>
+              <label>Password
+                <input type="password" id="new-password" placeholder="at least 8 characters" autocomplete="new-password">
+              </label>
+              <label>Shell
+                <select id="new-shell"></select>
+              </label>
+              <label class="switch-row">
+                <input type="checkbox" id="new-sudo"> <span>Administrator (sudo)</span>
+              </label>
+              <label>SSH public key (optional)
+                <textarea id="new-ssh-key" rows="3" placeholder="ssh-ed25519 AAAA... me@laptop"></textarea>
+              </label>
+              <button class="btn btn-primary" type="submit">Create user</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- SOFTWARE -->
+      <section class="view hidden" id="view-software">
+        <div class="toolbar">
+          <div class="tabs" id="software-tabs">
+            <button class="tab active" data-tab="updates">Updates</button>
+            <button class="tab" data-tab="installed">Installed</button>
+            <button class="tab" data-tab="search">Search</button>
+          </div>
+          <div class="form-row">
+            <button class="btn" id="pkg-refresh">Refresh package lists</button>
+            <button class="btn btn-primary" id="pkg-upgrade">Upgrade all</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="tab-panel" id="tab-updates">
+            <table class="table" id="pkg-updates-table"></table>
+          </div>
+          <div class="tab-panel hidden" id="tab-installed">
+            <input type="text" id="pkg-filter" class="input-wide" placeholder="Filter installed packages…">
+            <table class="table" id="pkg-installed-table"></table>
+          </div>
+          <div class="tab-panel hidden" id="tab-search">
+            <form id="search-form" class="form form-inline">
+              <input type="text" id="search-input" placeholder="Search packages…" autocomplete="off">
+              <button class="btn btn-primary" type="submit">Search</button>
+            </form>
+            <table class="table" id="pkg-search-table"></table>
+          </div>
+        </div>
+
+        <h2 class="section-title">APT Maintenance</h2>
+        <div class="cards">
+          <div class="card">
+            <h2>Cache &amp; Cleanup</h2>
+            <div id="apt-stats" class="muted"></div>
+            <div class="form-row">
+              <button class="btn" id="pkg-autoremove">Remove unused packages</button>
+              <button class="btn" id="pkg-autoclean">Remove obsolete downloads</button>
+              <button class="btn" id="pkg-clean">Clear package cache</button>
+            </div>
+            <h2 class="spaced">What each action does</h2>
+            <ul class="list muted">
+              <li><b>Remove unused packages</b> (<code>autoremove</code>) — uninstalls dependencies that are no longer needed by anything.</li>
+              <li><b>Remove obsolete downloads</b> (<code>autoclean</code>) — deletes cached .deb files that can no longer be downloaded.</li>
+              <li><b>Clear package cache</b> (<code>clean</code>) — deletes <em>all</em> cached .deb files; they are re-downloaded on demand.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h2>Autoremove Candidates</h2>
+            <ul class="list" id="apt-autoremove-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- JOBS -->
+      <section class="view hidden" id="view-jobs">
+        <div class="card">
+          <table class="table" id="jobs-table"></table>
+        </div>
+      </section>
+
+      <!-- AUDIT -->
+      <section class="view hidden" id="view-audit">
+        <div class="card">
+          <table class="table" id="audit-table"></table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Network apply/confirm bar -->
+  <div id="revert-bar" class="revert-bar hidden">
+    <span id="revert-text">Network changes applied.</span>
+    <span id="revert-countdown" class="countdown"></span>
+    <button class="btn btn-primary" id="revert-confirm">Keep changes</button>
+    <button class="btn btn-danger" id="revert-discard">Revert now</button>
+  </div>
+
+  <!-- Job log modal -->
+  <div id="job-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 id="job-modal-title">Job</h2>
+        <button class="btn btn-ghost" id="job-modal-close">Close</button>
+      </div>
+      <div class="muted" id="job-modal-meta"></div>
+      <pre class="log log-tall" id="job-modal-log"></pre>
+      <div class="form-row">
+        <button class="btn btn-danger" id="job-modal-cancel">Cancel job</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- User edit modal -->
+  <div id="user-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 id="user-modal-title">User</h2>
+        <button class="btn btn-ghost" id="user-modal-close">Close</button>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <h2>Details</h2>
+          <form id="user-edit-form" class="form">
+            <label>Full name
+              <input type="text" id="edit-full-name" autocomplete="off">
+            </label>
+            <label>Shell
+              <select id="edit-shell"></select>
+            </label>
+            <label class="switch-row">
+              <input type="checkbox" id="edit-sudo"> <span>Administrator (sudo)</span>
+            </label>
+            <label class="switch-row">
+              <input type="checkbox" id="edit-locked"> <span>Account locked</span>
+            </label>
+            <button class="btn btn-primary" type="submit">Save details</button>
+          </form>
+          <h2 class="spaced">Set Password</h2>
+          <form id="user-password-form" class="form">
+            <label>New password
+              <input type="password" id="edit-password" placeholder="at least 8 characters" autocomplete="new-password">
+            </label>
+            <button class="btn" type="submit">Set password</button>
+          </form>
+        </div>
+        <div class="card">
+          <h2>SSH Keys</h2>
+          <table class="table" id="user-keys-table"></table>
+          <form id="user-key-form" class="form">
+            <label>Add public key
+              <textarea id="edit-key" rows="3" placeholder="ssh-ed25519 AAAA... me@laptop"></textarea>
+            </label>
+            <button class="btn" type="submit">Add key</button>
+          </form>
+          <h2 class="spaced">Danger Zone</h2>
+          <label class="switch-row">
+            <input type="checkbox" id="delete-remove-home"> <span>Also delete home directory and mail</span>
+          </label>
+          <button class="btn btn-danger" id="user-delete" type="button">Delete this user</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Token modal -->
+  <div id="token-modal" class="modal">
+    <div class="modal-box modal-small">
+      <h2>Authentication required</h2>
+      <p class="muted">Enter the access token from <code>/etc/linustart/config.json</code> on the server.</p>
+      <form id="token-form" class="form">
+        <input type="password" id="token-input" placeholder="Access token" autocomplete="off">
+        <button class="btn btn-primary" type="submit">Connect</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
