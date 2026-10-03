@@ -16,13 +16,16 @@ import json
 import os
 import re
 import shutil
-from typing import Dict, Optional
+from pathlib import PurePosixPath
+from typing import Dict, List, Mapping, Optional, Sequence
 
 from ..paths import (
     MAIL_STATE_FILE,
+    MSMTPRC,
     POSTFIX_MAIN_CF,
     POSTFIX_SASL_DB,
     POSTFIX_SASL_PASSWD,
+    ROOT,
     UNATTENDED_FILE,
 )
 from ..util import read_text, run, write_text
@@ -30,12 +33,233 @@ from ..util import read_text, run, write_text
 from .hostname import valid_hostname
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+# Local mailbox names ("root", "postmaster") are valid unattended-upgrades
+# recipients - the report is delivered on the box itself.
+LOCAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}$")
 MAIN_CF_LINE_RE = re.compile(r"^(?P<key>[A-Za-z0-9_]+)\s*=\s*(?P<value>.*)$")
 
 SECURITIES = ("starttls", "ssl", "none")
 REPORT_MODES = ("always", "only-on-error", "on-change")
 
+
+# --------------------------------------------------------------------------
+# Unattended-upgrades report settings
+# --------------------------------------------------------------------------
+
+def resolve_report_target(report_to: str, from_address: str = "") -> str:
+    """Where unattended-upgrades reports go.
+
+    An empty recipient falls back to the relay's from address so reports work
+    out of the box instead of silently being disabled.
+    """
+    target = (report_to or "").strip()
+    if target:
+        if not valid_recipient(target):
+            raise ValueError(f"invalid report recipient: {target!r}")
+        return target
+    fallback = (from_address or "").strip()
+    if valid_email(fallback):
+        return fallback
+    raise ValueError("a report recipient is required (set one here or a from address first)")
+
 SASL_PASSWD_MODE = 0o600
+
+
+# --------------------------------------------------------------------------
+# Mail transfer agents: detect conflicting MTAs
+# --------------------------------------------------------------------------
+
+# kind "mta" packages provide sendmail and conflict with each other;
+# kind "client" packages (plain msmtp, mailx) are harmless and left alone.
+MAILER_PACKAGES: Dict[str, Dict[str, object]] = {
+    "postfix": {"label": "Postfix", "kind": "mta", "supported": True},
+    "msmtp-mta": {"label": "msmtp sendmail compatibility", "kind": "mta", "supported": False},
+    "ssmtp": {"label": "sSMTP", "kind": "mta", "supported": False},
+    "nullmailer": {"label": "Nullmailer", "kind": "mta", "supported": False},
+    "exim4": {"label": "Exim4", "kind": "mta", "supported": False},
+    "exim4-base": {"label": "Exim4 base", "kind": "mta", "supported": False},
+    "exim4-daemon-heavy": {"label": "Exim4 daemon (heavy)", "kind": "mta", "supported": False},
+    "exim4-daemon-light": {"label": "Exim4 daemon (light)", "kind": "mta", "supported": False},
+    "sendmail-bin": {"label": "Sendmail", "kind": "mta", "supported": False},
+    "dma": {"label": "Dragonfly Mail Agent", "kind": "mta", "supported": False},
+    "msmtp": {"label": "msmtp client", "kind": "client", "supported": False},
+    "bsd-mailx": {"label": "bsd-mailx", "kind": "client", "supported": False},
+    "mailutils": {"label": "GNU mailutils", "kind": "client", "supported": False},
+}
+SENDMAIL_PROVIDERS = ("postfix", "msmtp", "ssmtp", "nullmailer", "exim", "sendmail", "dma")
+
+
+def classify_sendmail_target(target: str) -> str:
+    """Which package's sendmail is at the end of this path (by symlink target)."""
+    lowered = (target or "").lower()
+    for provider in SENDMAIL_PROVIDERS:
+        if provider in lowered:
+            return provider
+    return "unknown" if lowered else "none"
+
+
+def parse_dpkg_status(text: str) -> List[str]:
+    """Installed package names from `dpkg-query -W -f='${Package} ${Status}'`."""
+    installed: List[str] = []
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[1] == "install ok installed":
+            installed.append(parts[0])
+    return installed
+
+
+def known_mailers(installed: Sequence[str]) -> List[str]:
+    return sorted(set(installed) & set(MAILER_PACKAGES))
+
+
+def conflicting_mailers(installed: Sequence[str]) -> List[str]:
+    """Installed MTAs that compete with Postfix for the sendmail role."""
+    return [
+        name
+        for name in known_mailers(installed)
+        if MAILER_PACKAGES[name]["kind"] == "mta" and not MAILER_PACKAGES[name]["supported"]
+    ]
+
+
+def remove_conflicting_command(packages: Sequence[str]) -> List[str]:
+    """argv to remove conflicting MTAs (allowlisted names only, configs kept)."""
+    names = sorted(set(packages))
+    if not names:
+        raise ValueError("no conflicting mailers to remove")
+    for name in names:
+        if name not in MAILER_PACKAGES or MAILER_PACKAGES[name]["supported"]:
+            raise ValueError(f"refusing to remove {name!r}")
+    return ["apt-get", "remove", "-y"] + names
+
+
+async def installed_mailers() -> List[str]:
+    try:
+        result = await run(["dpkg-query", "-W", "-f=${Package} ${Status}\\n"])
+    except RuntimeError:
+        return []
+    return known_mailers(parse_dpkg_status(result.stdout))
+
+
+async def mailer_status() -> Dict[str, object]:
+    """What handles sendmail on this system, and what conflicts with Postfix."""
+    installed = await installed_mailers()
+    sendmail = shutil.which("sendmail")
+    return {
+        "packages": installed,
+        "conflicts": conflicting_mailers(installed),
+        "sendmail": sendmail or "",
+        "sendmail_provider": classify_sendmail_target(os.path.realpath(sendmail)) if sendmail else "none",
+        "msmtp_client": "msmtp" in installed,
+    }
+
+
+# --------------------------------------------------------------------------
+# msmtp import (existing setups get adopted, not bulldozed)
+# --------------------------------------------------------------------------
+
+MSMTP_KEYS = ("host", "port", "user", "from", "auth", "tls", "tls_starttls", "passwordeval", "password")
+
+
+def parse_msmtprc(text: str, account: Optional[str] = None) -> Dict[str, str]:
+    """Effective settings for one msmtp account (``defaults`` merged in).
+
+    Understands ``defaults``, ``account NAME`` sections and the
+    ``account default : NAME`` alias used to pick the default account.
+    """
+    sections: Dict[str, Dict[str, str]] = {}
+    current: Optional[str] = None
+    default_name: Optional[str] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        key = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if key == "defaults":
+            current = "defaults"
+            sections.setdefault(current, {})
+        elif key == "account":
+            words = value.replace(":", " ").split()
+            if words and words[0].lower() == "default":
+                default_name = words[1] if len(words) > 1 else None
+                current = None  # an alias line, not a section
+            else:
+                current = value or None
+                if current:
+                    sections.setdefault(current, {})
+        elif current is not None:
+            sections[current][key] = value.strip().strip('"')
+    name = account or default_name
+    if name is None:
+        candidates = [key for key in sections if key != "defaults"]
+        name = candidates[0] if len(candidates) == 1 else "defaults"
+    effective = {**sections.get("defaults", {}), **sections.get(name, {})}
+    return {key: effective[key] for key in MSMTP_KEYS if key in effective}
+
+
+def msmtp_import_settings(config: Mapping[str, str]) -> Dict[str, object]:
+    """Map msmtp settings onto the panel's relay fields."""
+    tls_on = config.get("tls", "off").lower() == "on"
+    starttls_on = config.get("tls_starttls", "on").lower() == "on"
+    if tls_on and not starttls_on:
+        security = "ssl"
+    elif tls_on or starttls_on:
+        security = "starttls"
+    else:
+        security = "none"
+    try:
+        port = int(config.get("port", "587") or "587")
+    except ValueError:
+        port = 587
+    return {
+        "host": config.get("host", ""),
+        "port": port,
+        "security": security,
+        "username": config.get("user", ""),
+        "from_address": config.get("from", ""),
+    }
+
+
+def msmtp_password_path(config: Mapping[str, str]) -> str:
+    """The password file referenced by ``passwordeval "cat /path"`` (or "")."""
+    match = re.search(r"cat\s+([^\s\"']+)", config.get("passwordeval", ""))
+    if not match:
+        return ""
+    path = match.group(1)
+    return path if path.startswith("/") else ""
+
+
+def read_msmtp_password() -> str:
+    """Read the msmtp password file (root-only; never returned by the API)."""
+    config = parse_msmtprc(read_text(MSMTPRC))
+    path = msmtp_password_path(config)
+    if not path and "password" not in config:
+        return ""
+    if "password" in config and not path:
+        return config["password"]
+    rooted = ROOT.joinpath(*PurePosixPath(path).parts[1:])
+    try:
+        return rooted.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+async def msmtp_status() -> Dict[str, object]:
+    """Summarize an existing msmtp setup for the migration banner (no secrets)."""
+    text = read_text(MSMTPRC)
+    config = parse_msmtprc(text)
+    if not config:
+        return {"detected": False}
+    password_path = msmtp_password_path(config)
+    rooted = ROOT.joinpath(*PurePosixPath(password_path).parts[1:]) if password_path else None
+    return {
+        "detected": True,
+        **msmtp_import_settings(config),
+        "password_available": bool(
+            (rooted is not None and rooted.is_file()) or config.get("password")
+        ),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -44,6 +268,12 @@ SASL_PASSWD_MODE = 0o600
 
 def valid_email(address: str) -> bool:
     return bool(EMAIL_RE.match(address.strip()))
+
+
+def valid_recipient(value: str) -> bool:
+    """A full email address or a local mailbox name like 'root'."""
+    value = (value or "").strip()
+    return bool(EMAIL_RE.match(value) or LOCAL_RE.match(value))
 
 
 def valid_host(host: str) -> bool:
@@ -167,7 +397,10 @@ def installed() -> bool:
 
 
 async def service_active() -> bool:
-    result = await run(["systemctl", "is-active", "--quiet", "postfix"])
+    try:
+        result = await run(["systemctl", "is-active", "--quiet", "postfix"])
+    except RuntimeError:
+        return False  # no systemd here; report inactive instead of failing
     return result.ok
 
 
@@ -224,16 +457,23 @@ async def apply(
         raise ValueError("an SMTP username is required")
     if not valid_email(from_address):
         raise ValueError(f"invalid from address: {from_address!r}")
-    if report_to and not valid_email(report_to):
-        raise ValueError(f"invalid report recipient: {report_to!r}")
     if report_mode not in REPORT_MODES:
         raise ValueError(f"report_mode must be one of {REPORT_MODES}")
+    report_to = resolve_report_target(report_to, from_address)
     if not installed():
         raise RuntimeError("postfix is not installed")
 
     location = format_relayhost(host, port)
     existing = read_text(POSTFIX_SASL_PASSWD)
-    line = merge_sasl_line(existing, location, username, password)
+    try:
+        line = merge_sasl_line(existing, location, username, password)
+    except ValueError:
+        # No stored password for this relay: adopt an existing msmtp password
+        # so switching from msmtp-mta setups is a one-click operation.
+        password = read_msmtp_password()
+        if not password:
+            raise
+        line = merge_sasl_line(existing, location, username, password)
     write_text(POSTFIX_SASL_PASSWD, line)
     os.chmod(POSTFIX_SASL_PASSWD, SASL_PASSWD_MODE)
     await run(["postmap", "hash:/etc/postfix/sasl_passwd"], check=True)
@@ -254,21 +494,44 @@ async def apply(
     }
     write_text(MAIL_STATE_FILE, json.dumps(state, indent=2) + "\n")
 
-    # Wire unattended-upgrades notifications to the same mailbox.
-    unattended = read_text(UNATTENDED_FILE)
-    if unattended:
-        from . import unattended as unattended_mod
-
-        unattended = unattended_mod.upsert_setting(
-            unattended, "Unattended-Upgrade::Mail", report_to
-        )
-        unattended = unattended_mod.upsert_setting(
-            unattended, "Unattended-Upgrade::MailReport", report_mode
-        )
-        write_text(UNATTENDED_FILE, unattended)
+    await apply_report_settings(report_to, report_mode, from_address)
 
     await run(["systemctl", "reload", "postfix"], check=True)
     return await status()
+
+
+async def apply_report_settings(
+    report_to: str = "", report_mode: str = "only-on-error", from_address: str = ""
+) -> Dict[str, object]:
+    """Wire unattended-upgrades notifications (Mail / MailReport / Sender).
+
+    Creates ``50unattended-upgrades`` when the system has none, so reports
+    also work on minimal installs where the package ships no configuration.
+    Also sets ``Unattended-Upgrade::Sender`` so reports are sent from the
+    relay account's address - hosted mail servers often reject mail whose
+    From does not match the authenticated user.
+    """
+    if report_mode not in REPORT_MODES:
+        raise ValueError(f"report_mode must be one of {REPORT_MODES}")
+    if not from_address:
+        from_address = str(_read_state().get("from_address", "") or "")
+    target = resolve_report_target(report_to, from_address)
+
+    from . import unattended as unattended_mod
+
+    unattended = read_text(UNATTENDED_FILE) or unattended_mod.base_config()
+    unattended = unattended_mod.upsert_setting(unattended, "Unattended-Upgrade::Mail", target)
+    unattended = unattended_mod.upsert_setting(unattended, "Unattended-Upgrade::MailReport", report_mode)
+    if valid_email(from_address):
+        unattended = unattended_mod.upsert_setting(
+            unattended, "Unattended-Upgrade::Sender", from_address
+        )
+    write_text(UNATTENDED_FILE, unattended)
+
+    state = _read_state()
+    state.update({"report_to": target, "report_mode": report_mode})
+    write_text(MAIL_STATE_FILE, json.dumps(state, indent=2) + "\n")
+    return state
 
 
 def test_command(from_address: str, recipient: str) -> list:
