@@ -20,6 +20,10 @@ const state = {
   duTimer: null,
   updateChecked: false,
   updateTag: "",
+  cronFiles: [],
+  cronEdit: null,
+  sysctlFiles: [],
+  sysctlEdit: null,
 };
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -128,6 +132,8 @@ const TITLES = {
   software: "Software",
   storage: "Storage",
   logs: "Logs & Processes",
+  cron: "Cron",
+  sysctl: "Sysctl",
   terminal: "Terminal",
   jobs: "Jobs",
   audit: "Audit Log",
@@ -146,6 +152,8 @@ const LOADERS = {
   software: loadSoftware,
   storage: loadStorage,
   logs: loadLogsView,
+  cron: loadCron,
+  sysctl: loadSysctl,
   terminal: loadTerminal,
   jobs: loadJobs,
   audit: loadAudit,
@@ -247,7 +255,7 @@ async function loadNetwork() {
         <label>DNS servers (comma separated)
           <input type="text" name="dns" value="${esc((iface.dns || []).join(", "))}" placeholder="1.1.1.1, 8.8.8.8">
         </label>
-        <button class="btn btn-primary" type="submit">Apply (with 90s auto-revert)</button>
+        <button class="btn btn-primary" type="submit">Apply (with 90s Auto-Revert)</button>
       </form>
     </div>`;
   }).join("");
@@ -447,6 +455,309 @@ $("#uu-dry-run").addEventListener("click", async () => {
     const job = await api("/updates/dry-run", { method: "POST" });
     toast("Dry run started", "success");
     openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
+
+/* ------------------------------------------------------------------- cron */
+
+async function loadCron() {
+  const data = await api("/cron");
+  state.cronFiles = data.files || [];
+  state.cronSchedules = data.schedules || [];
+  const kindLabels = {
+    system: "system crontab",
+    "cron.d": "cron.d drop-in",
+    user: "user crontab",
+  };
+  $("#cron-summary").textContent =
+    `${data.jobs || 0} job(s) in ${state.cronFiles.length} file(s)`;
+  $("#cron-files").innerHTML = state.cronFiles.map((file) => {
+    if (file.kind === "error") {
+      return `<div class="card"><h2><code>${esc(file.path)}</code></h2>`
+        + `<p class="muted">This file could not be read: ${esc(file.detail || "")}</p></div>`;
+    }
+    const rows = (file.entries || []).map((entry) => `
+      <tr${entry.enabled ? "" : ' class="muted"'}>
+        <td><code>${esc(entry.schedule)}</code>${entry.enabled ? "" : " (disabled)"}${entry.valid ? "" : ' <span class="badge">invalid</span>'}</td>
+        <td>${esc(entry.user || file.owner)}</td>
+        <td><code>${esc(entry.command)}</code></td>
+        <td>
+          <button class="btn btn-small" type="button" data-cron-edit="${esc(file.path)}" data-cron-index="${entry.index}">Edit</button>
+          <button class="btn btn-small btn-danger" type="button" data-cron-delete="${esc(file.path)}" data-cron-index="${entry.index}">Delete</button>
+        </td>
+      </tr>`).join("");
+    return `
+      <div class="card">
+        <h2><code>${esc(file.path)}</code> <span class="badge">${kindLabels[file.kind] || file.kind}</span></h2>
+        ${rows
+          ? `<table class="table"><thead><tr><th>Schedule</th><th>Run As</th><th>Command</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<p class="muted">No jobs in this file.</p>'}
+        <div class="form-row">
+          <button class="btn" type="button" data-cron-add="${esc(file.path)}">Add Job</button>
+          ${file.kind === "system" ? "" : `<button class="btn btn-danger" type="button" data-cron-deletefile="${esc(file.path)}">Delete File</button>`}
+        </div>
+      </div>`;
+  }).join("") || '<div class="card"><p class="muted">No cron files found.</p></div>';
+  $("#cron-file").innerHTML = state.cronFiles
+    .filter((file) => file.kind !== "error")
+    .map((file) => `<option value="${esc(file.path)}">${esc(file.path)}</option>`).join("");
+}
+
+function openCronModal(path, index) {
+  const file = (state.cronFiles || []).find((item) => item.path === path);
+  const entry = index >= 0
+    ? ((file && file.entries) || []).find((item) => item.index === index) || null
+    : null;
+  state.cronEdit = { path, index: entry ? entry.index : -1, raw: entry ? entry.raw : "" };
+  $("#cron-modal-title").textContent = entry ? "Edit Job" : "Add Job";
+  $("#cron-modal-path").textContent = entry ? path : "Adding a new job";
+  $("#cron-target-row").classList.toggle("hidden", !!entry);
+  $("#cron-file").value = path;
+  $("#cron-schedule").value = entry ? entry.schedule : "*/5 * * * *";
+  $("#cron-command").value = entry ? entry.command : "";
+  $("#cron-user").value = entry ? entry.user : (file ? file.owner : "root");
+  // a user crontab has no user column; its owner is implied
+  $("#cron-user").disabled = !!(file && file.kind === "user");
+  $("#cron-enabled").checked = entry ? !!entry.enabled : true;
+  $("#cron-modal-delete").classList.toggle("hidden", !entry);
+  $("#cron-schedules-hint").innerHTML = (state.cronSchedules || [])
+    .map((preset) => `<button class="btn btn-small" type="button" data-cron-preset="${esc(preset)}">${esc(preset)}</button>`)
+    .join(" ");
+  $("#cron-modal").classList.remove("hidden");
+  $("#cron-schedule").focus();
+}
+
+function closeCronModal() {
+  $("#cron-modal").classList.add("hidden");
+  state.cronEdit = null;
+}
+
+$("#cron-refresh").addEventListener("click", () => loadCron());
+$("#cron-add").addEventListener("click", () => openCronModal($("#cron-file").value, -1));
+$("#cron-modal-close").addEventListener("click", closeCronModal);
+$("#cron-modal-cancel").addEventListener("click", closeCronModal);
+
+$("#cron-schedules-hint").addEventListener("click", (event) => {
+  const preset = event.target.closest("[data-cron-preset]");
+  if (preset) $("#cron-schedule").value = preset.dataset.cronPreset;
+});
+
+$("#view-cron").addEventListener("click", async (event) => {
+  const edit = event.target.closest("[data-cron-edit]");
+  if (edit) return openCronModal(edit.dataset.cronEdit, Number(edit.dataset.cronIndex));
+  const add = event.target.closest("[data-cron-add]");
+  if (add) return openCronModal(add.dataset.cronAdd, -1);
+
+  const drop = event.target.closest("[data-cron-delete]");
+  if (drop) {
+    const entry = ((state.cronFiles.find((f) => f.path === drop.dataset.cronDelete) || {}).entries || [])
+      .find((item) => item.index === Number(drop.dataset.cronIndex));
+    if (!window.confirm(`Delete this job?\n\n${entry ? entry.schedule + " " + entry.command : ""}`)) return;
+    try {
+      await api("/cron/delete", {
+        method: "POST",
+        body: { path: drop.dataset.cronDelete, index: Number(drop.dataset.cronIndex), expected: entry ? entry.raw : "" },
+      });
+      toast("Cron job deleted", "success");
+      loadCron();
+    } catch (err) { toast(err.message, "error"); }
+    return;
+  }
+
+  const dropFile = event.target.closest("[data-cron-deletefile]");
+  if (dropFile) {
+    const path = dropFile.dataset.cronDeletefile;
+    if (!window.confirm(`Delete ${path} and every job in it? This cannot be undone.`)) return;
+    try {
+      await api("/cron/delete-file", { method: "POST", body: { path } });
+      toast("Cron file deleted", "success");
+      loadCron();
+    } catch (err) { toast(err.message, "error"); }
+  }
+});
+
+$("#cron-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const edit = state.cronEdit || { path: $("#cron-file").value, index: -1, raw: "" };
+  try {
+    await api("/cron/entry", {
+      method: "POST",
+      body: {
+        path: edit.path || $("#cron-file").value,
+        index: edit.index,
+        schedule: $("#cron-schedule").value.trim(),
+        command: $("#cron-command").value.trim(),
+        user: $("#cron-user").value.trim(),
+        enabled: $("#cron-enabled").checked,
+        expected: edit.raw,
+      },
+    });
+    toast(edit.index < 0 ? "Cron job added" : "Cron job saved", "success");
+    closeCronModal();
+    loadCron();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#cron-modal-delete").addEventListener("click", async () => {
+  const edit = state.cronEdit;
+  if (!edit || edit.index < 0) return;
+  if (!window.confirm("Delete this cron job?")) return;
+  try {
+    await api("/cron/delete", { method: "POST", body: { path: edit.path, index: edit.index, expected: edit.raw } });
+    toast("Cron job deleted", "success");
+    closeCronModal();
+    loadCron();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+/* ----------------------------------------------------------------- sysctl */
+
+async function loadSysctl() {
+  const data = await api("/sysctl");
+  state.sysctlFiles = data.files || [];
+  $("#sysctl-summary").textContent =
+    `${data.settings || 0} setting(s) in ${state.sysctlFiles.length} file(s)`;
+  $("#sysctl-files").innerHTML = state.sysctlFiles.map((file) => {
+    if (file.kind === "error") {
+      return `<div class="card"><h2><code>${esc(file.path)}</code></h2>`
+        + `<p class="muted">This file could not be read: ${esc(file.detail || "")}</p></div>`;
+    }
+    const rows = (file.entries || []).map((entry) => `
+      <tr${entry.valid ? "" : ' class="muted"'}>
+        <td><code>${esc(entry.key)}</code></td>
+        <td><code>${esc(entry.value)}</code></td>
+        <td>${entry.runtime === null || entry.runtime === undefined
+          ? '<span class="muted">-</span>'
+          : `<code>${esc(entry.runtime)}</code>${entry.changed ? ' <span class="badge">pending</span>' : ""}`}</td>
+        <td>
+          <button class="btn btn-small" type="button" data-sysctl-edit="${esc(file.path)}" data-sysctl-index="${entry.index}">Edit</button>
+          <button class="btn btn-small btn-danger" type="button" data-sysctl-delete="${esc(file.path)}" data-sysctl-index="${entry.index}">Delete</button>
+        </td>
+      </tr>`).join("");
+    const label = file.kind === "main" ? "applied last" : "drop-in";
+    return `
+      <div class="card">
+        <h2><code>${esc(file.path)}</code> <span class="badge">${label}</span></h2>
+        ${rows
+          ? `<table class="table"><thead><tr><th>Parameter</th><th>Configured</th><th>Runtime</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<p class="muted">No settings in this file.</p>'}
+        <div class="form-row">
+          <button class="btn" type="button" data-sysctl-add="${esc(file.path)}">Add Setting</button>
+          ${file.kind === "main" ? "" : `<button class="btn btn-danger" type="button" data-sysctl-deletefile="${esc(file.path)}">Delete File</button>`}
+        </div>
+      </div>`;
+  }).join("") || '<div class="card"><p class="muted">No sysctl configuration files found.</p></div>';
+  $("#sysctl-file").innerHTML = [
+    `<option value="${esc(data.default_file)}">${esc(data.default_file)} (new)</option>`,
+    ...state.sysctlFiles
+      .filter((file) => file.kind !== "error")
+      .map((file) => `<option value="${esc(file.path)}">${esc(file.path)}</option>`),
+  ].join("");
+}
+
+function openSysctlModal(path, index) {
+  const file = (state.sysctlFiles || []).find((item) => item.path === path);
+  const entry = index >= 0
+    ? ((file && file.entries) || []).find((item) => item.index === index) || null
+    : null;
+  state.sysctlEdit = { path, index: entry ? entry.index : -1, raw: entry ? entry.raw : "" };
+  $("#sysctl-modal-title").textContent = entry ? "Edit Setting" : "Add Setting";
+  $("#sysctl-modal-path").textContent = entry ? path : "Adding a new setting";
+  $("#sysctl-target-row").classList.toggle("hidden", !!entry);
+  $("#sysctl-file").value = path;
+  $("#sysctl-key").value = entry ? entry.key : "";
+  $("#sysctl-value").value = entry ? entry.value : "";
+  const runtime = entry ? entry.runtime : null;
+  $("#sysctl-runtime-hint").textContent = runtime === null || runtime === undefined
+    ? ""
+    : `The kernel is currently using ${runtime} for this parameter.`;
+  $("#sysctl-modal-delete").classList.toggle("hidden", !entry);
+  $("#sysctl-modal").classList.remove("hidden");
+  $("#sysctl-key").focus();
+}
+
+function closeSysctlModal() {
+  $("#sysctl-modal").classList.add("hidden");
+  state.sysctlEdit = null;
+}
+
+$("#sysctl-refresh").addEventListener("click", () => loadSysctl());
+
+$("#sysctl-apply").addEventListener("click", async () => {
+  try {
+    await api("/sysctl/apply", { method: "POST" });
+    toast("All sysctl settings applied", "success");
+    loadSysctl();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#sysctl-add").addEventListener("click", () => openSysctlModal($("#sysctl-file").value, -1));
+$("#sysctl-modal-close").addEventListener("click", closeSysctlModal);
+$("#sysctl-modal-cancel").addEventListener("click", closeSysctlModal);
+
+$("#view-sysctl").addEventListener("click", async (event) => {
+  const edit = event.target.closest("[data-sysctl-edit]");
+  if (edit) return openSysctlModal(edit.dataset.sysctlEdit, Number(edit.dataset.sysctlIndex));
+  const add = event.target.closest("[data-sysctl-add]");
+  if (add) return openSysctlModal(add.dataset.sysctlAdd, -1);
+
+  const drop = event.target.closest("[data-sysctl-delete]");
+  if (drop) {
+    const file = state.sysctlFiles.find((f) => f.path === drop.dataset.sysctlDelete) || {};
+    const entry = (file.entries || []).find((item) => item.index === Number(drop.dataset.sysctlIndex));
+    if (!window.confirm(`Remove this setting?\n\n${entry ? `${entry.key} = ${entry.value}` : ""}`)) return;
+    try {
+      await api("/sysctl/delete", {
+        method: "POST",
+        body: { path: drop.dataset.sysctlDelete, index: Number(drop.dataset.sysctlIndex), expected: entry ? entry.raw : "" },
+      });
+      toast("Setting removed", "success");
+      loadSysctl();
+    } catch (err) { toast(err.message, "error"); }
+    return;
+  }
+
+  const dropFile = event.target.closest("[data-sysctl-deletefile]");
+  if (dropFile) {
+    const path = dropFile.dataset.sysctlDeletefile;
+    if (!window.confirm(`Delete ${path}? Settings from other files will still apply.`)) return;
+    try {
+      await api("/sysctl/delete-file", { method: "POST", body: { path } });
+      toast("File deleted", "success");
+      loadSysctl();
+    } catch (err) { toast(err.message, "error"); }
+  }
+});
+
+$("#sysctl-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const edit = state.sysctlEdit || { path: $("#sysctl-file").value, index: -1, raw: "" };
+  try {
+    await api("/sysctl/entry", {
+      method: "POST",
+      body: {
+        path: edit.path || $("#sysctl-file").value,
+        index: edit.index,
+        key: $("#sysctl-key").value.trim(),
+        value: $("#sysctl-value").value.trim(),
+        expected: edit.raw,
+      },
+    });
+    toast(edit.index < 0 ? "Setting added and applied" : "Setting saved and applied", "success");
+    closeSysctlModal();
+    loadSysctl();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#sysctl-modal-delete").addEventListener("click", async () => {
+  const edit = state.sysctlEdit;
+  if (!edit || edit.index < 0) return;
+  if (!window.confirm("Remove this setting and re-apply?")) return;
+  try {
+    await api("/sysctl/delete", { method: "POST", body: { path: edit.path, index: edit.index, expected: edit.raw } });
+    toast("Setting removed", "success");
+    closeSysctlModal();
+    loadSysctl();
   } catch (err) { toast(err.message, "error"); }
 });
 

@@ -46,6 +46,12 @@ SSHD_CONFIG = rooted("etc", "ssh", "sshd_config")
 NFTABLES_CONF = rooted("etc", "nftables.conf")
 UFW_DIR = rooted("etc", "ufw")
 SUDOERS_D = rooted("etc", "sudoers.d")
+CRONTAB = rooted("etc", "crontab")
+SYSCTL_CONF = rooted("etc", "sysctl.conf")
+SYSCTL_D = rooted("etc", "sysctl.d")
+PROC_SYS = rooted("proc", "sys")
+CRON_D = rooted("etc", "cron.d")
+CRON_SPOOL = rooted("var", "spool", "cron", "crontabs")
 VAR_LOG_DIR = rooted("var", "log")
 
 # LinuStart state.

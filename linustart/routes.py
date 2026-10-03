@@ -25,7 +25,9 @@ from .modules import packages as packages_mod
 from .modules import procs as procs_mod
 from .modules import services as services_mod
 from .modules import sshd as sshd_mod
+from .modules import cron as cron_mod
 from .modules import sudoers as sudoers_mod
+from .modules import sysctl as sysctl_mod
 from .modules import sysinfo as sysinfo_mod
 from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
@@ -160,6 +162,44 @@ class AgingBody(BaseModel):
     max_days: Optional[int] = None
     warn_days: Optional[int] = None
     expiry: Optional[str] = None
+
+
+class CronBody(BaseModel):
+    path: str
+    schedule: str = ""
+    command: str = ""
+    user: str = ""
+    enabled: bool = True
+    index: int = -1  # -1 appends a new job
+    expected: str = ""  # the raw line as loaded; refuses stale edits
+
+
+class CronDeleteBody(BaseModel):
+    path: str
+    index: int
+    expected: str = ""
+
+
+class CronFileBody(BaseModel):
+    path: str
+
+
+class SysctlBody(BaseModel):
+    path: str
+    key: str = ""
+    value: str = ""
+    index: int = -1  # -1 appends a new setting
+    expected: str = ""  # the raw line as loaded; refuses stale edits
+
+
+class SysctlDeleteBody(BaseModel):
+    path: str
+    index: int
+    expected: str = ""
+
+
+class SysctlFileBody(BaseModel):
+    path: str
 
 
 class SudoersBody(BaseModel):
@@ -1019,6 +1059,68 @@ def build_router(
         audit.record("process.kill", f"signal {result['signal']} sent to PID {result['pid']}")
         return result
 
+    # ---- cron ---------------------------------------------------------------
+    @router.get("/cron", dependencies=guard)
+    async def cron_list() -> Dict[str, object]:
+        return cron_mod.list_files()
+
+    @router.post("/cron/entry", dependencies=guard)
+    async def cron_upsert(body: CronBody) -> Dict[str, object]:
+        try:
+            if body.index < 0:
+                result = await cron_mod.add_entry(
+                    body.path, body.schedule, body.command, body.user, body.enabled
+                )
+                verb = "added"
+            else:
+                result = await cron_mod.update_entry(
+                    body.path,
+                    body.index,
+                    body.schedule,
+                    body.command,
+                    body.user,
+                    body.enabled,
+                    body.expected,
+                )
+                verb = "updated" if body.enabled else "disabled"
+        except ValueError as exc:
+            audit.record("cron.update", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("cron.update", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record(
+            "cron.update",
+            f"job {verb} in {body.path}: {body.schedule} {body.command[:120]}",
+        )
+        return result
+
+    @router.post("/cron/delete", dependencies=guard)
+    async def cron_delete(body: CronDeleteBody) -> Dict[str, object]:
+        try:
+            result = await cron_mod.delete_entry(body.path, body.index, body.expected)
+        except ValueError as exc:
+            audit.record("cron.delete", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("cron.delete", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("cron.delete", f"removed line {body.index} from {body.path}")
+        return result
+
+    @router.post("/cron/delete-file", dependencies=guard)
+    async def cron_delete_file(body: CronFileBody) -> Dict[str, object]:
+        try:
+            result = await cron_mod.delete_file(body.path)
+        except ValueError as exc:
+            audit.record("cron.delete", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("cron.delete", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("cron.delete", f"deleted {body.path}")
+        return result
+
     # ---- users: aging, history and sudo rules ----------------------------
     @router.get("/users/{name}/aging", dependencies=guard)
     async def users_aging(name: str) -> Dict[str, object]:
@@ -1073,6 +1175,67 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         audit.record("sudoers.remove", f"removed sudo rule for {name}")
         return result
+
+    # ---- sysctl --------------------------------------------------------------
+    @router.get("/sysctl", dependencies=guard)
+    async def sysctl_list() -> Dict[str, object]:
+        return sysctl_mod.list_files()
+
+    @router.post("/sysctl/entry", dependencies=guard)
+    async def sysctl_upsert(body: SysctlBody) -> Dict[str, object]:
+        try:
+            if body.index < 0:
+                result = await sysctl_mod.add_entry(body.path, body.key, body.value)
+                verb = "added"
+            else:
+                result = await sysctl_mod.update_entry(
+                    body.path, body.index, body.key, body.value, body.expected
+                )
+                verb = "updated"
+        except ValueError as exc:
+            audit.record("sysctl.update", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("sysctl.update", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("sysctl.update", f"{verb} {body.key}={body.value} in {body.path}")
+        return result
+
+    @router.post("/sysctl/delete", dependencies=guard)
+    async def sysctl_delete(body: SysctlDeleteBody) -> Dict[str, object]:
+        try:
+            result = await sysctl_mod.delete_entry(body.path, body.index, body.expected)
+        except ValueError as exc:
+            audit.record("sysctl.delete", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("sysctl.delete", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("sysctl.delete", f"removed line {body.index} from {body.path}")
+        return result
+
+    @router.post("/sysctl/delete-file", dependencies=guard)
+    async def sysctl_delete_file(body: SysctlFileBody) -> Dict[str, object]:
+        try:
+            result = await sysctl_mod.delete_file(body.path)
+        except ValueError as exc:
+            audit.record("sysctl.delete", str(exc), ok=False)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("sysctl.delete", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("sysctl.delete", f"deleted {body.path}")
+        return result
+
+    @router.post("/sysctl/apply", dependencies=guard)
+    async def sysctl_apply() -> Dict[str, object]:
+        try:
+            output = await sysctl_mod._apply_checked()
+        except RuntimeError as exc:
+            audit.record("sysctl.apply", str(exc), ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("sysctl.apply", "applied all sysctl settings")
+        return {"output": output, **sysctl_mod.list_files()}
 
     # ---- web terminal -----------------------------------------------------
     @router.get("/terminal/sessions", dependencies=guard)

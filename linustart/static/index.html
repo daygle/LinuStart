@@ -23,13 +23,15 @@
         <button class="nav-item" data-view="software">Software</button>
         <button class="nav-item" data-view="storage">Storage</button>
         <button class="nav-item" data-view="logs">Logs &amp; Processes</button>
+        <button class="nav-item" data-view="cron">Cron</button>
+        <button class="nav-item" data-view="sysctl">Sysctl</button>
         <button class="nav-item" data-view="terminal">Terminal</button>
         <button class="nav-item" data-view="jobs">Jobs</button>
         <button class="nav-item" data-view="audit">Audit Log</button>
       </nav>
       <div class="sidebar-footer">
         <div id="server-label">-</div>
-        <button id="logout" class="btn btn-ghost btn-small">Forget token</button>
+        <button id="logout" class="btn btn-ghost btn-small">Forget Token</button>
       </div>
     </aside>
 
@@ -79,7 +81,7 @@
               <label>Hostname
                 <input type="text" id="hostname-input" placeholder="my-server" autocomplete="off">
               </label>
-              <button class="btn btn-primary" type="submit">Set hostname</button>
+              <button class="btn btn-primary" type="submit">Set Hostname</button>
             </form>
           </div>
           <div class="card">
@@ -89,7 +91,7 @@
                 <input type="text" id="timezone-input" list="timezone-list" placeholder="Europe/Amsterdam" autocomplete="off">
                 <datalist id="timezone-list"></datalist>
               </label>
-              <button class="btn btn-primary" type="submit">Set timezone</button>
+              <button class="btn btn-primary" type="submit">Set Timezone</button>
             </form>
             <div class="form-row">
               <span id="ntp-status" class="muted"></span>
@@ -162,8 +164,8 @@
               </label>
               <p class="muted">Reports are delivered through the SMTP relay on the Email page, from the mail account configured there. "Only on error" mails you when an upgrade run fails. A local name like <code>root</code> delivers on this machine.</p>
               <div class="form-row">
-                <button class="btn btn-primary" type="submit">Save settings</button>
-                <button class="btn" type="button" id="uu-dry-run">Run dry run</button>
+                <button class="btn btn-primary" type="submit">Save Settings</button>
+                <button class="btn" type="button" id="uu-dry-run">Run Dry Run</button>
               </div>
             </form>
           </div>
@@ -183,7 +185,7 @@
                 <textarea id="uu-blacklist" rows="3" spellcheck="false" placeholder="linux-image-generic"></textarea>
               </label>
               <div class="form-row">
-                <button class="btn btn-primary" type="submit">Save origins</button>
+                <button class="btn btn-primary" type="submit">Save Origins</button>
               </div>
             </form>
             <h2 class="spaced">Configuration Files</h2>
@@ -194,6 +196,37 @@
         </div>
       </section>
 
+      <!-- CRON -->
+      <section class="view hidden" id="view-cron">
+        <div class="toolbar">
+          <div class="form-row">
+            <span class="muted" id="cron-summary"></span>
+          </div>
+          <div class="form-row">
+            <button class="btn" type="button" id="cron-refresh">Refresh</button>
+            <button class="btn btn-primary" type="button" id="cron-add">Add Job</button>
+          </div>
+        </div>
+        <div id="cron-files"></div>
+        <p class="muted">Job files come from <code>/etc/crontab</code>, <code>/etc/cron.d/</code> and the user crontabs in <code>/var/spool/cron/crontabs/</code>. Every change is backed up to <code>/var/lib/linustart/backups</code> and recorded in the audit log.</p>
+      </section>
+
+      <!-- SYSCTL -->
+      <section class="view hidden" id="view-sysctl">
+        <div class="toolbar">
+          <div class="form-row">
+            <span class="muted" id="sysctl-summary"></span>
+          </div>
+          <div class="form-row">
+            <button class="btn" type="button" id="sysctl-refresh">Refresh</button>
+            <button class="btn" type="button" id="sysctl-apply">Apply Settings</button>
+            <button class="btn btn-primary" type="button" id="sysctl-add">Add Setting</button>
+          </div>
+        </div>
+        <div id="sysctl-files"></div>
+        <p class="muted">Every change is written to the file, applied with <code>sysctl --system</code>, and rolled back automatically if the kernel rejects it. The runtime column shows what the kernel is using right now, read from <code>/proc/sys</code>. Files are applied in order, so <code>/etc/sysctl.conf</code> wins over the drop-ins in <code>/etc/sysctl.d/</code>.</p>
+      </section>
+
       <!-- EMAIL -->
       <section class="view hidden" id="view-email">
         <div class="toolbar">
@@ -202,8 +235,8 @@
             <span class="muted" id="mail-transport"></span>
           </div>
           <div class="form-row">
-            <button class="btn btn-danger hidden" id="mail-remove-conflicts" type="button">Remove conflicting mailers</button>
-            <button class="btn hidden" id="mail-install" type="button">Install postfix</button>
+            <button class="btn btn-danger hidden" id="mail-remove-conflicts" type="button">Remove Conflicting Mailers</button>
+            <button class="btn hidden" id="mail-install" type="button">Install Postfix</button>
           </div>
         </div>
         <div class="cards">
@@ -243,7 +276,7 @@
                   <option value="always">Always</option>
                 </select>
               </label>
-              <button class="btn btn-primary" type="submit">Save mail settings</button>
+              <button class="btn btn-primary" type="submit">Save Mail Settings</button>
             </form>
           </div>
           <div class="card">
@@ -254,7 +287,7 @@
                 <input type="text" id="mail-test-to" placeholder="me@example.com" autocomplete="off">
               </label>
               <div class="form-row">
-                <button class="btn btn-primary" type="submit">Send test email</button>
+                <button class="btn btn-primary" type="submit">Send Test Email</button>
               </div>
             </form>
             <h2 class="spaced">Current Setup</h2>
@@ -291,7 +324,7 @@
               <label>SSH public key (optional)
                 <textarea id="new-ssh-key" rows="3" placeholder="ssh-ed25519 AAAA... me@laptop"></textarea>
               </label>
-              <button class="btn btn-primary" type="submit">Create user</button>
+              <button class="btn btn-primary" type="submit">Create User</button>
             </form>
           </div>
         </div>
@@ -306,8 +339,8 @@
             <button class="tab" data-tab="search">Search</button>
           </div>
           <div class="form-row">
-            <button class="btn" id="pkg-refresh">Refresh package lists</button>
-            <button class="btn btn-primary" id="pkg-upgrade">Upgrade all</button>
+            <button class="btn" id="pkg-refresh">Refresh Package Lists</button>
+            <button class="btn btn-primary" id="pkg-upgrade">Upgrade All</button>
           </div>
         </div>
         <div class="card">
@@ -333,9 +366,9 @@
             <h2>Panel Version</h2>
             <div id="update-info" class="muted">Not checked yet.</div>
             <div class="form-row">
-              <button class="btn" id="update-check" type="button">Check for updates</button>
-              <button class="btn btn-primary" id="update-install" type="button" disabled>Install update</button>
-              <button class="btn btn-danger" id="update-rollback" type="button">Roll back</button>
+              <button class="btn" id="update-check" type="button">Check for Updates</button>
+              <button class="btn btn-primary" id="update-install" type="button" disabled>Install Update</button>
+              <button class="btn btn-danger" id="update-rollback" type="button">Roll Back</button>
             </div>
           </div>
           <div class="card">
@@ -352,9 +385,9 @@
             <h2>Cache &amp; Cleanup</h2>
             <div id="apt-stats" class="muted"></div>
             <div class="form-row">
-              <button class="btn" id="pkg-autoremove">Remove unused packages</button>
-              <button class="btn" id="pkg-autoclean">Remove obsolete downloads</button>
-              <button class="btn" id="pkg-clean">Clear package cache</button>
+              <button class="btn" id="pkg-autoremove">Remove Unused Packages</button>
+              <button class="btn" id="pkg-autoclean">Remove Obsolete Downloads</button>
+              <button class="btn" id="pkg-clean">Clear Package Cache</button>
             </div>
             <h2 class="spaced">What each action does</h2>
             <ul class="list muted">
@@ -402,7 +435,7 @@
               <label>Address <span class="muted">source for incoming, destination for outgoing</span>
                 <input type="text" id="fw-address" placeholder="any or 10.0.0.0/8" autocomplete="off">
               </label>
-              <button class="btn btn-primary" type="submit">Add rule (with auto-revert)</button>
+              <button class="btn btn-primary" type="submit">Add Rule (with Auto-Revert)</button>
             </form>
             <h2 class="spaced">Default Policies</h2>
             <form id="fw-policy-form" class="form">
@@ -416,7 +449,7 @@
                 <input type="checkbox" id="fw-enabled"> <span>Firewall enabled</span>
               </label>
               <p class="muted">When switching incoming to deny, an allow rule for the SSH port is added automatically if none exists.</p>
-              <button class="btn btn-primary" type="submit">Apply policies (with auto-revert)</button>
+              <button class="btn btn-primary" type="submit">Apply Policies (with Auto-Revert)</button>
             </form>
           </div>
         </div>
@@ -470,7 +503,7 @@
               <label>Client alive count max
                 <input type="text" id="ssh-alive-count" placeholder="3" maxlength="2">
               </label>
-              <button class="btn btn-primary" type="submit">Apply hardening (with auto-revert)</button>
+              <button class="btn btn-primary" type="submit">Apply Hardening (with Auto-Revert)</button>
             </form>
           </div>
         </div>
@@ -586,8 +619,8 @@
   <div id="revert-bar" class="revert-bar hidden">
     <span id="revert-text">Network changes applied.</span>
     <span id="revert-countdown" class="countdown"></span>
-    <button class="btn btn-primary" id="revert-confirm">Keep changes</button>
-    <button class="btn btn-danger" id="revert-discard">Revert now</button>
+    <button class="btn btn-primary" id="revert-confirm">Keep Changes</button>
+    <button class="btn btn-danger" id="revert-discard">Revert Now</button>
   </div>
 
   <!-- Job log modal -->
@@ -600,7 +633,7 @@
       <div class="muted" id="job-modal-meta"></div>
       <pre class="log log-tall" id="job-modal-log"></pre>
       <div class="form-row">
-        <button class="btn btn-danger" id="job-modal-cancel">Cancel job</button>
+        <button class="btn btn-danger" id="job-modal-cancel">Cancel Job</button>
       </div>
     </div>
   </div>
@@ -628,14 +661,14 @@
             <label class="switch-row">
               <input type="checkbox" id="edit-locked"> <span>Account locked</span>
             </label>
-            <button class="btn btn-primary" type="submit">Save details</button>
+            <button class="btn btn-primary" type="submit">Save Details</button>
           </form>
           <h2 class="spaced">Set Password</h2>
           <form id="user-password-form" class="form">
             <label>New password
               <input type="password" id="edit-password" placeholder="at least 8 characters" autocomplete="new-password">
             </label>
-            <button class="btn" type="submit">Set password</button>
+            <button class="btn" type="submit">Set Password</button>
           </form>
           <h2 class="spaced">Password Aging</h2>
           <form id="user-aging-form" class="form">
@@ -648,7 +681,7 @@
             <label>Account expires (YYYY-MM-DD or never)
               <input type="text" id="aging-expiry" placeholder="never" autocomplete="off">
             </label>
-            <button class="btn" type="submit">Save aging policy</button>
+            <button class="btn" type="submit">Save Aging Policy</button>
           </form>
         </div>
         <div class="card">
@@ -658,15 +691,15 @@
             <label>Add public key
               <textarea id="edit-key" rows="3" placeholder="ssh-ed25519 AAAA... me@laptop"></textarea>
             </label>
-            <button class="btn" type="submit">Add key</button>
+            <button class="btn" type="submit">Add Key</button>
           </form>
           <h2 class="spaced">Sudo Rule</h2>
           <label class="switch-row">
             <input type="checkbox" id="sudo-nopasswd"> <span>Passwordless sudo (NOPASSWD)</span>
           </label>
           <div class="form-row">
-            <button class="btn" id="sudo-save" type="button">Install sudo rule</button>
-            <button class="btn btn-danger" id="sudo-remove" type="button">Remove sudo rule</button>
+            <button class="btn" id="sudo-save" type="button">Install Sudo Rule</button>
+            <button class="btn btn-danger" id="sudo-remove" type="button">Remove Sudo Rule</button>
           </div>
           <p class="muted" id="sudo-status"></p>
           <h2 class="spaced">Login History</h2>
@@ -675,7 +708,7 @@
           <label class="switch-row">
             <input type="checkbox" id="delete-remove-home"> <span>Also delete home directory and mail</span>
           </label>
-          <button class="btn btn-danger" id="user-delete" type="button">Delete this user</button>
+          <button class="btn btn-danger" id="user-delete" type="button">Delete This User</button>
         </div>
       </div>
     </div>
@@ -698,6 +731,64 @@
       </div>
       <h2 class="spaced">Recent Journal</h2>
       <pre class="log log-tall" id="service-modal-log"></pre>
+    </div>
+  </div>
+
+  <!-- Cron editor -->
+  <div class="modal" id="cron-modal">
+    <div class="modal-box">
+      <button class="modal-close" id="cron-modal-close" type="button" aria-label="Close">&times;</button>
+      <h3 id="cron-modal-title">Add Job</h3>
+      <p class="muted" id="cron-modal-path"></p>
+      <form id="cron-form" class="form">
+        <label id="cron-target-row" class="hidden">File
+          <select id="cron-file"></select>
+        </label>
+        <label>Schedule <span class="muted">(five fields: minute hour day month weekday)</span>
+          <input type="text" id="cron-schedule" value="*/5 * * * *" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="form-row" id="cron-schedules-hint"></div>
+        <label>Command
+          <input type="text" id="cron-command" placeholder="/usr/local/bin/job --flag" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Run as <span class="muted">(user crontabs always run as their owner)</span>
+          <input type="text" id="cron-user" placeholder="root" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="switch-row">
+          <input type="checkbox" id="cron-enabled" checked> <span>Enabled</span>
+        </label>
+        <div class="form-row">
+          <button class="btn btn-primary" type="submit">Save Job</button>
+          <button class="btn btn-danger hidden" type="button" id="cron-modal-delete">Delete Job</button>
+          <button class="btn" type="button" id="cron-modal-cancel">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Sysctl editor -->
+  <div class="modal" id="sysctl-modal">
+    <div class="modal-box">
+      <button class="modal-close" id="sysctl-modal-close" type="button" aria-label="Close">&times;</button>
+      <h3 id="sysctl-modal-title">Add Setting</h3>
+      <p class="muted" id="sysctl-modal-path"></p>
+      <form id="sysctl-form" class="form">
+        <label id="sysctl-target-row" class="hidden">File
+          <select id="sysctl-file"></select>
+        </label>
+        <label>Parameter
+          <input type="text" id="sysctl-key" placeholder="vm.swappiness" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Value
+          <input type="text" id="sysctl-value" placeholder="10" autocomplete="off" spellcheck="false">
+        </label>
+        <p class="muted" id="sysctl-runtime-hint"></p>
+        <div class="form-row">
+          <button class="btn btn-primary" type="submit">Save Setting</button>
+          <button class="btn btn-danger hidden" type="button" id="sysctl-modal-delete">Delete Setting</button>
+          <button class="btn" type="button" id="sysctl-modal-cancel">Cancel</button>
+        </div>
+      </form>
     </div>
   </div>
 
