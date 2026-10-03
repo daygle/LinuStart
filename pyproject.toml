@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linustart"
-version = "0.1.0"
+version = "1.0.0"  # must match linustart/__init__.py - tests/test_updater.py enforces it
 description = "Self-hosted web panel for Debian and Ubuntu server administration: networking, unattended updates, hostname, timezone and APT package management."
 readme = "README.md"
 requires-python = ">=3.9"

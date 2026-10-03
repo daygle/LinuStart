@@ -21,6 +21,8 @@ any time. Pure helpers are testable without root or network access.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import os
 import re
@@ -219,7 +221,12 @@ def download(url: str, dest: Path) -> None:
 def extract_tree(archive: Path, dest: Path) -> Path:
     with tarfile.open(archive, "r:gz") as tar:
         top = validate_members([member.name for member in tar.getmembers()])
-        tar.extractall(dest)
+        try:
+            # Python 3.12+ can filter members; 3.14 rejects archives that do
+            # not opt in, and the DeprecationWarning is noise in job logs.
+            tar.extractall(dest, filter="data")
+        except TypeError:  # older interpreters have no filter argument
+            tar.extractall(dest)
     return dest / top
 
 
@@ -275,14 +282,46 @@ def schedule_restart() -> None:
         log("could not schedule the restart automatically; run: systemctl restart linustart")
 
 
+@contextlib.contextmanager
+def staging_dir(app_dir: Path):
+    """Scratch space on the *same filesystem* as the application tree.
+
+    The obvious choice, /tmp, is usually tmpfs while /opt is not, and
+    os.replace cannot rename across filesystems - the update would die with
+    EXDEV after the backup was already written.
+    """
+    try:
+        path = tempfile.mkdtemp(prefix=".linustart-update-", dir=str(app_dir.parent))
+    except OSError:
+        path = tempfile.mkdtemp(prefix="linustart-update-")
+    try:
+        yield Path(path)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _replace(src: Path, dst: Path) -> None:
+    """Rename src onto dst, coping with a cross-device move."""
+    try:
+        os.replace(src, dst)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        elif dst.exists():
+            dst.unlink()
+        shutil.move(str(src), str(dst))
+
+
 def replace_tree(app_dir: Path, new_tree: Path) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     old = app_dir.parent / f".linustart-old-{stamp}"
-    os.replace(app_dir, old)
+    _replace(app_dir, old)
     try:
-        os.replace(new_tree, app_dir)
+        _replace(new_tree, app_dir)
     except OSError:
-        os.replace(old, app_dir)
+        _replace(old, app_dir)
         raise
     return old
 
@@ -314,8 +353,8 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "") -> int:
         tarball_url = release["tarball_url"]
         log(f"latest release: {tag} ({release['published_at'] or 'no date'})")
 
-    with tempfile.TemporaryDirectory(prefix="linustart-update-") as tmp:
-        tmp_path = Path(tmp)
+    with staging_dir(app_dir) as tmp:
+        tmp_path = tmp
         if tarball:
             archive = Path(tarball)
             if not archive.is_file():
@@ -355,7 +394,7 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "") -> int:
             log(f"update failed: {exc}")
             log("restoring the previous version")
             shutil.rmtree(app_dir, ignore_errors=True)
-            os.replace(old_tree, app_dir)
+            _replace(old_tree, app_dir)
             try:
                 pip_install(app_dir)
                 log("previous version restored")
@@ -382,9 +421,9 @@ def cmd_rollback() -> int:
         log(f"no application backup found in {BACKUP_DIR}")
         return 1
     log(f"restoring {backup}")
-    with tempfile.TemporaryDirectory(prefix="linustart-rollback-") as tmp:
+    with staging_dir(app_dir) as tmp:
         try:
-            tree = extract_tree(backup, Path(tmp))
+            tree = extract_tree(backup, tmp)
         except (ValueError, tarfile.TarError) as exc:
             log(f"backup is unusable: {exc}")
             return 1

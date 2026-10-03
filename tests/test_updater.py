@@ -6,17 +6,25 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from linustart.updater import (  # noqa: E402
+    _replace,
     apply_command,
     build_api_url,
     is_newer,
     normalize_version,
     parse_release,
+    replace_tree,
     restart_command,
     rollback_command,
+    staging_dir,
     validate_members,
     validate_repo,
     validate_tag,
 )
+
+import errno  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import tempfile  # noqa: E402
 
 RELEASE = {
     "tag_name": "v0.2.0",
@@ -114,6 +122,77 @@ def test_commands():
         pass
     else:
         raise AssertionError("expected ValueError for a hostile tag")
+
+
+def test_staging_dir_lives_beside_the_app():
+    """The swap is a rename, so staging must share the app's filesystem."""
+    with tempfile.TemporaryDirectory() as tmp:
+        app_dir = pathlib.Path(tmp) / "opt" / "linustart" / "app"
+        app_dir.mkdir(parents=True)
+        with staging_dir(app_dir) as staging:
+            assert staging.parent == app_dir.parent
+            assert staging.is_dir()
+        assert not staging.exists()  # cleaned up on exit
+
+
+def test_replace_falls_back_when_filesystems_differ():
+    """/tmp on tmpfs and /opt on the root fs made os.replace raise EXDEV."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        src = root / "src"
+        src.mkdir()
+        (src / "file.txt").write_text("new tree")
+        dst = root / "dst"
+
+        real_replace = os.replace
+
+        def refuse(*_args, **_kwargs):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        os.replace = refuse
+        try:
+            _replace(src, dst)
+        finally:
+            os.replace = real_replace
+        assert not src.exists()
+        assert (dst / "file.txt").read_text() == "new tree"
+
+
+def test_replace_tree_swaps_and_can_undo():
+    with tempfile.TemporaryDirectory() as tmp:
+        app_dir = pathlib.Path(tmp) / "app"
+        app_dir.mkdir()
+        (app_dir / "version.txt").write_text("old")
+        new_tree = app_dir.parent / "new"
+        new_tree.mkdir()
+        (new_tree / "version.txt").write_text("new")
+
+        old_tree = replace_tree(app_dir, new_tree)
+        assert (app_dir / "version.txt").read_text() == "new"
+        assert (old_tree / "version.txt").read_text() == "old"
+        # the previous tree is where a rollback would come from
+        assert old_tree.parent == app_dir.parent
+
+
+def test_version_is_the_single_source_of_truth():
+    """The tag, the package metadata and the running code must agree.
+
+    A release tagged v1.0.0 while the code still said 0.1.0 made the
+    updater roll every install straight back, so pin the two together.
+    """
+    import linustart
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    declared = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+    assert declared, "pyproject.toml has no static version"
+    assert declared.group(1) == linustart.__version__
+    assert re.fullmatch(r"\d{1,4}(\.\d{1,4}){0,3}(-[0-9A-Za-z.]+)?", linustart.__version__), (
+        f"version {linustart.__version__!r} would not pass validate_tag when tagged"
+    )
+    # the updater compares the installed version against the tag
+    assert normalize_version("v" + linustart.__version__) == linustart.__version__
+    assert validate_tag("v" + linustart.__version__)
 
 
 if __name__ == "__main__":
