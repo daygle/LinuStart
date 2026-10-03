@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .paths import CONFIG_FILE
+from .updater import DEFAULT_REPO
 
 
 @dataclass
@@ -16,6 +17,7 @@ class Settings:
     port: int = 8765
     token: Optional[str] = None
     config_path: Path = field(default_factory=lambda: CONFIG_FILE)
+    update_repo: str = DEFAULT_REPO
 
     @property
     def auth_enabled(self) -> bool:
@@ -42,6 +44,8 @@ def load_settings(
             settings.port = data["port"]
         if isinstance(data.get("auth_token"), str) and data["auth_token"]:
             settings.token = data["auth_token"]
+        if isinstance(data.get("update_repo"), str) and data["update_repo"]:
+            settings.update_repo = data["update_repo"]
     if host is not None:
         settings.host = host
     if port is not None:
