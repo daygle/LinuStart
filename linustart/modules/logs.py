@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..paths import VAR_LOG_DIR
-from ..util import is_within, run
+from ..util import run
 
 LOG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
@@ -70,12 +70,18 @@ def tail_text(text: str, lines: int = 200) -> List[str]:
 
 
 def tail_file(path: Path, lines: int = 200) -> List[str]:
-    """Read only the last slice of a (possibly huge) log file."""
-    if not is_within(VAR_LOG_DIR, path):
+    """Read only the last slice of a (possibly huge) log file.
+
+    The realpath-then-prefix check is written out here instead of delegating to
+    util.is_within: the guard has to sit in this function, immediately before
+    the file is opened, for it to be provably about this open.
+    """
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(VAR_LOG_DIR), "")):
         raise ValueError("refusing to read outside /var/log")
     try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
+        size = os.stat(real).st_size
+        with open(real, "rb") as handle:
             handle.seek(max(0, size - MAX_TAIL_BYTES))
             data = handle.read()
     except FileNotFoundError:
@@ -119,6 +125,8 @@ def list_log_files() -> Dict[str, object]:
 def read_log_file(name: str, lines: object = 200) -> Dict[str, object]:
     safe = valid_log_name(name)
     path = VAR_LOG_DIR / safe
-    if not is_within(VAR_LOG_DIR, path):
+    if not os.path.realpath(path).startswith(
+        os.path.join(os.path.realpath(VAR_LOG_DIR), "")
+    ):
         raise ValueError("refusing to read outside /var/log")
     return {"name": safe, "lines": tail_file(path, lines)}

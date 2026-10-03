@@ -19,15 +19,17 @@ from ..paths import GROUP_FILE, PASSWD_FILE, SHADOW_FILE, SHELLS_FILE
 from ..util import read_text, run, write_text
 
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-# The separator is [ \t]+ and the comment is [^\r\n]* rather than \s+ and .*
-# on purpose: \s matches what .* also matches, so one run of whitespace could
-# be split between the two quantifiers in a growing number of ways. The two
-# character classes are disjoint, which leaves the matcher a single path.
+# The separator is [ \t]+ and the comment starts with [^\s\r\n] rather than
+# \s+ and .*, on purpose: a comment that could itself begin with whitespace
+# would let one run of tabs be split between the two quantifiers in a growing
+# number of ways, which is polynomial backtracking on user-submitted text.
+# A comment always follows its whitespace, so anchoring it on a non-space
+# character costs nothing real and leaves the matcher a single path.
 KEY_RE = re.compile(
     r"^(?P<type>ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp(?:256|384|521)"
     r"|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
     r"[ \t]+(?P<data>[A-Za-z0-9+/=]+)"
-    r"(?:[ \t]+(?P<comment>[^\r\n]*))?\Z"
+    r"(?:[ \t]+(?P<comment>[^\s\r\n][^\r\n]*))?\Z"
 )
 # A real OpenSSH key line is a few hundred bytes. Anything longer is not a key,
 # and refusing it before the regex bounds the work done on user-supplied text.

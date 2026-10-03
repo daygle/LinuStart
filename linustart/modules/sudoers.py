@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..paths import SUDOERS_D
-from ..util import backup, is_within, read_text, run
+from ..util import backup, read_text, run
 from .users import valid_username
 
 PREFIX = "linustart-"
@@ -31,15 +31,14 @@ MODE = 0o440
 def dropin_path(username: str) -> Path:
     """The one place a user name becomes a path.
 
-    Every writer and remover goes through here, so the containment check sits
-    on the single path that every sudoers file is reached by.
+    Every writer and remover goes through here. The containment check that
+    guards the actual filesystem calls lives in set_rule and remove_rule,
+    next to those calls, rather than here: a guard only counts when it can be
+    seen to dominate the operation it protects.
     """
     if not valid_username(username):
         raise ValueError(f"not a valid user name: {username!r}")
-    path = SUDOERS_D / f"{PREFIX}{username}"
-    if not is_within(SUDOERS_D, path):
-        raise ValueError(f"refusing to touch a path outside {SUDOERS_D}: {username!r}")
-    return path
+    return SUDOERS_D / f"{PREFIX}{username}"
 
 
 def build_sudoers_dropin(username: str, nopasswd: bool = False) -> str:
@@ -116,23 +115,33 @@ async def set_rule(username: str, nopasswd: bool = False) -> Dict[str, object]:
     error = await validate_sudoers(content)
     if error:
         raise ValueError(f"sudo rejected the rule: {error}")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Resolve, then confirm the result is still inside /etc/sudoers.d before
+    # any file is created, read or replaced. Doing it here rather than in
+    # dropin_path keeps the check adjacent to the operations it protects.
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(SUDOERS_D), "")):
+        raise ValueError(f"refusing to write outside {SUDOERS_D}: {username!r}")
+    directory = os.path.dirname(real)
+    os.makedirs(directory, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=str(path.parent), prefix=f".{path.name}.", delete=False
+        "w", encoding="utf-8", dir=directory, prefix=f".{os.path.basename(real)}.", delete=False
     ) as handle:
         handle.write(content)
         tmp_name = handle.name
     os.chmod(tmp_name, MODE)
-    if path.exists():
-        backup(path)
-    os.replace(tmp_name, path)
-    return {"file": path.name, "user": username, "nopasswd": nopasswd}
+    if os.path.exists(real):
+        backup(Path(real))
+    os.replace(tmp_name, real)
+    return {"file": os.path.basename(real), "user": username, "nopasswd": nopasswd}
 
 
 def remove_rule(username: str) -> Dict[str, object]:
     path = dropin_path(username)
-    if not path.exists():
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(SUDOERS_D), "")):
+        raise ValueError(f"refusing to touch a path outside {SUDOERS_D}: {username!r}")
+    if not os.path.exists(real):
         raise ValueError(f"no sudo rule installed for {username}")
-    backup(path)
-    path.unlink()
-    return {"file": path.name, "removed": True}
+    backup(Path(real))
+    os.unlink(real)
+    return {"file": os.path.basename(real), "removed": True}

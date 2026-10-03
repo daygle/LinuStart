@@ -154,6 +154,24 @@ def test_valid_authorized_key_still_accepts_real_lines():
     assert valid_authorized_key(f"ssh-rsa {BLOB2}")
     assert valid_authorized_key(f"ecdsa-sha2-nistp521 {BLOB1} a comment")
     assert valid_authorized_key(f"ssh-ed25519 {BLOB1} comment with spaces")
+    # A comment may contain spaces once it has started.
+    assert valid_authorized_key(f"ssh-ed25519 {BLOB1} two words here")
+
+
+def test_valid_authorized_key_anchors_the_comment_on_a_word():
+    # The comment is anchored on a non-space character, so any run of spaces
+    # or tabs between the key and the comment is consumed by the separator
+    # alone. Letting the comment match whitespace too is what let one tab run
+    # be split between the two quantifiers in a growing number of ways, which
+    # CodeQL flagged as polynomial backtracking.
+    for gap in (" ", "\t", "  ", "\t\t", " \t "):
+        line = f"ssh-ed25519 {BLOB1}{gap}bob@laptop"
+        assert valid_authorized_key(line), repr(line)
+        keys = parse_authorized_keys(line + "\n")
+        assert keys[0]["comment"] == "bob@laptop", repr(gap)
+    # A line that is only key material and separators is still a valid key.
+    assert valid_authorized_key(f"ssh-ed25519 {BLOB1} ")
+    assert valid_authorized_key(f"ssh-ed25519 {BLOB1}")
 
 
 def test_valid_authorized_key_refuses_a_second_line():
@@ -168,17 +186,17 @@ def test_valid_authorized_key_refuses_a_second_line():
 
 
 def test_valid_authorized_key_is_not_quadratic_on_whitespace():
-    # The separator and the comment used to be \s+ and .*, which both match a
-    # space, so a long run of spaces could be split between them in a growing
-    # number of ways. With the disjoint classes this stays a single pass; the
-    # bound here is loose on purpose so it cannot flake on a slow machine, it
-    # only fails if the pattern goes back to exploring splits.
+    # Separator and comment must not both be able to match the same tab run,
+    # or one long run of whitespace can be split between them in a growing
+    # number of ways. The bound is loose so it cannot flake on a slow machine;
+    # it only fails if the pattern goes back to exploring splits.
     import time
 
-    crafted = "ssh-ed25519 " + (" " * 60000) + "!"
-    started = time.perf_counter()
-    assert not valid_authorized_key(crafted)
-    assert time.perf_counter() - started < 2.0, "key matching is blowing up on whitespace"
+    for filler in (" ", "\t", " \t " * 3):
+        crafted = "ssh-ed25519 " + (filler * 20000) + "!"
+        started = time.perf_counter()
+        assert not valid_authorized_key(crafted)
+        assert time.perf_counter() - started < 2.0, f"blowing up on {filler!r}"
 
 
 def test_remove_authorized_key():

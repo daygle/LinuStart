@@ -80,28 +80,29 @@ def read_text(path: Path) -> str:
 def is_within(base: Path, candidate: Path) -> bool:
     """True when *candidate* really lives at or under *base*.
 
-    Both sides are resolved before the comparison, so a symlink that points
-    out of the tree is rejected instead of followed. Callers use this as the
-    last gate before touching a path that can trace back to a request.
+    Both sides go through os.path.realpath, so a symlink pointing out of the
+    tree is rejected instead of followed.
     """
-    try:
-        target = candidate.resolve()
-        root = base.resolve()
-    except OSError:
-        return False
-    return target == root or root in target.parents
+    root = os.path.realpath(base)
+    real = os.path.realpath(candidate)
+    return real == root or real.startswith(os.path.join(root, ""))
 
 
 def backup(path: Path) -> None:
-    """Copy an existing file into the backup directory before it is rewritten."""
-    if not is_within(ROOT, path):
+    """Copy an existing file into the backup directory before it is rewritten.
+
+    The realpath-then-prefix check is spelled out here rather than delegated
+    to is_within so the guard sits in the same function as the copy below.
+    """
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(ROOT), "")):
         raise ValueError(f"refusing to back up a path outside {ROOT}: {path}")
-    if not path.exists():
+    if not os.path.exists(real):
         return
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    name = f"{stamp}-{str(path).lstrip(os.sep).replace(os.sep, '__')}"
-    shutil.copy2(path, BACKUP_DIR / name)
+    name = f"{stamp}-{real.lstrip(os.sep).replace(os.sep, '__')}"
+    shutil.copy2(real, BACKUP_DIR / name)
 
 
 def write_text(path: Path, content: str) -> None:
@@ -134,7 +135,8 @@ def restore_files(snapshots: Mapping[str, str]) -> None:
     """Restore files captured with :func:`snapshot_files`."""
     for name, content in snapshots.items():
         path = Path(name)
-        if not is_within(ROOT, path):
+        real = os.path.realpath(path)
+        if not real.startswith(os.path.join(os.path.realpath(ROOT), "")):
             raise ValueError(f"refusing to restore a path outside {ROOT}: {path}")
         if content == "":
             if path.exists():
