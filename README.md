@@ -55,17 +55,24 @@ The installer:
 2. checks for other mail transfer agents (`msmtp-mta`, `ssmtp`, `exim4`, …) and reports them - they are left working; the Email page switches delivery to Postfix and removes them afterwards,
 3. installs `python3` + venv, `iproute2` and `unattended-upgrades`,
 4. installs the app into `/opt/linustart`,
-5. creates `/etc/linustart/config.json` with a generated access token,
-6. installs and enables the `linustart` systemd service.
+5. creates `/etc/linustart/config.json` with a generated access token and the
+   listen address (every interface, so the panel is reachable on the LAN),
+6. offers to open the port in `ufw` (or prints the `firewalld` equivalent),
+7. installs and enables the `linustart` systemd service, then prints both the
+   loopback and LAN URLs.
 
-Then forward the port over SSH (recommended) and open the UI:
+Open `http://<server-ip>:8765` from any machine on the LAN and paste the token
+the installer printed. To reach it from outside the LAN, forward the port over
+SSH instead of exposing it:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 user@your-server
 # browser: http://127.0.0.1:8765   (paste the token printed by the installer)
 ```
 
-Remove it again with `sudo ./install.sh --uninstall`.
+Install flags: `--loopback` binds `127.0.0.1` only, `--host ADDR` and
+`--port N` set the listen address, and `./install.sh --uninstall` removes the
+service again.
 
 ### Updating LinuStart
 
@@ -89,10 +96,21 @@ is restored automatically. Roll back manually at any time from the GUI or:
 Air-gapped servers can update from a downloaded archive:
 `python -m linustart.updater apply --tarball release.tar.gz --tag v0.2.0`.
 
-### Exposing it on the network
+### Bind addresses
 
-By default it binds to `127.0.0.1:8765`. To serve it directly, edit
-`/etc/linustart/config.json`:
+A fresh install listens on `0.0.0.0`, so the panel is reachable from the LAN
+straight away, protected only by the generated access token. The installer prints
+both URLs and offers to open the port in `ufw`.
+
+Change the listen address at install time or afterwards:
+
+```bash
+./install.sh --loopback                        # back to 127.0.0.1, tunnel only
+./install.sh --host 192.168.1.10 --port 8765   # one interface only
+```
+
+or by editing `/etc/linustart/config.json` and running
+`systemctl restart linustart`:
 
 ```json
 {
@@ -102,9 +120,10 @@ By default it binds to `127.0.0.1:8765`. To serve it directly, edit
 }
 ```
 
-and `sudo systemctl restart linustart`. The service **refuses to bind to a
-non-loopback address without a token**. Ideally, put it behind a reverse proxy
-with TLS (Caddy/nginx) rather than exposing plain HTTP.
+The service **refuses to bind to a non-loopback address without a token**, and
+the installer generates one when an existing config lacks it. Because this is a
+root-level admin panel served over plain HTTP, prefer an SSH tunnel or a TLS
+reverse proxy (Caddy/nginx) over exposing it beyond a trusted network.
 
 ## Running without installing (development)
 
