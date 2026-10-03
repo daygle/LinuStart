@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..paths import SUDOERS_D
-from ..util import backup, read_text, run
+from ..util import backup, is_within, read_text, run
 from .users import valid_username
 
 PREFIX = "linustart-"
@@ -29,9 +29,17 @@ MODE = 0o440
 # --------------------------------------------------------------------------
 
 def dropin_path(username: str) -> Path:
+    """The one place a user name becomes a path.
+
+    Every writer and remover goes through here, so the containment check sits
+    on the single path that every sudoers file is reached by.
+    """
     if not valid_username(username):
         raise ValueError(f"not a valid user name: {username!r}")
-    return SUDOERS_D / f"{PREFIX}{username}"
+    path = SUDOERS_D / f"{PREFIX}{username}"
+    if not is_within(SUDOERS_D, path):
+        raise ValueError(f"refusing to touch a path outside {SUDOERS_D}: {username!r}")
+    return path
 
 
 def build_sudoers_dropin(username: str, nopasswd: bool = False) -> str:

@@ -19,11 +19,19 @@ from ..paths import GROUP_FILE, PASSWD_FILE, SHADOW_FILE, SHELLS_FILE
 from ..util import read_text, run, write_text
 
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+# The separator is [ \t]+ and the comment is [^\r\n]* rather than \s+ and .*
+# on purpose: \s matches what .* also matches, so one run of whitespace could
+# be split between the two quantifiers in a growing number of ways. The two
+# character classes are disjoint, which leaves the matcher a single path.
 KEY_RE = re.compile(
-    r"^(?P<type>ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)"
+    r"^(?P<type>ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp(?:256|384|521)"
     r"|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
-    r"\s+(?P<data>[A-Za-z0-9+/=]+)(?:\s+(?P<comment>.*))?$"
+    r"[ \t]+(?P<data>[A-Za-z0-9+/=]+)"
+    r"(?:[ \t]+(?P<comment>[^\r\n]*))?\Z"
 )
+# A real OpenSSH key line is a few hundred bytes. Anything longer is not a key,
+# and refusing it before the regex bounds the work done on user-supplied text.
+MAX_KEY_LENGTH = 8192
 
 MIN_PASSWORD_LENGTH = 8
 DEFAULT_SHELLS = ["/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/sbin/nologin"]
@@ -68,9 +76,21 @@ def valid_password(password: str) -> bool:
     )
 
 
+def _key_match(line: str) -> Optional[re.Match]:
+    """Match one authorized_keys line, or None when it is not a plausible key.
+
+    Every caller goes through here so the length cap and the pattern stay in
+    step, and so a line is matched once rather than validated and re-matched.
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > MAX_KEY_LENGTH:
+        return None
+    return KEY_RE.match(stripped)
+
+
 def valid_authorized_key(line: str) -> bool:
     """Accept only lines whose key material decodes as a plausible key blob."""
-    match = KEY_RE.match(line.strip())
+    match = _key_match(line)
     if not match:
         return False
     data = match.group("data")
@@ -171,7 +191,7 @@ def parse_authorized_keys(text: str) -> List[Dict[str, object]]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        match = KEY_RE.match(stripped)
+        match = _key_match(stripped)
         keys.append(
             {
                 "index": index,
@@ -187,12 +207,13 @@ def parse_authorized_keys(text: str) -> List[Dict[str, object]]:
 def add_authorized_key(content: str, key_line: str) -> str:
     """Append a key unless the same key material is already present."""
     stripped = key_line.strip()
-    if not valid_authorized_key(stripped):
+    match = _key_match(stripped)
+    if not match or not valid_authorized_key(stripped):
         raise ValueError("that does not look like an OpenSSH public key")
-    data = KEY_RE.match(stripped).group("data")  # type: ignore[union-attr]
+    data = match.group("data")
     for existing in parse_authorized_keys(content):
-        match = KEY_RE.match(str(existing["raw"]))
-        if match and match.group("data") == data:
+        other = _key_match(str(existing["raw"]))
+        if other and other.group("data") == data:
             return content  # already there, keep as is
     if content and not content.endswith("\n"):
         content += "\n"

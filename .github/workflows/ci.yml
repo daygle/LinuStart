@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# This workflow only ever checks out the repository and runs tests: it never
+# publishes anything, so it gets read access and nothing else. Declaring it
+# stops a future step from quietly inheriting a wider token.
+permissions:
+  contents: read
+
 # The panel is a Python/Javascript project: the OS checks are the gates.
 # Debian/Ubuntu is the target, and the interpreter of record is the venv's
 # python (system python has broken pydantic, so system python must never
@@ -48,7 +54,7 @@ jobs:
 
       - name: Confirm the installed package actually imports
         run: |
-          .venv/bin/python -c "import linustart.updater, linustart.modules.cron, linustart.modules.sysctl; print('imports ok')"
+          .venv/bin/python -c "import linustart.app, linustart.routes, linustart.updater, linustart.modules.cron, linustart.modules.sysctl, linustart.modules.users, linustart.modules.logs, linustart.modules.sudoers; print('imports ok')"
 
   # The shell always returns the status of the last command in the pipeline,
   # so a failing earlier step is reported here as a failing gate.

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..paths import VAR_LOG_DIR
-from ..util import run
+from ..util import is_within, run
 
 LOG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
@@ -71,6 +71,8 @@ def tail_text(text: str, lines: int = 200) -> List[str]:
 
 def tail_file(path: Path, lines: int = 200) -> List[str]:
     """Read only the last slice of a (possibly huge) log file."""
+    if not is_within(VAR_LOG_DIR, path):
+        raise ValueError("refusing to read outside /var/log")
     try:
         size = path.stat().st_size
         with path.open("rb") as handle:
@@ -117,6 +119,6 @@ def list_log_files() -> Dict[str, object]:
 def read_log_file(name: str, lines: object = 200) -> Dict[str, object]:
     safe = valid_log_name(name)
     path = VAR_LOG_DIR / safe
-    if not path.resolve().is_relative_to(VAR_LOG_DIR.resolve()):
+    if not is_within(VAR_LOG_DIR, path):
         raise ValueError("refusing to read outside /var/log")
     return {"name": safe, "lines": tail_file(path, lines)}

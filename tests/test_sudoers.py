@@ -10,6 +10,26 @@ from linustart.modules.sudoers import (  # noqa: E402
     dropin_path,
     parse_sudoers_dropin,
 )
+from linustart.paths import SUDOERS_D  # noqa: E402
+from linustart.util import is_within  # noqa: E402
+
+
+def test_dropin_path_stays_inside_sudoers_d():
+    # Every sudoers write and removal goes through dropin_path, so this is
+    # the one place a user name is allowed to become a path.
+    path = dropin_path("deploy")
+    assert is_within(SUDOERS_D, path)
+    assert path.name == "linustart-deploy"
+    assert path.parent == SUDOERS_D
+
+
+def test_dropin_path_refuses_traversal():
+    for bad in ["..", "../escape", "a/b", "/etc/passwd", "..\\escape", "de ploy", ""]:
+        try:
+            dropin_path(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"dropin_path accepted {bad!r}")
 
 
 def test_build_sudoers_dropin():

@@ -2,9 +2,11 @@
 
 import pathlib
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from linustart.modules import cron as cron_mod  # noqa: E402
 from linustart.modules.cron import (  # noqa: E402
     append_entry,
     parse_entries,
@@ -259,6 +261,27 @@ def test_invalid_schedule_is_still_listed():
     assert len(entries) == 1
     assert entries[0].valid is False
     assert entries[0].command == "/bin/true"
+
+
+def test_list_files_does_not_echo_exception_text():
+    """A file that cannot be listed must not put raw OSError text in the body.
+
+    The listing is served straight to the browser, and OSError messages carry
+    paths and permissions the caller has no business seeing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = pathlib.Path(tmp) / "broken"
+        broken.mkdir()  # reading a directory raises, which is what we want
+        original = cron_mod._iter_paths
+        cron_mod._iter_paths = lambda: [broken]
+        try:
+            listing = cron_mod.list_files()
+        finally:
+            cron_mod._iter_paths = original
+    entry = listing["files"][0]
+    assert entry["kind"] == "error"
+    assert entry["detail"] == cron_mod.READ_ERROR
+    assert "Errno" not in entry["detail"]
 
 
 if __name__ == "__main__":

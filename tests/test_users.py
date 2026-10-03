@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from linustart.modules.users import (  # noqa: E402
+    MAX_KEY_LENGTH,
     add_authorized_key,
     memberships,
     parse_authorized_keys,
@@ -135,6 +136,49 @@ def test_add_authorized_key_rejects_garbage():
         pass
     else:
         raise AssertionError("expected ValueError for a non-key line")
+
+
+def test_valid_authorized_key_refuses_oversized_line():
+    # A real key line is a few hundred bytes; the cap is checked before the
+    # pattern runs so untrusted input cannot make us do unbounded work.
+    oversized = "ssh-ed25519 " + ("A" * (MAX_KEY_LENGTH + 1))
+    assert not valid_authorized_key(oversized)
+    # Padding it out with a comment does not get it under the cap either.
+    sneaky = "ssh-ed25519 " + BLOB1 + " " + ("c" * MAX_KEY_LENGTH)
+    assert not valid_authorized_key(sneaky)
+
+
+def test_valid_authorized_key_still_accepts_real_lines():
+    # The hardening must not narrow what a genuine key looks like.
+    assert valid_authorized_key(f"  ssh-ed25519 {BLOB1} bob@laptop  ")
+    assert valid_authorized_key(f"ssh-rsa {BLOB2}")
+    assert valid_authorized_key(f"ecdsa-sha2-nistp521 {BLOB1} a comment")
+    assert valid_authorized_key(f"ssh-ed25519 {BLOB1} comment with spaces")
+
+
+def test_valid_authorized_key_refuses_a_second_line():
+    # A newline would let one submitted line install two keys.
+    assert not valid_authorized_key(f"ssh-ed25519 {BLOB1}\nssh-rsa {BLOB2}")
+    try:
+        add_authorized_key(KEYS, f"ssh-ed25519 {BLOB3}\nssh-rsa {BLOB2}")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an embedded newline")
+
+
+def test_valid_authorized_key_is_not_quadratic_on_whitespace():
+    # The separator and the comment used to be \s+ and .*, which both match a
+    # space, so a long run of spaces could be split between them in a growing
+    # number of ways. With the disjoint classes this stays a single pass; the
+    # bound here is loose on purpose so it cannot flake on a slow machine, it
+    # only fails if the pattern goes back to exploring splits.
+    import time
+
+    crafted = "ssh-ed25519 " + (" " * 60000) + "!"
+    started = time.perf_counter()
+    assert not valid_authorized_key(crafted)
+    assert time.perf_counter() - started < 2.0, "key matching is blowing up on whitespace"
 
 
 def test_remove_authorized_key():

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from .paths import BACKUP_DIR
+from .paths import BACKUP_DIR, ROOT
 
 
 @dataclass
@@ -77,8 +77,25 @@ def read_text(path: Path) -> str:
         return ""
 
 
+def is_within(base: Path, candidate: Path) -> bool:
+    """True when *candidate* really lives at or under *base*.
+
+    Both sides are resolved before the comparison, so a symlink that points
+    out of the tree is rejected instead of followed. Callers use this as the
+    last gate before touching a path that can trace back to a request.
+    """
+    try:
+        target = candidate.resolve()
+        root = base.resolve()
+    except OSError:
+        return False
+    return target == root or root in target.parents
+
+
 def backup(path: Path) -> None:
     """Copy an existing file into the backup directory before it is rewritten."""
+    if not is_within(ROOT, path):
+        raise ValueError(f"refusing to back up a path outside {ROOT}: {path}")
     if not path.exists():
         return
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -117,6 +134,8 @@ def restore_files(snapshots: Mapping[str, str]) -> None:
     """Restore files captured with :func:`snapshot_files`."""
     for name, content in snapshots.items():
         path = Path(name)
+        if not is_within(ROOT, path):
+            raise ValueError(f"refusing to restore a path outside {ROOT}: {path}")
         if content == "":
             if path.exists():
                 backup(path)

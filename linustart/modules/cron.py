@@ -51,6 +51,11 @@ SCHEDULE_FIELDS = (
 )
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 MAX_COMMAND = 2000
+# Shown in place of an exception when one file cannot be listed. The raw
+# OSError text can name paths and permissions the API caller has no business
+# seeing, so the response carries a fixed reason and the operator looks at the
+# path itself.
+READ_ERROR = "cannot read this file"
 
 
 # --------------------------------------------------------------------------
@@ -418,8 +423,12 @@ def list_files() -> Dict[str, object]:
         try:
             kind, owner = classify(path)
             files.append(CronFile(path=path, kind=kind, owner=owner).to_dict())
-        except (OSError, ValueError) as exc:
-            files.append({"path": logical_path(path), "kind": "error", "detail": str(exc), "entries": []})
+        except (OSError, ValueError):
+            # The operator gets a stable reason, never the raw exception:
+            # OSError text carries paths and permissions we need not echo.
+            files.append(
+                {"path": logical_path(path), "kind": "error", "detail": READ_ERROR, "entries": []}
+            )
     return {
         "files": files,
         "jobs": sum(int(item.get("count") or 0) for item in files),

@@ -1296,14 +1296,16 @@ def build_router(
     async def update_check() -> Dict[str, object]:
         try:
             release = await asyncio.to_thread(updater_mod.latest_release, settings.update_repo)
-        except updater_mod.NoReleases as exc:
+        except updater_mod.NoReleases:
+            # A fixed reason, not the exception text: the response body is
+            # served to the browser and must not echo raw error detail.
             return {
                 "current": __version__,
                 "latest": None,
                 "tag": "",
                 "newer_available": False,
                 "no_releases": True,
-                "detail": str(exc),
+                "detail": "this repository has no published releases yet",
                 "repo": settings.update_repo,
                 "update_supported": updater_mod.is_managed_install(),
                 "app_dir": str(updater_mod.app_source_dir()),

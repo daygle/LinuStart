@@ -2,9 +2,11 @@
 
 import pathlib
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from linustart.modules import sysctl as sysctl_mod  # noqa: E402
 from linustart.modules.sysctl import (  # noqa: E402
     append_entry,
     apply_problems,
@@ -210,6 +212,27 @@ def test_runtime_value_of_a_known_key():
     assert runtime_value("vm.definitely.not.a.real.key") is None
     # globs have no runtime value
     assert runtime_value("net.ipv4.conf.*.rp_filter") is None
+
+
+def test_list_files_does_not_echo_exception_text():
+    """A file that cannot be listed must not put raw OSError text in the body.
+
+    The listing is served straight to the browser, and OSError messages carry
+    paths and permissions the caller has no business seeing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = pathlib.Path(tmp) / "broken"
+        broken.mkdir()  # reading a directory raises, which is what we want
+        original = sysctl_mod._iter_paths
+        sysctl_mod._iter_paths = lambda: [broken]
+        try:
+            listing = sysctl_mod.list_files()
+        finally:
+            sysctl_mod._iter_paths = original
+    entry = listing["files"][0]
+    assert entry["kind"] == "error"
+    assert entry["detail"] == sysctl_mod.READ_ERROR
+    assert "Errno" not in entry["detail"]
 
 
 if __name__ == "__main__":

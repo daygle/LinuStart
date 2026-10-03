@@ -26,6 +26,11 @@ from ..util import read_text, restore_files, run, write_text
 
 DEFAULT_FILE = "99-linustart.conf"
 MAX_VALUE = 200
+# Shown in place of an exception when one file cannot be listed. The raw
+# OSError text can name paths and permissions the API caller has no business
+# seeing, so the response carries a fixed reason and the operator looks at the
+# path itself.
+READ_ERROR = "cannot read this file"
 
 # Kernel parameter names: letters, digits and the separators that appear in
 # real keys (vm.swappiness, fs.file-max, net.ipv4.conf.all.rp_filter), plus
@@ -275,8 +280,12 @@ def list_files() -> Dict[str, object]:
     for path in _iter_paths():
         try:
             files.append(SysctlFile(path=path, kind=classify(path)).to_dict())
-        except (OSError, ValueError) as exc:
-            files.append({"path": logical_path(path), "kind": "error", "detail": str(exc), "entries": []})
+        except (OSError, ValueError):
+            # The operator gets a stable reason, never the raw exception:
+            # OSError text carries paths and permissions we need not echo.
+            files.append(
+                {"path": logical_path(path), "kind": "error", "detail": READ_ERROR, "entries": []}
+            )
     default_file = logical_path(SYSCTL_D / DEFAULT_FILE)
     return {
         "files": files,
