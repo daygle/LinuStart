@@ -9,7 +9,8 @@ on:
 # The panel is a Python/Javascript project: the OS checks are the gates.
 # Debian/Ubuntu is the target, and the interpreter of record is the venv's
 # python (system python has broken pydantic, so system python must never
-# run this suite).
+# run this suite). The runner is Linux, so the venv interpreter lives in
+# .venv/bin - a Windows checkout's .venv/Scripts/python is not a thing here.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -25,8 +26,8 @@ jobs:
       - name: Install the venv (like install.sh cares about it)
         run: |
           python -m venv .venv
-          .venv/Scripts/python -m pip install -U pip setuptools wheel
-          .venv/Scripts/python -m pip install -e .[dev]
+          .venv/bin/python -m pip install -U pip setuptools wheel
+          .venv/bin/python -m pip install -e .[dev]
 
       - name: Install the OS checks so the panel tests are meaningful
         run: |
@@ -35,7 +36,7 @@ jobs:
 
       - name: Run the suite the same way a developer does
         run: |
-          .venv/Scripts/python -m pytest -q
+          .venv/bin/python -m pytest -q
 
       # Static checks are cheap and fast - they run on the current commit
       # regardless of what the tests do next to it.
@@ -47,7 +48,7 @@ jobs:
 
       - name: Confirm the installed package actually imports
         run: |
-          .venv/Scripts/python -c "import linustart.updater, linustart.modules.cron, linustart.modules.sysctl; print('imports ok')"
+          .venv/bin/python -c "import linustart.updater, linustart.modules.cron, linustart.modules.sysctl; print('imports ok')"
 
   # The shell always returns the status of the last command in the pipeline,
   # so a failing earlier step is reported here as a failing gate.
