@@ -258,3 +258,4 @@ view to see exactly what happened.
   over stdin (never argv), and SSH public keys must decode as real key
   material before they are accepted.
 - Prefer SSH port forwarding over exposing the port publicly.
+- Security policy, validation boundaries, backups and the audit log are documented in [SECURITY.md](SECURITY.md).
