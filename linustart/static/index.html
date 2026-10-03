@@ -735,7 +735,7 @@
   </div>
 
   <!-- Cron editor -->
-  <div class="modal" id="cron-modal">
+  <div class="modal hidden" id="cron-modal">
     <div class="modal-box">
       <button class="modal-close" id="cron-modal-close" type="button" aria-label="Close">&times;</button>
       <h3 id="cron-modal-title">Add Job</h3>
@@ -767,7 +767,7 @@
   </div>
 
   <!-- Sysctl editor -->
-  <div class="modal" id="sysctl-modal">
+  <div class="modal hidden" id="sysctl-modal">
     <div class="modal-box">
       <button class="modal-close" id="sysctl-modal-close" type="button" aria-label="Close">&times;</button>
       <h3 id="sysctl-modal-title">Add Setting</h3>
@@ -793,7 +793,7 @@
   </div>
 
   <!-- Token modal -->
-  <div id="token-modal" class="modal">
+  <div id="token-modal" class="modal hidden">
     <div class="modal-box modal-small">
       <h2>Authentication required</h2>
       <p class="muted">Enter the access token from <code>/etc/linustart/config.json</code> on the server.</p>

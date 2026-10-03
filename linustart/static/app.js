@@ -1877,5 +1877,8 @@ async function loadTerminal() {
 
 /* ------------------------------------------------------------------- init */
 
-if (state.token) hideTokenModal(); else showTokenModal();
+// Do not open the token modal just because nothing is stored yet: an install
+// with no token configured never returns 401, so it would sit in front of the
+// panel forever. api() opens it on a real 401, and the logout button opens it
+// when a token is needed again.
 loadView();
