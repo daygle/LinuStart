@@ -11,6 +11,7 @@ import base64
 import binascii
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -28,6 +29,24 @@ MIN_PASSWORD_LENGTH = 8
 DEFAULT_SHELLS = ["/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/sbin/nologin"]
 SUDO_GROUP = "sudo"
 ROOT_USER = "root"
+
+MAX_AGE_DAYS = 99999
+MAX_WARN_DAYS = 99
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+TIMESTAMP_RE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"\s?\d{1,2} \d{2}:\d{2}:\d{2} \d{4}(?: [+-]\d{4})?"
+)
+CHAGE_LABELS = {
+    "last password change": "last_change",
+    "password expires": "password_expires",
+    "password inactive": "password_inactive",
+    "account expires": "account_expires",
+    "minimum number of days between password change": "min_days",
+    "maximum number of days between password change": "max_days",
+    "number of days of warning before password expires": "warn_days",
+}
 
 
 # --------------------------------------------------------------------------
@@ -370,3 +389,148 @@ def _secure_key_file(path: Path, entry: Dict[str, object]) -> None:
     except (OSError, ValueError):
         # Non-root dev sandboxes can't chown; permissions still applied.
         pass
+
+
+# --------------------------------------------------------------------------
+# Login history (last) and password aging (chage)
+# --------------------------------------------------------------------------
+
+def parse_last(text: str) -> List[Dict[str, str]]:
+    """Parse ``last -F`` output into structured login records.
+
+    Handles both rows with a source field (``pts/0 192.168.1.5 ...``) and
+    local rows without one, ``reboot`` rows and the trailing ``wtmp begins``
+    notice. Unknown shapes are skipped rather than guessed at.
+    """
+    entries: List[Dict[str, str]] = []
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        if not stripped or stripped.startswith(("wtmp begins", "btmp begins", "utmp begins")):
+            continue
+        parts = stripped.split(maxsplit=2)
+        if len(parts) < 2:
+            continue
+        user = parts[0]
+        terminal = parts[1]
+        remainder = parts[2] if len(parts) > 2 else ""
+        if user == "reboot":
+            if remainder.startswith("system boot"):
+                remainder = remainder[len("system boot"):].strip()
+            elif terminal == "system" and remainder.startswith("boot"):
+                remainder = remainder[len("boot"):].strip()
+            terminal = "system boot"
+        stamps = TIMESTAMP_RE.findall(remainder)
+        if not stamps:
+            continue
+        source = remainder.split(stamps[0], 1)[0].strip()
+        joined = remainder
+        if "still logged in" in joined or "still running" in joined:
+            status = "logged in"
+        elif "gone - no logout" in joined:
+            status = "no logout"
+        elif " down " in f" {joined} ":
+            status = "system down"
+        elif "crash" in joined:
+            status = "crash"
+        else:
+            status = "finished"
+        duration = ""
+        match = re.search(r"\((\d+:\d+)\)", joined)
+        if match:
+            duration = match.group(1)
+        entries.append(
+            {
+                "user": user,
+                "terminal": terminal,
+                "source": source,
+                "login": stamps[0],
+                "logout": stamps[1] if len(stamps) > 1 else "",
+                "status": status,
+                "duration": duration,
+            }
+        )
+    return entries
+
+
+def parse_chage(text: str) -> Dict[str, str]:
+    """Parse ``chage -l`` output into normalized field names."""
+    fields: Dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        label, _, value = line.partition(":")
+        key = CHAGE_LABELS.get(" ".join(label.lower().split()))
+        if key:
+            fields[key] = value.strip()
+    return fields
+
+
+def valid_expiry(value: str) -> Optional[str]:
+    """Normalize an account expiry: a YYYY-MM-DD date or None for 'never'."""
+    value = (value or "").strip()
+    if value.lower() in ("", "never", "-1", "none"):
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("expiry must be a YYYY-MM-DD date or 'never'")
+    return value
+
+
+def valid_day_count(value: object, high: int, label: str) -> int:
+    try:
+        days = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a number of days")
+    if not 0 <= days <= high:
+        raise ValueError(f"{label} must be between 0 and {high}")
+    return days
+
+
+async def login_history(name: Optional[str] = None, limit: int = 30) -> List[Dict[str, str]]:
+    limit = max(1, min(200, limit))
+    argv = ["last", "-F", "-n", str(limit)]
+    if name:
+        _passwd_entry(name)
+        argv.append(name)
+    try:
+        result = await run(argv)
+    except OSError as exc:
+        raise RuntimeError(f"the 'last' command is not available: {exc}")
+    return parse_last(result.stdout)
+
+
+async def aging(name: str) -> Dict[str, str]:
+    """Password aging policy for one account (``chage -l``)."""
+    _passwd_entry(name)
+    try:
+        result = await run(["chage", "-l", name])
+    except OSError as exc:
+        raise RuntimeError(f"the 'chage' command is not available: {exc}")
+    if not result.ok:
+        raise RuntimeError(f"reading aging policy failed: {result.stderr.strip()}")
+    return parse_chage(result.stdout)
+
+
+async def set_aging(
+    name: str,
+    *,
+    max_days: Optional[int] = None,
+    warn_days: Optional[int] = None,
+    expiry: Optional[str] = None,
+) -> Dict[str, str]:
+    """Update password aging: max age, expiry warning and account expiry."""
+    _passwd_entry(name)
+    commands = []
+    if max_days is not None:
+        commands.append(["chage", "-M", str(valid_day_count(max_days, MAX_AGE_DAYS, "max age")), name])
+    if warn_days is not None:
+        commands.append(["chage", "-W", str(valid_day_count(warn_days, MAX_WARN_DAYS, "warning days")), name])
+    if expiry is not None:
+        date = valid_expiry(expiry)
+        commands.append(["chage", "-E", date or "-1", name])
+    if not commands:
+        raise ValueError("nothing to change")
+    for argv in commands:
+        await run(argv, check=True)
+    return await aging(name)
