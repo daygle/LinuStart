@@ -1,7 +1,7 @@
 # LinuStart
 
 A self-hosted web panel for administering **Debian and Ubuntu** servers:
-networking, unattended updates, hostname, timezone and APT package management —
+networking, unattended updates, hostname, timezone and APT package management -
 from one clean dashboard.
 
 Built for the "day 0 → day N" case: it installs onto a freshly created server
@@ -30,9 +30,9 @@ what makes the same binary behave correctly on both Debian and Ubuntu.
 | **Networking** | Detects `netplan`, `NetworkManager` or `ifupdown`; DHCP ↔ static editing, gateway, DNS; **90-second auto-revert** so a bad change can't lock you out of SSH |
 | **Hostname** | `hostnamectl` + `/etc/hosts` kept in sync (`127.0.1.1` line) |
 | **Timezone / NTP** | `timedatectl` timezone picker (all tzdata names) and NTP toggle |
-| **Unattended updates** | Full control of `20auto-upgrades` + `50unattended-upgrades`: enable/disable, package-list refresh frequency, download-in-advance, autoclean interval, auto-reboot (+time, +reboot-with-users), unused-kernel cleanup, new/unused dependency removal, auto-fix interrupted dpkg; editable **upgrade origins** (`Unattended-Upgrade::Origins-Pattern` *or* legacy `Allowed-Origins`, one per line) and **package blacklist**, so Debian-only origin patterns are one paste away; activity log and dry-run button. Detects a missing `unattended-upgrades` package (common on minimal Debian) and offers to install it. **Email reports** (always / on-change / **only-on-error**) delivered through your SMTP relay to any address *or local mailbox* (e.g. `root`) — the configuration file is created when missing and the sender is set to your relay account so hosted mail servers accept the reports |
+| **Unattended updates** | Full control of `20auto-upgrades` + `50unattended-upgrades`: enable/disable, package-list refresh frequency, download-in-advance, autoclean interval, auto-reboot (+time, +reboot-with-users), unused-kernel cleanup, new/unused dependency removal, auto-fix interrupted dpkg; editable **upgrade origins** (`Unattended-Upgrade::Origins-Pattern` *or* legacy `Allowed-Origins`, one per line) and **package blacklist**, so Debian-only origin patterns are one paste away; activity log and dry-run button. Detects a missing `unattended-upgrades` package (common on minimal Debian) and offers to install it. **Email reports** (always / on-change / **only-on-error**) delivered through your SMTP relay to any address *or local mailbox* (e.g. `root`) - the configuration file is created when missing and the sender is set to your relay account so hosted mail servers accept the reports |
 | **Email** | Sets up Postfix as an authenticated SMTP relay (smarthost) through **your own mail server** (the mail account hosted there), sending from an address hosted on that server; STARTTLS or SSL on any port; wires unattended-upgrades reports to a mailbox (falling back to the from address when left blank); one-click **test send** through the full mail pipeline. Detects **conflicting mail transfer agents** (`msmtp-mta`, `ssmtp`, `nullmailer`, `exim4`, `sendmail-bin`, `dma`) that would swallow reports and offers one-click removal (client-only tools like plain `msmtp`, `bsd-mailx`, `mailutils` are left untouched). **Existing `msmtp` setups are adopted, not bulldozed**: an `/etc/msmtprc` is detected and the relay form is pre-filled from it, and the password is picked up from the msmtp password file when left blank, so switching delivery to Postfix is one click |
-| **Software** | Search, install, remove APT packages; list upgradable packages; one-click upgrade; **maintenance**: `update`, `upgrade`, `autoremove`, `autoclean`, `clean` — all as background jobs with live logs, plus cache size and autoremove-candidate previews |
+| **Software** | Search, install, remove APT packages; list upgradable packages; one-click upgrade; **maintenance**: `update`, `upgrade`, `autoremove`, `autoclean`, `clean` - all as background jobs with live logs, plus cache size and autoremove-candidate previews |
 | **Users** | Create/maintain accounts: passwords (via `chpasswd`), full name, login shell, sudo membership, lock/unlock, delete (optionally with home); full **SSH key management** with key validation and locked-down `~/.ssh` permissions; **password aging** (`chage`), **login history** (`last`) and per-user **sudo rules** in `sudoers.d` (validated with `visudo -cf`) |
 | **Firewall** | UFW or nftables (auto-detected); allow/deny rules with ports and CIDRs, default policies, enable/disable; the SSH port is kept reachable automatically when switching to a deny-incoming policy; changes use the same **90-second auto-revert** as networking |
 | **SSH hardening** | `sshd_config` management: port, `PermitRootLogin`, password/key auth, `MaxAuthTries`, client-alive settings; every change is validated with `sshd -t` and applied with **90-second auto-revert** so a bad setting can't lock you out |
@@ -40,7 +40,7 @@ what makes the same binary behave correctly on both Debian and Ubuntu.
 | **Storage** | Filesystem usage (`df`) and a **directory-size explorer**: `du` scans run as background jobs with the results parsed into a sortable table |
 | **Logs & Processes** | `journalctl` viewer (unit + priority filters) and safe tails of `/var/log` files; process list sorted by CPU/memory with validated `kill` (TERM/KILL/HUP/INT) |
 | **Terminal** | A web terminal over WebSocket: real PTY-backed shells (optionally as another user via `runuser`), every session recorded to `/var/lib/linustart/terminal/` and noted in the audit log |
-| **Self-update** | Check for and install new LinuStart releases from GitHub in the GUI: downloads the release tarball, backs up the current application to `/var/lib/linustart/backups`, re-installs and restarts the service — with one-click **rollback** to the last backup |
+| **Self-update** | Check for and install new LinuStart releases from GitHub in the GUI: downloads the release tarball, backs up the current application to `/var/lib/linustart/backups`, re-installs and restarts the service - with one-click **rollback** to the last backup |
 | **Safety** | Diff-friendly edits (comments/formatting preserved), automatic backups of every file it rewrites (`/var/lib/linustart/backups`), append-only audit log |
 
 ## Quick install (Debian / Ubuntu)
@@ -52,7 +52,7 @@ sudo ./install.sh
 The installer:
 
 1. verifies the system is in the Debian family (`/etc/os-release`),
-2. checks for other mail transfer agents (`msmtp-mta`, `ssmtp`, `exim4`, …) and reports them — they are left working; the Email page switches delivery to Postfix and removes them afterwards,
+2. checks for other mail transfer agents (`msmtp-mta`, `ssmtp`, `exim4`, …) and reports them - they are left working; the Email page switches delivery to Postfix and removes them afterwards,
 3. installs `python3` + venv, `iproute2` and `unattended-upgrades`,
 4. installs the app into `/opt/linustart`,
 5. creates `/etc/linustart/config.json` with a generated access token,
@@ -136,12 +136,12 @@ OpenAPI docs are served at `/api/docs` when the service runs.
 **Network changes.** Clicking *Apply* writes the backend's native config file
 (and snapshots it first), applies it, and starts a 90-second countdown. If you
 don't click **Keep changes**, the panel restores the previous config and
-re-applies it automatically — even if your SSH connection dropped during the
+re-applies it automatically - even if your SSH connection dropped during the
 change. This is the same trick used by `nmtui` and cloud-init.
 
 **Firewall and SSH changes.** Firewall rule/policy changes and sshd
 settings get the same confirm-or-revert treatment as networking: apply,
-validate, then a 90-second countdown to keep the change — otherwise the
+validate, then a 90-second countdown to keep the change - otherwise the
 previous files are restored and re-applied automatically. Enabling a
 deny-incoming firewall policy automatically allows the current SSH port
 first, so the panel can't cut off its own access.
@@ -183,7 +183,7 @@ updater.py            Self-update from GitHub releases (apply/rollback CLI)
 tests/                Unit tests for all config-editing logic (131 tests)
 ```
 
-The UI intentionally has **no build step and no Node dependency** — the whole
+The UI intentionally has **no build step and no Node dependency** - the whole
 thing is one `.deb`-friendly Python package with a static frontend.
 
 ## Tests
@@ -208,14 +208,14 @@ It manages:
 | Piece | Purpose |
 | --- | --- |
 | `/etc/postfix/main.cf` | `relayhost`, `myorigin` (your sender domain), SASL + TLS settings, `inet_interfaces = loopback-only` so the server can't be used as an open relay |
-| `/etc/postfix/sasl_passwd` | Credentials (`chmod 600`, `postmap`-hashed) — the password is **never** returned by the API or stored in the panel's own state |
+| `/etc/postfix/sasl_passwd` | Credentials (`chmod 600`, `postmap`-hashed) - the password is **never** returned by the API or stored in the panel's own state |
 | `/etc/linustart/mail.json` | Panel state: relay host/port/security, username, from address, report settings |
 | `50unattended-upgrades` | `Unattended-Upgrade::Mail` + `MailReport` so update reports arrive in your inbox |
 
 Saving runs `postmap` and reloads Postfix. If Postfix isn't installed yet, the
 Email page offers a one-click install (pre-seeded via debconf so it stays
 non-interactive). The **Send test email** button queues a real message through
-the local Postfix queue and out via the relay — watch its live log in the Jobs
+the local Postfix queue and out via the relay - watch its live log in the Jobs
 view to see exactly what happened.
 
 ## Requirements

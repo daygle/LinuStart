@@ -11,7 +11,7 @@ The wire protocol is JSON in both directions:
 * client → ``{"type": "input", "data": "..."}`` / ``{"type": "resize", ...}``
 * server → ``{"type": "output", "data": "..."}`` / ``{"type": "closed", ...}``
 
-Only the standard library is used (``pty``, ``os``, ``asyncio``) — no new
+Only the standard library is used (``pty``, ``os``, ``asyncio``) - no new
 runtime dependencies.
 """
 

@@ -1,7 +1,7 @@
 """Sudo rules: per-user drop-in files in ``/etc/sudoers.d``.
 
 The panel only ever writes its own drop-ins (``linustart-<user>``) with one of
-two shapes — full sudo or passwordless sudo — and validates each file with
+two shapes - full sudo or passwordless sudo - and validates each file with
 ``visudo -cf`` before installing it. Foreign sudoers files are listed but
 never edited. Pure helpers are testable without root.
 """

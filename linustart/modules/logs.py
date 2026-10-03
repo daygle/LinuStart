@@ -2,7 +2,7 @@
 
 Pure helpers validate names and slice text so they can be tested without root.
 File access is restricted to validated plain names directly under ``/var/log``
-— no path separators, so nothing outside that directory can be reached.
+- no path separators, so nothing outside that directory can be reached.
 """
 
 from __future__ import annotations

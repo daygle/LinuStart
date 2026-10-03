@@ -39,7 +39,7 @@ function toast(message, kind = "info") {
 }
 
 function fmtBytes(bytes) {
-  if (!bytes) return "—";
+  if (!bytes) return "-";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = bytes;
   let unit = 0;
@@ -48,7 +48,7 @@ function fmtBytes(bytes) {
 }
 
 function fmtUptime(seconds) {
-  if (!seconds) return "—";
+  if (!seconds) return "-";
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -176,7 +176,7 @@ $("#refresh").addEventListener("click", loadView);
 
 async function loadOverview() {
   const data = await api("/system/overview");
-  $("#server-label").textContent = data.hostname || "—";
+  $("#server-label").textContent = data.hostname || "-";
   $("#overview-cards").innerHTML = `
     <div class="card"><h2>System</h2>
       <div class="stat-grid">
@@ -290,7 +290,7 @@ function startRevertBar(session) {
   const bar = $("#revert-bar");
   bar.classList.remove("hidden");
   $("#revert-text").textContent =
-    `Changes applied (${session.label || "system"}). Confirm to keep them — otherwise they revert automatically.`;
+    `Changes applied (${session.label || "system"}). Confirm to keep them - otherwise they revert automatically.`;
   let left = session.seconds_left;
   const tick = () => {
     $("#revert-countdown").textContent = `revert in ${left}s`;
@@ -477,7 +477,7 @@ async function loadMail() {
   if (msmtp.detected && !data.relayhost) {
     msmtpHint.classList.remove("hidden");
     msmtpHint.textContent =
-      "Existing msmtp configuration found — the form is pre-filled from /etc/msmtprc. " +
+      "Existing msmtp configuration found - the form is pre-filled from /etc/msmtprc. " +
       (msmtp.password_available
         ? "Leave the password blank and the msmtp password file is used automatically. "
         : "") +
@@ -503,7 +503,7 @@ async function loadMail() {
   transport.textContent = transportText;
   $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
   $("#mail-summary").textContent = data.relayhost
-    ? `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "—"} (sender domain ${data.myorigin || "—"}).`
+    ? `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`
     : "No relay configured yet.";
 }
 
@@ -567,7 +567,7 @@ async function loadUsers() {
   const rows = (data.users || []).map((u) => `
     <tr>
       <td><code>${esc(u.name)}</code></td>
-      <td>${esc(u.full_name || "—")}</td>
+      <td>${esc(u.full_name || "-")}</td>
       <td><code>${esc(u.shell)}</code></td>
       <td>
         ${u.sudo ? '<span class="badge ok">sudo</span> ' : ""}
@@ -642,7 +642,7 @@ function renderKeys(keys) {
     <tbody>${keys.map((k) => `
       <tr>
         <td><code>${esc(k.type)}</code>${k.valid ? "" : ' <span class="badge warn">unrecognized</span>'}</td>
-        <td>${esc(k.comment || "—")}</td>
+        <td>${esc(k.comment || "-")}</td>
         <td><button class="btn btn-small btn-danger" data-key-index="${k.index}">Remove</button></td>
       </tr>`).join("") || "<tr><td colspan='3' class='muted'>No keys installed</td></tr>"}</tbody>`;
 }
@@ -819,7 +819,7 @@ async function loadSoftware() {
     `${candidates.length} package(s) can be autoremoved.`;
   $("#apt-autoremove-list").innerHTML = candidates
     .map((name) => `<li><code>${esc(name)}</code></li>`)
-    .join("") || "<li class='muted'>Nothing to remove — nice and tidy.</li>";
+    .join("") || "<li class='muted'>Nothing to remove - nice and tidy.</li>";
   $("#pkg-updates-table").innerHTML = `
     <thead><tr><th>Package</th><th>Version</th><th></th><th></th></tr></thead>
     <tbody>${(upgradable.packages || []).map((p) => pkgRow(p, "Install", "btn-primary")).join("")
@@ -840,7 +840,7 @@ async function checkUpdate() {
     if (data.no_releases) {
       info.innerHTML =
         `Installed: <code>${esc(data.current)}</code> <span class="badge muted">no releases yet</span>` +
-        `<br><span class="muted">${esc(data.detail || "")} — publish a GitHub release (e.g. v0.2.0) to enable in-panel updates.</span>`;
+        `<br><span class="muted">${esc(data.detail || "")} - publish a GitHub release (e.g. v0.2.0) to enable in-panel updates.</span>`;
       $("#update-install").disabled = true;
       return;
     }
@@ -851,7 +851,7 @@ async function checkUpdate() {
         : '<span class="badge ok">up to date</span>') +
       (data.update_supported
         ? ""
-        : '<br><span class="muted">Source checkout — updates apply to install.sh installs; use git pull here.</span>');
+        : '<br><span class="muted">Source checkout - updates apply to install.sh installs; use git pull here.</span>');
     $("#update-install").disabled = !data.newer_available || !data.update_supported;
     $("#update-notes").textContent = data.notes || "This release has no notes.";
     const link = $("#update-link");
@@ -1088,7 +1088,7 @@ $("#fw-rules-table").addEventListener("click", async (event) => {
   if (!window.confirm("Remove this firewall rule?")) return;
   try {
     const result = await api(`/firewall/rules/${button.dataset.fwRemove}`, { method: "DELETE" });
-    toast("Rule removed — confirm within 90s to keep it", "success");
+    toast("Rule removed - confirm within 90s to keep it", "success");
     startRevertBar(result.session);
     loadFirewall();
   } catch (err) { toast(err.message, "error"); }
@@ -1107,7 +1107,7 @@ $("#fw-rule-form").addEventListener("submit", async (event) => {
         address: $("#fw-address").value.trim() || "any",
       },
     });
-    toast("Rule added — confirm within 90s to keep it", "success");
+    toast("Rule added - confirm within 90s to keep it", "success");
     startRevertBar(result.session);
     $("#fw-rule-form").reset();
     loadFirewall();
@@ -1127,8 +1127,8 @@ $("#fw-policy-form").addEventListener("submit", async (event) => {
     });
     toast(
       result.ssh_rule_added
-        ? "Policies applied — an SSH allow rule was added automatically"
-        : "Policies applied — confirm within 90s to keep them",
+        ? "Policies applied - an SSH allow rule was added automatically"
+        : "Policies applied - confirm within 90s to keep them",
       "success",
     );
     startRevertBar(result.session);
@@ -1176,7 +1176,7 @@ $("#ssh-form").addEventListener("submit", (event) => {
       password_authentication: $("#ssh-password-auth").checked,
       pubkey_authentication: $("#ssh-pubkey-auth").checked,
     },
-    "SSH access settings applied — confirm within 90s",
+    "SSH access settings applied - confirm within 90s",
   );
 });
 
@@ -1189,7 +1189,7 @@ $("#ssh-extra-form").addEventListener("submit", (event) => {
       client_alive_interval: parseInt($("#ssh-alive-interval").value.trim(), 10),
       client_alive_count_max: parseInt($("#ssh-alive-count").value.trim(), 10),
     },
-    "SSH hardening applied — confirm within 90s",
+    "SSH hardening applied - confirm within 90s",
   );
 });
 
@@ -1227,7 +1227,7 @@ async function openService(unit) {
     state.svcEdit = unit;
     $("#service-modal-title").textContent = data.unit;
     $("#service-modal-meta").textContent =
-      `${data.description} · ${data.active}/${data.sub} · ${data.enabled || "unknown"} · pid ${data.main_pid || "—"}`;
+      `${data.description} · ${data.active}/${data.sub} · ${data.enabled || "unknown"} · pid ${data.main_pid || "-"}`;
     $("#service-modal-log").textContent = (data.journal || []).join("\n") || "No journal entries.";
     $("#service-modal").classList.remove("hidden");
   } catch (err) { toast(err.message, "error"); }

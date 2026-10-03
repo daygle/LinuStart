@@ -2,9 +2,9 @@
 
 The panel supports two backends and detects which one is available:
 
-* ``ufw``      — rules are managed through the ``ufw`` CLI, state parsed from
+* ``ufw``      - rules are managed through the ``ufw`` CLI, state parsed from
   ``ufw status verbose``. Snapshots of ``/etc/ufw`` back every change.
-* ``nftables`` — a clearly marked managed block inside ``/etc/nftables.conf``
+* ``nftables`` - a clearly marked managed block inside ``/etc/nftables.conf``
   holds the panel's table (``inet linustart``); the rest of the file is left
   untouched. Every apply is validated with ``nft -c`` first.
 
@@ -391,7 +391,7 @@ async def detect_backend() -> str:
 
 
 def ssh_port() -> str:
-    """The port sshd currently listens on — kept open when enabling a lockdown."""
+    """The port sshd currently listens on - kept open when enabling a lockdown."""
     return parse_sshd_config(read_text(SSHD_CONFIG)).get("Port", "22")
 
 
