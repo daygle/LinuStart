@@ -18,6 +18,8 @@ class Settings:
     token: Optional[str] = None
     config_path: Path = field(default_factory=lambda: CONFIG_FILE)
     update_repo: str = DEFAULT_REPO
+    # Refuse self-updates whose release publishes no SHA256SUMS.
+    update_require_checksum: bool = False
 
     @property
     def auth_enabled(self) -> bool:
@@ -46,6 +48,8 @@ def load_settings(
             settings.token = data["auth_token"]
         if isinstance(data.get("update_repo"), str) and data["update_repo"]:
             settings.update_repo = data["update_repo"]
+        if isinstance(data.get("update_require_checksum"), bool):
+            settings.update_require_checksum = data["update_require_checksum"]
     if host is not None:
         settings.host = host
     if port is not None:

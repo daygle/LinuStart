@@ -144,33 +144,60 @@ mkdir -p "$APP_DIR" "$CONFIG_DIR" "$STATE_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve, download and unpack the newest published release; echo
-# "<tag>|<directory>". Every non-zero return means "fall back to the
-# checkout", so an offline install never fails just because GitHub is down.
+# "<tag>|<directory>|<workdir>". Return 1 means "fall back to the checkout",
+# so an offline install never fails just because GitHub is down; return 3
+# means the download failed its checksum, which must stop the install.
 #
 # The tag comes from the GitHub API but the download URL is built here from
 # REPO and that tag, and the tag is checked against TAG_PATTERN first, so the
 # only untrusted text that reaches the shell is a validated version string.
+# When the release carries the workflow-built archive plus SHA256SUMS, that
+# archive is downloaded and verified instead of GitHub's generated tarball.
 fetch_release_info() {
-    local tag archive top work
+    local tag archive top work meta has_assets name expected actual
     command -v curl >/dev/null 2>&1 || return 1
-    tag="$(curl -fsSL --max-time 20 \
+    work="$(mktemp -d)"
+    meta="$work/release.json"
+    curl -fsSL --max-time 20 \
         -H 'Accept: application/vnd.github+json' \
         -H 'User-Agent: LinuStart-Installer' \
-        "https://api.github.com/repos/$REPO/releases/latest" \
-        | python3 -c 'import json, sys; print(json.load(sys.stdin).get("tag_name", ""))' 2>/dev/null)" || return 1
-    [[ "$tag" =~ $TAG_PATTERN ]] || return 1
-    work="$(mktemp -d)"
-    archive="$work/release.tar.gz"
-    curl -fsSL --max-time 180 -H 'User-Agent: LinuStart-Installer' \
-        "https://api.github.com/repos/$REPO/tarball/$tag" -o "$archive" || { rm -rf "$work"; return 1; }
+        "https://api.github.com/repos/$REPO/releases/latest" -o "$meta" || { rm -rf "$work"; return 1; }
+    tag="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("tag_name", ""))' "$meta" 2>/dev/null)" \
+        || { rm -rf "$work"; return 1; }
+    [[ "$tag" =~ $TAG_PATTERN ]] || { rm -rf "$work"; return 1; }
+    name="linustart-${tag}.tar.gz"
+    has_assets="$(python3 -c '
+import json, sys
+names = {a.get("name") for a in json.load(open(sys.argv[1])).get("assets") or []}
+print("yes" if {sys.argv[2], "SHA256SUMS"} <= names else "no")' "$meta" "$name" 2>/dev/null || echo no)"
+    if [[ "$has_assets" == "yes" ]]; then
+        archive="$work/$name"
+        curl -fsSL --max-time 180 -H 'User-Agent: LinuStart-Installer' \
+            "https://github.com/$REPO/releases/download/$tag/$name" -o "$archive" || { rm -rf "$work"; return 1; }
+        curl -fsSL --max-time 30 -H 'User-Agent: LinuStart-Installer' \
+            "https://github.com/$REPO/releases/download/$tag/SHA256SUMS" -o "$work/SHA256SUMS" || { rm -rf "$work"; return 1; }
+        expected="$(awk -v n="$name" '$2 == n || $2 == "*"n {print tolower($1)}' "$work/SHA256SUMS" | head -n1)"
+        actual="$(sha256sum "$archive" | awk '{print $1}')"
+        if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+            echo "    Checksum mismatch for $name (expected ${expected:-none}, got $actual)." >&2
+            rm -rf "$work"
+            return 3
+        fi
+        echo "    sha256 verified: $actual" >&2
+    else
+        echo "    Release $tag publishes no SHA256SUMS; the download cannot be verified." >&2
+        archive="$work/release.tar.gz"
+        curl -fsSL --max-time 180 -H 'User-Agent: LinuStart-Installer' \
+            "https://api.github.com/repos/$REPO/tarball/$tag" -o "$archive" || { rm -rf "$work"; return 1; }
+    fi
+    mkdir "$work/src"
     # GNU tar refuses absolute paths and '..' members, so unpacking is safe.
-    tar -xzf "$archive" -C "$work" || { rm -rf "$work"; return 1; }
-    top="$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    tar -xzf "$archive" -C "$work/src" || { rm -rf "$work"; return 1; }
+    top="$(find "$work/src" -mindepth 1 -maxdepth 1 -type d | head -n1)"
     if [[ -z "$top" || ! -f "$top/linustart/__init__.py" || ! -f "$top/pyproject.toml" ]]; then
         rm -rf "$work"
         return 1
     fi
-    RELEASE_WORK="$work"
     printf '%s|%s|%s\n' "$tag" "$top" "$work"
 }
 
@@ -179,12 +206,18 @@ RELEASE_TAG=""
 RELEASE_WORK=""
 if [[ "$FROM_SOURCE" -eq 0 ]]; then
     echo "    Looking for the latest $REPO release..."
-    if RELEASE_INFO="$(fetch_release_info)"; then
+    FETCH_STATUS=0
+    RELEASE_INFO="$(fetch_release_info)" || FETCH_STATUS=$?
+    if [[ "$FETCH_STATUS" -eq 0 ]]; then
         RELEASE_TAG="${RELEASE_INFO%%|*}"
         RELEASE_REST="${RELEASE_INFO#*|}"
         SOURCE_TREE="${RELEASE_REST%%|*}"
         RELEASE_WORK="${RELEASE_REST#*|}"
         echo "    Installing release $RELEASE_TAG"
+    elif [[ "$FETCH_STATUS" -eq 3 ]]; then
+        echo "error: the release download failed verification; refusing to install it." >&2
+        echo "       Re-run later, or use --source to install this checkout deliberately." >&2
+        exit 1
     else
         echo "    Could not fetch a release, installing this checkout instead." >&2
     fi

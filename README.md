@@ -107,6 +107,19 @@ is restored automatically. Roll back manually at any time from the GUI or:
 /opt/linustart/venv/bin/python -m linustart.updater rollback
 ```
 
+**Verified downloads.** The `Release assets` workflow attaches
+`linustart-<tag>.tar.gz` and a `SHA256SUMS` file to every published release.
+The panel and `install.sh` download that archive and refuse it if the checksum
+does not match. Releases without `SHA256SUMS` (older ones) still install, with a
+warning; set `"update_require_checksum": true` in `config.json` to refuse them.
+A checksum protects against corrupted or tampered downloads, not against
+someone who controls the GitHub repository itself.
+
+Updates and rollbacks also install the release's `systemd/linustart.service`
+when it differs from `/etc/systemd/system/linustart.service`, followed by
+`systemctl daemon-reload`, so changes to the service sandbox reach updated
+machines.
+
 Air-gapped servers can update from a downloaded archive:
 `python -m linustart.updater apply --tarball release.tar.gz --tag v0.2.0`.
 

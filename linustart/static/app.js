@@ -320,7 +320,7 @@ function startRevertBar(session) {
   const tick = () => {
     $("#revert-countdown").textContent = `revert in ${left}s`;
     left -= 1;
-    if (left < 0) { hideRevertBar(); loadNetwork(); }
+    if (left < 0) { hideRevertBar(); loadView(); }
   };
   tick();
   state.sessionTimer = setInterval(tick, 1000);
@@ -1195,6 +1195,9 @@ async function checkUpdate() {
       (data.newer_available
         ? '<span class="badge warn">update available</span>'
         : '<span class="badge ok">up to date</span>') +
+      (data.checksum_published
+        ? ' <span class="badge ok">SHA-256 verified on install</span>'
+        : ` <span class="badge warn">no checksum published${data.require_checksum ? " - install refused" : ""}</span>`) +
       commitNote +
       (data.update_supported
         ? ""
@@ -1870,6 +1873,7 @@ function termConnect() {
   ws.onclose = (event) => {
     term.ws = null;
     if (event.code === 4401) toast("Terminal authentication failed - check the access token", "error");
+    if (event.code === 4429) toast("Too many wrong tokens from this address - try again later", "error");
     if ($("#term-status").textContent !== "Session closed") $("#term-status").textContent = "Disconnected";
   };
 }
@@ -1921,3 +1925,13 @@ async function loadTerminal() {
 // panel forever. api() opens it on a real 401, and the logout button opens it
 // when a token is needed again.
 loadView();
+resumePendingSession();
+
+// A change applied before this page was loaded (or before the panel
+// restarted) is still waiting for confirmation: show its countdown.
+async function resumePendingSession() {
+  try {
+    const data = await api("/sessions");
+    if (!state.session && (data.sessions || []).length) startRevertBar(data.sessions[0]);
+  } catch (err) { /* not signed in yet; the view loader reports that */ }
+}

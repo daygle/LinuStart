@@ -297,7 +297,10 @@ def client(tmp_path, monkeypatch):
     from linustart.app import create_app
     from linustart.settings import Settings
 
+    from linustart import sessions as sessions_mod
+
     monkeypatch.setattr(audit, "AUDIT_LOG", tmp_path / "audit.log")
+    monkeypatch.setattr(sessions_mod, "PENDING_REVERTS_FILE", tmp_path / "pending-reverts.json")
     app = create_app(Settings(token="s3cret-token"))
     with TestClient(app) as test_client:
         yield test_client
@@ -456,3 +459,46 @@ def test_timezone_cache_picks_up_a_new_zone_in_a_subdirectory(tmp_path, monkeypa
     os.utime(base / "America", (top_mtime + 5, top_mtime + 5))
     os.utime(base, (top_mtime, top_mtime))
     assert "America/Ciudad_Juarez" in timezone_mod.list_timezones()
+
+
+# --------------------------------------------------------------------------
+# Brute-force throttling
+# --------------------------------------------------------------------------
+
+def test_throttle_locks_out_after_repeated_failures():
+    from linustart.ratelimit import AuthThrottle
+
+    now = [1000.0]
+    throttle = AuthThrottle(max_failures=3, window=60, lockout=120, clock=lambda: now[0])
+    assert not throttle.failure("a") and not throttle.failure("a")
+    assert throttle.failure("a")  # third strike starts the lockout
+    assert throttle.retry_after("a") > 0 and throttle.retry_after("b") == 0
+    now[0] += 121
+    assert throttle.retry_after("a") == 0
+
+
+def test_throttle_window_forgets_old_failures():
+    from linustart.ratelimit import AuthThrottle
+
+    now = [0.0]
+    throttle = AuthThrottle(max_failures=3, window=60, lockout=120, clock=lambda: now[0])
+    throttle.failure("a")
+    throttle.failure("a")
+    now[0] += 61
+    assert not throttle.failure("a")
+
+
+def test_api_locks_out_a_token_guesser(client):
+    bad = {"Authorization": "Bearer guess"}
+    for _ in range(9):
+        assert client.get("/api/audit", headers=bad).status_code == 401
+    assert client.get("/api/audit", headers=bad).status_code == 401  # 10th: lockout begins
+    locked = client.get("/api/audit", headers={"Authorization": "Bearer s3cret-token"})
+    assert locked.status_code == 429  # even the right token, so guesses reveal nothing
+    assert int(locked.headers["retry-after"]) > 0
+
+
+def test_requests_without_a_token_are_not_counted(client):
+    for _ in range(30):
+        assert client.get("/api/audit").status_code == 401
+    assert client.get("/api/audit", headers={"Authorization": "Bearer s3cret-token"}).status_code == 200

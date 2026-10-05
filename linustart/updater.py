@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import errno
 import functools
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,11 @@ USER_AGENT = "LinuStart-Updater"
 DOWNLOAD_TIMEOUT = 120
 API_TIMEOUT = 15
 GIT_TIMEOUT = 5
+SUMS_ASSET = "SHA256SUMS"
+# Where release downloads may come from: the API, and the asset hosts that
+# browser_download_url redirects through.
+DOWNLOAD_PREFIXES = ("https://api.github.com/", "https://github.com/")
+SHA256_RE = re.compile(r"^(?P<digest>[0-9a-fA-F]{64})\s+\*?(?P<name>\S+)\s*$")
 
 
 class NoReleases(RuntimeError):
@@ -128,6 +134,14 @@ def parse_release(data: object) -> Dict[str, str]:
     tarball = data.get("tarball_url")
     if not isinstance(tarball, str) or not tarball.startswith("https://"):
         raise ValueError("that GitHub release has no tarball_url")
+    assets: Dict[str, str] = {}
+    for asset in data.get("assets") or []:
+        if not isinstance(asset, dict):
+            continue
+        name = asset.get("name")
+        url = asset.get("browser_download_url")
+        if isinstance(name, str) and isinstance(url, str) and url.startswith(DOWNLOAD_PREFIXES):
+            assets[name] = url
     return {
         "tag": tag.strip(),
         "name": str(data.get("name") or tag).strip(),
@@ -135,7 +149,58 @@ def parse_release(data: object) -> Dict[str, str]:
         "tarball_url": tarball,
         "published_at": str(data.get("published_at") or "").strip(),
         "body": str(data.get("body") or "").strip()[:2000],
+        "assets": assets,  # type: ignore[dict-item]
     }
+
+
+def release_asset_name(tag: str) -> str:
+    """The archive the release workflow attaches to every release."""
+    return f"linustart-{tag}.tar.gz"
+
+
+def choose_download(release: Dict[str, object]) -> Tuple[str, str, Optional[str]]:
+    """``(archive_url, archive_name, sums_url)`` for a release.
+
+    The workflow-built asset is preferred whenever a SHA256SUMS file sits next
+    to it, because only then can the download be checked. GitHub's generated
+    source tarball is the fallback for releases made before checksums were
+    published; it carries no checksum (``sums_url`` is None).
+    """
+    tag = str(release["tag"])
+    assets = release.get("assets") or {}
+    name = release_asset_name(tag)
+    if isinstance(assets, dict) and name in assets and SUMS_ASSET in assets:
+        return str(assets[name]), name, str(assets[SUMS_ASSET])
+    return str(release["tarball_url"]), "release.tar.gz", None
+
+
+def parse_sha256sums(text: str) -> Dict[str, str]:
+    """``sha256sum`` output -> {file name: lowercase digest}."""
+    sums: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        match = SHA256_RE.match(line.strip())
+        if match:
+            sums[match.group("name")] = match.group("digest").lower()
+    return sums
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_checksum(path: Path, name: str, sums_text: str) -> str:
+    """Return the verified digest; raise ValueError on a missing or bad sum."""
+    expected = parse_sha256sums(sums_text).get(name)
+    if not expected:
+        raise ValueError(f"{SUMS_ASSET} has no entry for {name}")
+    actual = sha256_file(path)
+    if actual != expected:
+        raise ValueError(f"checksum mismatch for {name}: expected {expected}, got {actual}")
+    return actual
 
 
 def validate_members(names: Sequence[str]) -> str:
@@ -252,10 +317,12 @@ def running_version() -> str:
     return str(version_details()["version"])
 
 
-def apply_command(repo: str, tag: str = "") -> List[str]:
+def apply_command(repo: str, tag: str = "", require_checksum: bool = False) -> List[str]:
     argv = [sys.executable, "-m", "linustart.updater", "apply", "--repo", validate_repo(repo)]
     if tag:
         argv += ["--tag", validate_tag(tag)]
+    if require_checksum:
+        argv.append("--require-checksum")
     return argv
 
 
@@ -297,6 +364,21 @@ def fetch_json(url: str) -> object:
         raise RuntimeError(f"could not reach GitHub: {exc.reason}")
 
 
+def release_by_tag(repo: str, tag: str) -> Dict[str, str]:
+    return parse_release(fetch_json(build_api_url(repo, f"releases/tags/{validate_tag(tag)}")))
+
+
+def fetch_text(url: str) -> str:
+    if not url.startswith(DOWNLOAD_PREFIXES):
+        raise RuntimeError(f"refusing to download from {url}")
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
+            return response.read(1024 * 1024).decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"download failed: {getattr(exc, 'reason', exc)}")
+
+
 def latest_release(repo: str) -> Dict[str, str]:
     try:
         return parse_release(fetch_json(build_api_url(repo, "releases/latest")))
@@ -307,6 +389,8 @@ def latest_release(repo: str) -> Dict[str, str]:
 
 
 def download(url: str, dest: Path) -> None:
+    if not url.startswith(DOWNLOAD_PREFIXES):
+        raise RuntimeError(f"refusing to download from {url}")
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response, dest.open("wb") as handle:
@@ -442,11 +526,42 @@ def replace_tree(app_dir: Path, new_tree: Path) -> Path:
     return old
 
 
+def installed_unit_path() -> Path:
+    from .paths import rooted
+
+    return rooted("etc", "systemd", "system", "linustart.service")
+
+
+def refresh_unit(app_dir: Path) -> bool:
+    """Install the new tree's systemd unit when it differs from the live one.
+
+    install.sh copies the unit once; without this, fixes to the unit (its
+    sandboxing, its capabilities) never reached a self-updated machine.
+    Only an existing install.sh unit is replaced. Returns True on a change.
+    """
+    from .util import read_text, write_text
+
+    source = app_dir / "systemd" / "linustart.service"
+    target = installed_unit_path()
+    if not source.is_file() or not target.is_file():
+        return False
+    content = source.read_text(encoding="utf-8")
+    if read_text(target) == content:
+        return False
+    write_text(target, content)
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        log("systemctl daemon-reload failed; run it before restarting")
+    log(f"updated {target} from the new release")
+    return True
+
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
-def cmd_apply(repo: str, tag: str = "", tarball: str = "") -> int:
+def cmd_apply(repo: str, tag: str = "", tarball: str = "", require_checksum: bool = False) -> int:
     from .paths import BACKUP_DIR
 
     app_dir = app_source_dir()
@@ -456,18 +571,22 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "") -> int:
         return 1
 
     log(f"current version: {__version__}  (repo {repo})")
+    archive_name = "release.tar.gz"
+    sums_url: Optional[str] = None
     if tarball:
         tag = validate_tag(tag) if tag else __version__
         log(f"using local archive {tarball} (tag {tag})")
-    elif tag:
-        tag = validate_tag(tag)
-        tarball_url = build_api_url(repo, f"tarball/{tag}")
-        log(f"using release tag {tag}")
     else:
-        release = latest_release(repo)
+        release = release_by_tag(repo, tag) if tag else latest_release(repo)
         tag = release["tag"]
-        tarball_url = release["tarball_url"]
-        log(f"latest release: {tag} ({release['published_at'] or 'no date'})")
+        tarball_url, archive_name, sums_url = choose_download(release)  # type: ignore[arg-type]
+        log(f"release: {tag} ({release['published_at'] or 'no date'})")
+        if sums_url is None:
+            if require_checksum:
+                log(f"refusing to update: release {tag} publishes no {SUMS_ASSET} "
+                    "and update_require_checksum is set")
+                return 1
+            log(f"warning: release {tag} publishes no {SUMS_ASSET}; the download cannot be verified")
 
     with staging_dir(app_dir) as tmp:
         tmp_path = tmp
@@ -477,10 +596,17 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "") -> int:
                 log(f"no such archive: {archive}")
                 return 1
         else:
-            archive = tmp_path / "release.tar.gz"
+            archive = tmp_path / archive_name
             log(f"downloading {tarball_url}")
             download(tarball_url, archive)
             log(f"downloaded {archive.stat().st_size} bytes")
+            if sums_url:
+                try:
+                    digest = verify_checksum(archive, archive_name, fetch_text(sums_url))
+                except ValueError as exc:
+                    log(f"refusing the archive: {exc}")
+                    return 1
+                log(f"sha256 verified: {digest}")
 
         log("verifying and extracting the archive")
         try:
@@ -520,6 +646,7 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "") -> int:
 
         shutil.rmtree(old_tree, ignore_errors=True)
 
+    refresh_unit(app_dir)
     log(f"update to {tag} complete")
     schedule_restart()
     return 0
@@ -550,6 +677,7 @@ def cmd_rollback() -> int:
     except Exception as exc:  # noqa: BLE001
         log(f"pip install failed: {exc}")
         return 1
+    refresh_unit(app_dir)
     log(f"rolled back to version {installed_version()}")
     schedule_restart()
     return 0
@@ -562,10 +690,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_parser.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository slug (default {DEFAULT_REPO})")
     apply_parser.add_argument("--tag", default="", help="release tag to install (default: latest release)")
     apply_parser.add_argument("--tarball", default="", help="install from a local release tarball instead of GitHub")
+    apply_parser.add_argument("--require-checksum", action="store_true",
+                              help=f"refuse releases that publish no {SUMS_ASSET}")
     sub.add_parser("rollback", help="restore the most recent application backup")
     args = parser.parse_args(argv)
     if args.command == "apply":
-        return cmd_apply(args.repo, args.tag, args.tarball)
+        return cmd_apply(args.repo, args.tag, args.tarball, args.require_checksum)
     return cmd_rollback()
 
 

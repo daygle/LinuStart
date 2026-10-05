@@ -12,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import audit
 from .jobs import JobManager
-from .routes import SessionManager, build_router
+from .routes import build_router
+from .sessions import SessionManager
 from .settings import Settings
 from .terminal import TerminalManager
 from .updater import running_version, version_details
@@ -26,6 +27,8 @@ def create_app(settings: Settings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         audit.record("app.start", f"LinuStart {version} started")
+        # Changes left unconfirmed when the panel last stopped still revert.
+        sessions.resume()
         yield
 
     app = FastAPI(

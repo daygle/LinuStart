@@ -59,3 +59,4 @@ STATE_DIR = rooted("var", "lib", "linustart")
 BACKUP_DIR = STATE_DIR / "backups"
 AUDIT_LOG = STATE_DIR / "audit.log"
 TERMINAL_LOG_DIR = STATE_DIR / "terminal"
+PENDING_REVERTS_FILE = STATE_DIR / "pending-reverts.json"

@@ -5,13 +5,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import hmac
-import time
-import uuid
-from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from . import audit
@@ -35,9 +32,11 @@ from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
 from .modules import users as users_mod
 from .paths import SSHD_CONFIG
+from .ratelimit import AuthThrottle, client_key
+from .sessions import SessionManager
 from .settings import Settings
 from .terminal import TerminalManager
-from .util import now_iso, restore_files, snapshot_files
+from .util import restore_files, snapshot_files
 
 
 # --------------------------------------------------------------------------
@@ -213,101 +212,6 @@ class UpdateInstallBody(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Network change sessions (apply + auto-revert unless confirmed)
-# --------------------------------------------------------------------------
-
-@dataclass
-class RevertSession:
-    id: str
-    kind: str
-    label: str
-    snapshots: Dict[str, str]
-    reapply: Callable[[], Awaitable[None]]
-    created_at: str = field(default_factory=now_iso)
-    expires_at: float = 0.0
-    confirmed: bool = False
-    done: bool = False
-    task: Optional[asyncio.Task] = None
-
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "id": self.id,
-            "kind": self.kind,
-            "label": self.label,
-            "created_at": self.created_at,
-            "confirmed": self.confirmed,
-            "done": self.done,
-            "seconds_left": max(0, int(self.expires_at - time.monotonic())) if not self.confirmed else 0,
-        }
-
-
-class SessionManager:
-    def __init__(self) -> None:
-        self.sessions: Dict[str, RevertSession] = {}
-
-    def create(
-        self,
-        kind: str,
-        label: str,
-        snapshots: Dict[str, str],
-        timeout: int,
-        reapply: Callable[[], Awaitable[None]],
-    ) -> RevertSession:
-        session = RevertSession(
-            id=uuid.uuid4().hex[:12],
-            kind=kind,
-            label=label,
-            snapshots=snapshots,
-            reapply=reapply,
-            expires_at=time.monotonic() + timeout,
-        )
-        self.sessions[session.id] = session
-        session.task = asyncio.get_running_loop().create_task(self._expire(session, timeout))
-        return session
-
-    async def _expire(self, session: RevertSession, timeout: int) -> None:
-        await asyncio.sleep(timeout)
-        if session.confirmed or session.done:
-            return
-        session.done = True
-        restore_files(session.snapshots)
-        try:
-            await session.reapply()
-            audit.record(
-                f"{session.kind}.revert",
-                f"changes to {session.label} reverted automatically after {timeout}s",
-            )
-        except Exception as exc:  # noqa: BLE001 - log and keep running
-            audit.record(f"{session.kind}.revert", f"revert of {session.label} failed: {exc}", ok=False)
-
-    async def confirm(self, session_id: str) -> RevertSession:
-        session = self._get(session_id)
-        if session.task and not session.task.done():
-            session.task.cancel()
-        session.confirmed = True
-        session.done = True
-        audit.record(f"{session.kind}.confirm", f"changes to {session.label} confirmed")
-        return session
-
-    async def revert(self, session_id: str) -> RevertSession:
-        session = self._get(session_id)
-        if session.task and not session.task.done():
-            session.task.cancel()
-        if not session.done:
-            session.done = True
-            restore_files(session.snapshots)
-            await session.reapply()
-            audit.record(f"{session.kind}.revert", f"changes to {session.label} reverted manually")
-        return session
-
-    def _get(self, session_id: str) -> RevertSession:
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="no such network session")
-        return session
-
-
-# --------------------------------------------------------------------------
 # Router factory
 # --------------------------------------------------------------------------
 
@@ -327,12 +231,38 @@ def build_router(
             (candidate or "").encode("utf-8"), str(settings.token).encode("utf-8")
         )
 
-    async def require_auth(authorization: Optional[str] = Header(None)) -> None:
+    throttle = AuthThrottle()
+
+    def locked_out(key: str) -> int:
+        return throttle.retry_after(key)
+
+    def note_failure(key: str) -> None:
+        if throttle.failure(key):
+            audit.record(
+                "auth.lockout",
+                f"{key} locked out for {throttle.lockout // 60} minutes after "
+                f"{throttle.max_failures} wrong tokens",
+                ok=False,
+            )
+
+    async def require_auth(request: Request, authorization: Optional[str] = Header(None)) -> None:
         if not settings.auth_enabled:
             return
+        key = client_key(request.client.host if request.client else None)
+        wait = locked_out(key)
+        if wait:
+            raise HTTPException(
+                status_code=429,
+                detail=f"too many wrong tokens; try again in {wait} seconds",
+                headers={"Retry-After": str(wait)},
+            )
         scheme, _, token = (authorization or "").partition(" ")
-        if scheme != "Bearer" or not token_ok(token):
-            raise HTTPException(status_code=401, detail="invalid or missing token")
+        if scheme == "Bearer" and token_ok(token):
+            throttle.success(key)
+            return
+        if authorization:  # a missing header is not a guess
+            note_failure(key)
+        raise HTTPException(status_code=401, detail="invalid or missing token")
 
     guard = [Depends(require_auth)]
 
@@ -411,7 +341,7 @@ def build_router(
             "backend": backend,
             "config": await network_mod.get_config(backend),
             "runtime": await network_mod.runtime_status(),
-            "sessions": [s.to_dict() for s in sessions.sessions.values() if not s.done],
+            "sessions": [s.to_dict() for s in sessions.pending()],
         }
 
     @router.post("/network/interfaces/{name}", dependencies=guard)
@@ -440,7 +370,7 @@ def build_router(
             f"{name} ({backend})",
             snapshots,
             timeout=90,
-            reapply=functools.partial(network_mod.apply_backend, backend, name),
+            reapply={"kind": "network", "backend": backend, "name": name},
         )
         audit.record(
             "network.configure",
@@ -785,6 +715,12 @@ def build_router(
         return {"keys": keys}
 
     # ---- generic confirm-or-revert sessions ------------------------------
+    @router.get("/sessions", dependencies=guard)
+    async def sessions_pending() -> Dict[str, object]:
+        # Lets a freshly loaded page (or one reloaded after a panel restart)
+        # find a change that is still waiting to be confirmed.
+        return {"sessions": [s.to_dict() for s in sessions.pending()]}
+
     @router.post("/sessions/{session_id}/confirm", dependencies=guard)
     async def sessions_confirm(session_id: str) -> Dict[str, object]:
         return (await sessions.confirm(session_id)).to_dict()
@@ -833,7 +769,7 @@ def build_router(
             audit.record("ssh.configure", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(
-            "ssh", "sshd settings", snapshots, timeout=90, reapply=sshd_mod.reload_service
+            "ssh", "sshd settings", snapshots, timeout=90, reapply={"kind": "ssh"}
         )
         audit.record("ssh.configure", ", ".join(f"{key}={value}" for key, value in values.items()))
         return {"ok": True, "session": session.to_dict(), "applied": values}
@@ -853,7 +789,7 @@ def build_router(
             "kind": "firewall",
             "label": f"firewall ({backend})",
             "timeout": 90,
-            "reapply": functools.partial(firewall_mod.reapply, backend),
+            "reapply": {"kind": "firewall", "backend": backend},
         }
 
     @router.get("/firewall", dependencies=guard)
@@ -1303,6 +1239,10 @@ def build_router(
             return
         await websocket.accept()
         if settings.auth_enabled:
+            key = client_key(websocket.client.host if websocket.client else None)
+            if locked_out(key):
+                await websocket.close(code=4429)
+                return
             # The token arrives as the first message rather than in the URL:
             # query strings end up in access logs and browser history.
             try:
@@ -1312,8 +1252,11 @@ def build_router(
             if not isinstance(hello, dict) or hello.get("type") != "auth" or not token_ok(
                 str(hello.get("token", ""))
             ):
+                if isinstance(hello, dict) and hello.get("token"):
+                    note_failure(key)
                 await websocket.close(code=4401)
                 return
+            throttle.success(key)
         try:
             session = await terminals.create(user or None, cols, rows)
         except (ValueError, RuntimeError) as exc:
@@ -1398,6 +1341,8 @@ def build_router(
             "newer_available": updater_mod.is_newer(release["tag"], str(details["base"])),
             "no_releases": False,
             "release_url": release["url"],
+            "checksum_published": updater_mod.choose_download(release)[2] is not None,
+            "require_checksum": settings.update_require_checksum,
             "published_at": release["published_at"],
             "notes": release["body"],
             "repo": settings.update_repo,
@@ -1408,7 +1353,9 @@ def build_router(
     @router.post("/update/install", dependencies=guard)
     async def update_install(body: UpdateInstallBody) -> Dict[str, object]:
         try:
-            argv = updater_mod.apply_command(settings.update_repo, body.tag)
+            argv = updater_mod.apply_command(
+                settings.update_repo, body.tag, settings.update_require_checksum
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if not updater_mod.is_managed_install():

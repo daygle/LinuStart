@@ -3,6 +3,8 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from linustart.updater import (  # noqa: E402
@@ -293,3 +295,80 @@ if __name__ == "__main__":
             func()
             print(f"ok: {name}")
     print("all updater tests passed")
+
+
+# --------------------------------------------------------------------------
+# Verified downloads and unit refresh
+# --------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+
+from linustart import updater as updater_mod  # noqa: E402
+
+RELEASE_WITH_ASSETS = {
+    "tag_name": "v1.2.0",
+    "tarball_url": "https://api.github.com/repos/daygle/LinuStart/tarball/v1.2.0",
+    "assets": [
+        {"name": "linustart-v1.2.0.tar.gz",
+         "browser_download_url": "https://github.com/daygle/LinuStart/releases/download/v1.2.0/linustart-v1.2.0.tar.gz"},
+        {"name": "SHA256SUMS",
+         "browser_download_url": "https://github.com/daygle/LinuStart/releases/download/v1.2.0/SHA256SUMS"},
+        {"name": "evil", "browser_download_url": "http://example.com/x"},
+    ],
+}
+
+
+def test_release_assets_are_parsed_and_foreign_hosts_dropped():
+    assets = parse_release(RELEASE_WITH_ASSETS)["assets"]
+    assert set(assets) == {"linustart-v1.2.0.tar.gz", "SHA256SUMS"}
+
+
+def test_choose_download_prefers_the_verifiable_asset():
+    url, name, sums = updater_mod.choose_download(parse_release(RELEASE_WITH_ASSETS))
+    assert name == "linustart-v1.2.0.tar.gz" and url.endswith(name) and sums.endswith("SHA256SUMS")
+    bare = dict(RELEASE_WITH_ASSETS, assets=[])
+    url, name, sums = updater_mod.choose_download(parse_release(bare))
+    assert url.endswith("tarball/v1.2.0") and sums is None
+
+
+def test_verify_checksum(tmp_path):
+    archive = tmp_path / "linustart-v1.2.0.tar.gz"
+    archive.write_bytes(b"payload")
+    digest = hashlib.sha256(b"payload").hexdigest()
+    sums = f"{digest}  linustart-v1.2.0.tar.gz\n{'0' * 64}  other\n"
+    assert updater_mod.verify_checksum(archive, archive.name, sums) == digest
+    with pytest.raises(ValueError):
+        updater_mod.verify_checksum(archive, archive.name, f"{'1' * 64}  {archive.name}\n")
+    with pytest.raises(ValueError):
+        updater_mod.verify_checksum(archive, archive.name, "")
+
+
+def test_require_checksum_flag_reaches_the_job():
+    assert apply_command("daygle/LinuStart", "", True)[-1] == "--require-checksum"
+    assert "--require-checksum" not in apply_command("daygle/LinuStart")
+
+
+def test_downloads_are_limited_to_github(tmp_path):
+    with pytest.raises(RuntimeError):
+        updater_mod.download("https://example.com/x.tar.gz", tmp_path / "x")
+    with pytest.raises(RuntimeError):
+        updater_mod.fetch_text("http://github.com/x")
+
+
+def test_refresh_unit_replaces_only_a_changed_installed_unit(tmp_path, monkeypatch):
+    from linustart import util
+
+    monkeypatch.setattr(util, "BACKUP_DIR", tmp_path / "backups")
+    app = tmp_path / "app"
+    (app / "systemd").mkdir(parents=True)
+    (app / "systemd" / "linustart.service").write_text("[Service]\nProtectHome=false\n")
+    unit = tmp_path / "linustart.service"
+    monkeypatch.setattr(updater_mod, "installed_unit_path", lambda: unit)
+    ran = []
+    monkeypatch.setattr(updater_mod.subprocess, "run", lambda argv, **kw: ran.append(argv))
+    assert updater_mod.refresh_unit(app) is False  # no install.sh unit: leave alone
+    unit.write_text("[Service]\nProtectHome=true\n")
+    assert updater_mod.refresh_unit(app) is True
+    assert "ProtectHome=false" in unit.read_text()
+    assert ran == [["systemctl", "daemon-reload"]]
+    assert updater_mod.refresh_unit(app) is False  # already current
