@@ -134,6 +134,26 @@
             </div>
             <div class="muted" id="local-time"></div>
           </div>
+          <div class="card danger-card">
+            <h2>Power</h2>
+            <p class="muted">Reboot or power off this server. The action is scheduled with a short countdown so you can still cancel it, and the panel goes away once it starts.</p>
+            <div class="form-row">
+              <label>Countdown
+                <select id="power-delay">
+                  <option value="5">5 seconds</option>
+                  <option value="30">30 seconds</option>
+                  <option value="60">1 minute</option>
+                  <option value="300">5 minutes</option>
+                </select>
+              </label>
+            </div>
+            <div class="form-row">
+              <button id="power-reboot" class="btn btn-danger">Reboot</button>
+              <button id="power-shutdown" class="btn btn-danger">Shut Down</button>
+              <button id="power-cancel" class="btn hidden">Cancel Pending</button>
+            </div>
+            <div class="muted" id="power-status"></div>
+          </div>
         </div>
       </section>
 

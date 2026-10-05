@@ -594,6 +594,9 @@ $("#revert-discard").addEventListener("click", async () => {
 /* ----------------------------------------------------------------- system */
 
 async function loadSystem() {
+  // Power status is independent of the hostname/timezone reads, so it loads on
+  // its own: a failing timedatectl/systemctl must not blank the power controls.
+  loadPowerStatus();
   const [host, tz] = await Promise.all([api("/hostname"), api("/timezone")]);
   $("#hostname-input").value = host.hostname || "";
   $("#timezone-input").value = tz.timezone || "";
@@ -604,6 +607,65 @@ async function loadSystem() {
   $("#ntp-toggle").dataset.enabled = tz.ntp ? "1" : "0";
   $("#local-time").textContent = tz.local_time ? `Local time: ${tz.local_time}` : "";
 }
+
+/* ------------------------------------------------------------------- power */
+
+async function loadPowerStatus() {
+  try {
+    renderPower(await api("/power"));
+  } catch (err) {
+    if (err.message === "Authentication required") throw err;
+    $("#power-status").textContent = `Could not read power status: ${err.message}`;
+    $("#power-reboot").disabled = true;
+    $("#power-shutdown").disabled = true;
+  }
+}
+
+function renderPower(data) {
+  const status = $("#power-status");
+  const cancel = $("#power-cancel");
+  const pending = !!data.pending;
+  cancel.classList.toggle("hidden", !pending);
+  $("#power-reboot").disabled = pending;
+  $("#power-shutdown").disabled = pending;
+  if (pending) {
+    const action = data.action === "shutdown" ? "Shutdown" : "Reboot";
+    status.textContent = `${action} is pending (unit ${data.unit}). The server goes away when the countdown ends.`;
+    cancel.dataset.action = data.action;
+  } else {
+    status.textContent = "Nothing scheduled. This server is not going to reboot or shut down on its own.";
+  }
+}
+
+async function schedulePower(action) {
+  const isShutdown = action === "shutdown";
+  const verb = isShutdown ? "Shut down" : "Reboot";
+  const outcome = isShutdown ? "shut down" : "rebooted";
+  const delay = $("#power-delay").value;
+  if (!window.confirm(
+    `${verb} this server?\n\nThe panel and every service on the machine stop. Make sure you have console or physical access in case it does not come back.`
+  )) return;
+  if (!window.confirm(`${verb} in ${delay} seconds?\n\nYou can cancel from this page until the countdown ends.`)) return;
+  try {
+    await api("/power", { method: "POST", body: { action, delay: Number(delay), confirm: true } });
+    toast(`${verb} scheduled — the server will be ${outcome} shortly`, "success");
+    loadPowerStatus();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+$("#power-reboot").addEventListener("click", () => schedulePower("reboot"));
+$("#power-shutdown").addEventListener("click", () => schedulePower("shutdown"));
+
+$("#power-cancel").addEventListener("click", async () => {
+  const action = $("#power-cancel").dataset.action;
+  if (!action) return;
+  if (!window.confirm("Cancel the pending reboot or shutdown?")) return;
+  try {
+    const result = await api("/power/cancel", { method: "POST", body: { action, confirm: true } });
+    toast(result.cancelled ? `Pending ${action} cancelled` : "Nothing was pending", "success");
+    loadPowerStatus();
+  } catch (err) { toast(err.message, "error"); }
+});
 
 $("#hostname-form").addEventListener("submit", async (event) => {
   event.preventDefault();
