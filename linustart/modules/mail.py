@@ -4,6 +4,7 @@ through your own mail server, from an address hosted there.
 Managed pieces:
   * /etc/postfix/main.cf          - relayhost, TLS, SASL, myorigin (key = value)
   * /etc/postfix/sasl_passwd      - "[mail.example.com]:587 user@domain:password"
+  * /etc/postfix/sender_canonical - "@domain relay@domain": envelope sender only
   * /etc/linustart/mail.json      - panel state (never the password)
   * unattended-upgrades Mail      - notification recipient
 
@@ -25,6 +26,7 @@ from ..paths import (
     POSTFIX_MAIN_CF,
     POSTFIX_SASL_DB,
     POSTFIX_SASL_PASSWD,
+    POSTFIX_SENDER_CANONICAL,
     ROOT,
     UNATTENDED_FILE,
 )
@@ -286,6 +288,57 @@ def valid_port(port: int) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Envelope sender (MAIL FROM)
+# --------------------------------------------------------------------------
+
+def address_domain(address: str) -> str:
+    """Domain part of an address ('' when there is none)."""
+    address = (address or "").strip()
+    return address.rsplit("@", 1)[1] if "@" in address else ""
+
+
+def envelope_sender(username: str, from_address: str) -> str:
+    """The MAIL FROM this relay is guaranteed to accept: the relay account.
+
+    A hosted mail server only lets an authenticated mailbox send as itself. A
+    MAIL FROM the login does not own is refused at RCPT TO with
+    ``553 5.7.1 Sender address rejected: not owned by user ...``, so the
+    envelope sender is pinned to the login while the visible ``From:`` header
+    keeps the address chosen on the Email page. Usernames without a domain
+    (``notifications``) are completed with the from address' domain.
+    """
+    user = (username or "").strip()
+    if not user:
+        return (from_address or "").strip()
+    if "@" in user:
+        return user
+    domain = address_domain(from_address)
+    return f"{user}@{domain}" if domain else user
+
+
+def sender_canonical_table(from_address: str, username: str) -> str:
+    """The ``/etc/postfix/sender_canonical`` lookup table.
+
+    ``@domain  relay-account`` pins every envelope sender from the sender
+    domain to the authenticated account. ``sender_canonical_classes =
+    envelope_sender`` (see :func:`relay_settings`) keeps the message headers
+    as written, so this only changes the SMTP envelope.
+    """
+    domain = address_domain(from_address)
+    sender = envelope_sender(username, from_address)
+    if not domain or not valid_email(sender):
+        raise ValueError(
+            f"cannot pin the envelope sender to {username or '(empty)'!r}: "
+            f"it is not a valid address in {from_address or '(no from address)'!r}"
+        )
+    return (
+        "# LinuStart: hosted mail servers reject a MAIL FROM their login does\n"
+        "# not own, so the envelope sender is always the relay account.\n"
+        f"@{domain}\t{sender}\n"
+    )
+
+
+# --------------------------------------------------------------------------
 # Postfix main.cf (key = value format)
 # --------------------------------------------------------------------------
 
@@ -384,6 +437,10 @@ def relay_settings(host: str, port: int, security: str, from_address: str) -> Di
         "smtp_tls_CAfile": "/etc/ssl/certs/ca-certificates.crt",
         "smtp_tls_security_level": "may" if security == "none" else "encrypt",
         "smtp_tls_wrappermode": "yes" if security == "ssl" else "no",
+        # Rewrite the SMTP envelope sender to the relay account only; the
+        # From:/Sender: headers keep the address the user configured.
+        "sender_canonical_maps": "hash:/etc/postfix/sender_canonical",
+        "sender_canonical_classes": "envelope_sender",
     }
 
 
@@ -424,6 +481,10 @@ async def status() -> Dict[str, object]:
         "security": state.get("security", "starttls"),
         "username": state.get("username", ""),
         "from_address": state.get("from_address", ""),
+        "envelope_sender": envelope_sender(
+            str(state.get("username", "") or ""), str(state.get("from_address", "") or "")
+        ),
+        "sender_canonical_set": bool(read_text(POSTFIX_SENDER_CANONICAL).strip()),
         "report_to": state.get("report_to", ""),
         "report_mode": state.get("report_mode", "only-on-error"),
         "credentials_set": sasl_exists,
@@ -477,6 +538,9 @@ async def apply(
     write_text(POSTFIX_SASL_PASSWD, line)
     os.chmod(POSTFIX_SASL_PASSWD, SASL_PASSWD_MODE)
     await run(["postmap", "hash:/etc/postfix/sasl_passwd"], check=True)
+
+    write_text(POSTFIX_SENDER_CANONICAL, sender_canonical_table(from_address, username))
+    await run(["postmap", f"hash:{POSTFIX_SENDER_CANONICAL}"], check=True)
 
     main_cf = read_text(POSTFIX_MAIN_CF)
     for key, value in relay_settings(host, port, security, from_address).items():
@@ -543,11 +607,17 @@ def test_command(from_address: str, recipient: str) -> list:
     return argv
 
 
-def test_message(recipient: str) -> str:
+def _header_value(value: str) -> str:
+    """Flatten a stored value so it can never break out of a header line."""
+    return re.sub(r"[\r\n]+", " ", value or "").strip()
+
+
+def test_message(recipient: str, from_address: str = "") -> str:
+    sender = _header_value(from_address)
     return (
-        "From: LinuStart\n"
-        f"To: {recipient}\n"
-        "Subject: LinuStart test email\n"
+        (f"From: LinuStart <{sender}>\n" if sender else "From: LinuStart\n")
+        + f"To: {_header_value(recipient)}\n"
+        + "Subject: LinuStart test email\n"
         "\n"
         "This is a test message sent by LinuStart through your SMTP relay.\n"
         "If you can read this, the server can deliver mail.\n"

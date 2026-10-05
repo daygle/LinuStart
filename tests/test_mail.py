@@ -6,13 +6,17 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from linustart.modules.mail import (  # noqa: E402
+    address_domain,
+    envelope_sender,
     format_relayhost,
     merge_sasl_line,
     parse_main_cf,
     parse_sasl_line,
     relay_settings,
+    sender_canonical_table,
     sasl_line,
     test_command as build_test_command,
+    test_message as build_test_message,
     upsert_main_cf,
     valid_email,
     valid_host,
@@ -145,6 +149,80 @@ def test_test_command():
         "sendmail", "-i", "-f", "me@example.com", "you@example.com",
     ]
     assert build_test_command("", "you@example.com") == ["sendmail", "-i", "you@example.com"]
+
+
+# --- envelope sender (the 553 5.7.1 "not owned by user" bounce) -----------
+
+def test_address_domain():
+    assert address_domain("me@example.com") == "example.com"
+    assert address_domain(" me@example.com ") == "example.com"
+    assert address_domain("me") == ""
+    assert address_domain("") == ""
+
+
+def test_envelope_sender_is_the_relay_account():
+    # The bounce: logging in as notifications@ while sending as daygle@ is
+    # refused, so the envelope sender must be the login.
+    assert envelope_sender("notifications@daygle.net", "daygle@daygle.net") == (
+        "notifications@daygle.net"
+    )
+    assert envelope_sender(" notifications@daygle.net ", "daygle@daygle.net") == (
+        "notifications@daygle.net"
+    )
+    # Same account, nothing to pin - still valid.
+    assert envelope_sender("linustart@example.com", "linustart@example.com") == (
+        "linustart@example.com"
+    )
+
+
+def test_envelope_sender_completes_a_bare_username():
+    assert envelope_sender("notifications", "daygle@daygle.net") == "notifications@daygle.net"
+    # Nothing to complete it with, so the login is used as-is.
+    assert envelope_sender("notifications", "daygle") == "notifications"
+    # No login configured: fall back to the from address.
+    assert envelope_sender("", "daygle@daygle.net") == "daygle@daygle.net"
+
+
+def test_sender_canonical_table_pins_the_from_domain():
+    table = sender_canonical_table("daygle@daygle.net", "notifications@daygle.net")
+    entries = [line for line in table.splitlines() if line and not line.startswith("#")]
+    assert entries == ["@daygle.net\tnotifications@daygle.net"]
+
+
+def test_sender_canonical_table_rejects_an_unusable_sender():
+    for from_address, username in [
+        ("", "notifications@daygle.net"),  # no domain to map
+        ("daygle@daygle.net", "not a login"),  # login is not an address
+    ]:
+        try:
+            sender_canonical_table(from_address, username)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {from_address!r} {username!r}")
+
+
+def test_relay_settings_rewrite_the_envelope_sender_only():
+    settings = relay_settings("mail.daygle.net", 587, "starttls", "daygle@daygle.net")
+    assert settings["sender_canonical_maps"] == "hash:/etc/postfix/sender_canonical"
+    # envelope_sender only: the From:/Sender: headers are left as written.
+    assert settings["sender_canonical_classes"] == "envelope_sender"
+
+
+def test_test_message_has_an_addressable_from_header():
+    message = build_test_message("daygle@daygle.net", "daygle@daygle.net")
+    assert message.startswith("From: LinuStart <daygle@daygle.net>\n")
+    assert "To: daygle@daygle.net\n" in message
+    assert build_test_message("daygle@daygle.net").startswith("From: LinuStart\n")
+
+
+def test_test_message_cannot_be_smuggled_headers():
+    message = build_test_message(
+        "daygle@daygle.net", "me@example.com\r\nBcc: victim@example.com"
+    )
+    assert message.startswith("From: LinuStart <me@example.com Bcc: victim@example.com>\n")
+    assert "\r" not in message
+    assert message.count("Subject:") == 1
 
 
 if __name__ == "__main__":

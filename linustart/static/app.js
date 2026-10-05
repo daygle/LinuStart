@@ -813,9 +813,20 @@ async function loadMail() {
   }
   transport.textContent = transportText;
   $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
-  $("#mail-summary").textContent = data.relayhost
-    ? `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`
-    : "No relay configured yet.";
+  let summary = "No relay configured yet.";
+  if (data.relayhost) {
+    summary =
+      `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`;
+    if (data.envelope_sender) {
+      summary += data.envelope_sender === data.from_address
+        ? ` Envelope sender (MAIL FROM): ${data.envelope_sender}.`
+        : ` The relay account owns the envelope sender, so messages leave with MAIL FROM ${data.envelope_sender} and From: ${data.from_address || "-"} - your mail server would reject the From: address as a sender it does not own.`;
+    }
+    if (data.credentials_set && !data.sender_canonical_set) {
+      summary += " Save these settings to pin the envelope sender to the relay account.";
+    }
+  }
+  $("#mail-summary").textContent = summary;
 }
 
 $("#mail-form").addEventListener("submit", async (event) => {

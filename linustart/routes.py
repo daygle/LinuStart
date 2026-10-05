@@ -525,7 +525,7 @@ def build_router(
             "mail.test",
             f"Test email to {recipient}",
             mail_mod.test_command(from_address, recipient),
-            stdin_text=mail_mod.test_message(recipient),
+            stdin_text=mail_mod.test_message(recipient, from_address),
         )
         audit.record("mail.test", f"test message to {recipient}")
         return job.to_dict()
