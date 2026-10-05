@@ -134,6 +134,26 @@
             </div>
             <div class="muted" id="local-time"></div>
           </div>
+          <div class="card danger-card">
+            <h2>Power</h2>
+            <p class="muted">Reboot or power off this server. The action is scheduled with a short countdown so you can still cancel it, and the panel goes away once it starts.</p>
+            <div class="form-row">
+              <label>Countdown
+                <select id="power-delay">
+                  <option value="5">5 seconds</option>
+                  <option value="30">30 seconds</option>
+                  <option value="60">1 minute</option>
+                  <option value="300">5 minutes</option>
+                </select>
+              </label>
+            </div>
+            <div class="form-row">
+              <button id="power-reboot" class="btn btn-danger">Reboot</button>
+              <button id="power-shutdown" class="btn btn-danger">Shut Down</button>
+              <button id="power-cancel" class="btn hidden">Cancel Pending</button>
+            </div>
+            <div class="muted" id="power-status"></div>
+          </div>
         </div>
       </section>
 
@@ -742,10 +762,13 @@
           <h2>SSH Keys</h2>
           <table class="table" id="user-keys-table"></table>
           <form id="user-key-form" class="form">
-            <label>Add public key
+            <label><span id="user-key-label">Add public key</span>
               <textarea id="edit-key" rows="3" placeholder="ssh-ed25519 AAAA... me@laptop"></textarea>
             </label>
-            <button class="btn" type="submit">Add Key</button>
+            <div class="form-row">
+              <button class="btn" id="user-key-submit" type="submit">Add Key</button>
+              <button class="btn hidden" id="user-key-cancel" type="button">Cancel Edit</button>
+            </div>
           </form>
           <h2 class="spaced">Sudo Rule</h2>
           <label class="switch-row">

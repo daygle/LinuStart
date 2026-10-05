@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hmac
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -23,6 +23,7 @@ from .modules import logs as logs_mod
 from .modules import mail as mail_mod
 from .modules import network as network_mod
 from .modules import packages as packages_mod
+from .modules import power as power_mod
 from .modules import procs as procs_mod
 from .modules import services as services_mod
 from .modules import sshd as sshd_mod
@@ -55,6 +56,14 @@ class TimezoneBody(BaseModel):
 
 class NtpBody(BaseModel):
     enabled: bool
+
+
+class PowerBody(BaseModel):
+    action: str = Field(pattern="^(reboot|shutdown)$")
+    delay: Optional[Union[int, str]] = None
+    # The UI must opt in explicitly; without it a stray POST cannot take the
+    # machine down.
+    confirm: bool = False
 
 
 class InterfaceBody(BaseModel):
@@ -354,6 +363,43 @@ def build_router(
             raise HTTPException(status_code=500, detail=str(exc))
         audit.record("timezone.set", f"timezone set to {body.timezone}")
         return await timezone_mod.status()
+
+    @router.get("/power", dependencies=guard)
+    async def power_status() -> Dict[str, object]:
+        return await power_mod.status()
+
+    @router.post("/power", dependencies=guard)
+    async def power_schedule(body: PowerBody) -> Dict[str, object]:
+        if not body.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="confirm must be true to schedule a reboot or shutdown",
+            )
+        try:
+            result = await power_mod.schedule(body.action, body.delay)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("power.schedule", f"{body.action} failed: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record(
+            "power.schedule",
+            f"{result['action']} scheduled {result['when']} (unit {result['unit']})",
+        )
+        return result
+
+    @router.post("/power/cancel", dependencies=guard)
+    async def power_cancel(body: PowerBody) -> Dict[str, object]:
+        try:
+            result = await power_mod.cancel(body.action)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("power.cancel", f"{body.action} failed: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        if result["cancelled"]:
+            audit.record("power.cancel", f"cancelled pending {result['action']}")
+        return result
 
     @router.post("/ntp", dependencies=guard)
     async def set_ntp(body: NtpBody) -> Dict[str, object]:
@@ -749,6 +795,16 @@ def build_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         audit.record("user.key.remove", f"removed SSH key {index} for {name}")
+        return {"keys": keys}
+
+    @router.put("/users/{name}/keys/{index}", dependencies=guard)
+    async def users_update_key(name: str, index: int, body: KeyBody) -> Dict[str, object]:
+        try:
+            keys = await users_mod.update_key(name, index, body.key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # The key material itself never reaches the audit log.
+        audit.record("user.key.update", f"updated SSH key {index} for {name}")
         return {"keys": keys}
 
     # ---- groups ------------------------------------------------------------

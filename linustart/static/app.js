@@ -17,6 +17,8 @@ const state = {
   installed: [],
   shells: [],
   editUser: null,
+  editKeyIndex: null,
+  editUserKeys: [],
   svcEdit: null,
   logFiles: [],
   duJob: null,
@@ -594,6 +596,9 @@ $("#revert-discard").addEventListener("click", async () => {
 /* ----------------------------------------------------------------- system */
 
 async function loadSystem() {
+  // Power status is independent of the hostname/timezone reads, so it loads on
+  // its own: a failing timedatectl/systemctl must not blank the power controls.
+  loadPowerStatus();
   const [host, tz] = await Promise.all([api("/hostname"), api("/timezone")]);
   $("#hostname-input").value = host.hostname || "";
   $("#timezone-input").value = tz.timezone || "";
@@ -604,6 +609,65 @@ async function loadSystem() {
   $("#ntp-toggle").dataset.enabled = tz.ntp ? "1" : "0";
   $("#local-time").textContent = tz.local_time ? `Local time: ${tz.local_time}` : "";
 }
+
+/* ------------------------------------------------------------------- power */
+
+async function loadPowerStatus() {
+  try {
+    renderPower(await api("/power"));
+  } catch (err) {
+    if (err.message === "Authentication required") throw err;
+    $("#power-status").textContent = `Could not read power status: ${err.message}`;
+    $("#power-reboot").disabled = true;
+    $("#power-shutdown").disabled = true;
+  }
+}
+
+function renderPower(data) {
+  const status = $("#power-status");
+  const cancel = $("#power-cancel");
+  const pending = !!data.pending;
+  cancel.classList.toggle("hidden", !pending);
+  $("#power-reboot").disabled = pending;
+  $("#power-shutdown").disabled = pending;
+  if (pending) {
+    const action = data.action === "shutdown" ? "Shutdown" : "Reboot";
+    status.textContent = `${action} is pending (unit ${data.unit}). The server goes away when the countdown ends.`;
+    cancel.dataset.action = data.action;
+  } else {
+    status.textContent = "Nothing scheduled. This server is not going to reboot or shut down on its own.";
+  }
+}
+
+async function schedulePower(action) {
+  const isShutdown = action === "shutdown";
+  const verb = isShutdown ? "Shut down" : "Reboot";
+  const outcome = isShutdown ? "shut down" : "rebooted";
+  const delay = $("#power-delay").value;
+  if (!window.confirm(
+    `${verb} this server?\n\nThe panel and every service on the machine stop. Make sure you have console or physical access in case it does not come back.`
+  )) return;
+  if (!window.confirm(`${verb} in ${delay} seconds?\n\nYou can cancel from this page until the countdown ends.`)) return;
+  try {
+    await api("/power", { method: "POST", body: { action, delay: Number(delay), confirm: true } });
+    toast(`${verb} scheduled — the server will be ${outcome} shortly`, "success");
+    loadPowerStatus();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+$("#power-reboot").addEventListener("click", () => schedulePower("reboot"));
+$("#power-shutdown").addEventListener("click", () => schedulePower("shutdown"));
+
+$("#power-cancel").addEventListener("click", async () => {
+  const action = $("#power-cancel").dataset.action;
+  if (!action) return;
+  if (!window.confirm("Cancel the pending reboot or shutdown?")) return;
+  try {
+    const result = await api("/power/cancel", { method: "POST", body: { action, confirm: true } });
+    toast(result.cancelled ? `Pending ${action} cancelled` : "Nothing was pending", "success");
+    loadPowerStatus();
+  } catch (err) { toast(err.message, "error"); }
+});
 
 $("#hostname-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1268,7 +1332,9 @@ async function openUser(name) {
     $("#edit-sudo").checked = !!u.sudo;
     $("#edit-locked").checked = !!u.locked;
     $("#edit-password").value = "";
-    $("#edit-key").value = "";
+    // Always start from a clean key form: an edit left in flight for another
+    // user would otherwise PUT a stale line index at the new account.
+    resetKeyForm();
     renderKeys(data.keys || []);
     $("#user-modal").classList.remove("hidden");
     loadUserDepth(name);
@@ -1308,18 +1374,30 @@ async function loadUserDepth(name) {
 }
 
 function renderKeys(keys) {
+  state.editUserKeys = keys || [];
+  // An edit in progress must not be thrown away by the refresh that follows a
+  // save, but the index it points at only survives while the file is unchanged.
+  if (state.editKeyIndex !== null) {
+    const current = keys.find((k) => k.index === state.editKeyIndex);
+    if (!current) state.editKeyIndex = null;
+  }
   $("#user-keys-table").innerHTML = `
     <thead><tr><th>Type</th><th>Comment</th><th></th></tr></thead>
     <tbody>${keys.map((k) => `
       <tr>
         <td><code>${esc(k.type)}</code>${k.valid ? "" : ' <span class="badge warn">unrecognized</span>'}</td>
         <td>${esc(k.comment || "-")}</td>
-        <td><button class="btn btn-small btn-danger" data-key-index="${k.index}">Remove</button></td>
+        <td class="key-actions">
+          <button class="btn btn-small" data-key-edit="${k.index}">Edit</button>
+          <button class="btn btn-small btn-danger" data-key-index="${k.index}">Remove</button>
+        </td>
       </tr>`).join("") || "<tr><td colspan='3' class='muted'>No keys installed</td></tr>"}</tbody>`;
 }
 
 function closeUserModal() {
   state.editUser = null;
+  state.editUserKeys = [];
+  resetKeyForm();
   $("#user-modal").classList.add("hidden");
 }
 
@@ -1377,28 +1455,65 @@ $("#user-password-form").addEventListener("submit", async (event) => {
   } catch (err) { toast(err.message, "error"); }
 });
 
+function resetKeyForm() {
+  state.editKeyIndex = null;
+  $("#user-key-label").textContent = "Add public key";
+  $("#user-key-submit").textContent = "Add Key";
+  $("#user-key-cancel").classList.add("hidden");
+  $("#edit-key").value = "";
+}
+
+function startKeyEdit(index, raw) {
+  state.editKeyIndex = index;
+  $("#user-key-label").textContent = `Edit public key on line ${index + 1}`;
+  $("#user-key-submit").textContent = "Update Key";
+  $("#user-key-cancel").classList.remove("hidden");
+  $("#edit-key").value = raw || "";
+  $("#edit-key").focus();
+}
+
+$("#user-key-cancel").addEventListener("click", resetKeyForm);
+
 $("#user-key-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.editUser) return;
+  const key = $("#edit-key").value.trim();
+  if (!key) { toast("Paste a public key first", "error"); return; }
+  const editing = state.editKeyIndex;
   try {
-    const data = await api(`/users/${encodeURIComponent(state.editUser)}/keys`, {
-      method: "POST",
-      body: { key: $("#edit-key").value.trim() },
-    });
-    $("#edit-key").value = "";
+    const data = editing === null
+      ? await api(`/users/${encodeURIComponent(state.editUser)}/keys`, {
+          method: "POST",
+          body: { key },
+        })
+      : await api(`/users/${encodeURIComponent(state.editUser)}/keys/${editing}`, {
+          method: "PUT",
+          body: { key },
+        });
+    resetKeyForm();
     renderKeys(data.keys || []);
-    toast("SSH key added", "success");
+    toast(editing === null ? "SSH key added" : "SSH key updated", "success");
   } catch (err) { toast(err.message, "error"); }
 });
 
 $("#user-keys-table").addEventListener("click", async (event) => {
+  if (!state.editUser) return;
+  const edit = event.target.closest("button[data-key-edit]");
+  if (edit) {
+    const index = Number(edit.dataset.keyEdit);
+    const key = (state.editUserKeys || []).find((k) => k.index === index);
+    startKeyEdit(index, key ? key.raw : "");
+    return;
+  }
   const button = event.target.closest("button[data-key-index]");
-  if (!button || !state.editUser) return;
+  if (!button) return;
+  const index = Number(button.dataset.keyIndex);
   try {
     const data = await api(
-      `/users/${encodeURIComponent(state.editUser)}/keys/${button.dataset.keyIndex}`,
+      `/users/${encodeURIComponent(state.editUser)}/keys/${index}`,
       { method: "DELETE" },
     );
+    resetKeyForm();
     renderKeys(data.keys || []);
     toast("SSH key removed", "info");
   } catch (err) { toast(err.message, "error"); }
