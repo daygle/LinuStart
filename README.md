@@ -31,10 +31,10 @@ what makes the same binary behave correctly on both Debian and Ubuntu.
 | **Hostname** | `hostnamectl` + `/etc/hosts` kept in sync (`127.0.1.1` line) |
 | **Timezone / NTP** | `timedatectl` timezone picker (all tzdata names) and NTP toggle |
 | **Unattended updates** | Full control of `20auto-upgrades` + `50unattended-upgrades`: enable/disable, package-list refresh frequency, download-in-advance, autoclean interval, auto-reboot (+time, +reboot-with-users), unused-kernel cleanup, new/unused dependency removal, auto-fix interrupted dpkg; editable **upgrade origins** (`Unattended-Upgrade::Origins-Pattern` *or* legacy `Allowed-Origins`, one per line) and **package blacklist**, so Debian-only origin patterns are one paste away; activity log and dry-run button. Detects a missing `unattended-upgrades` package (common on minimal Debian) and offers to install it. **Email reports** (always / on-change / **only-on-error**) delivered through your SMTP relay to any address *or local mailbox* (e.g. `root`) - the configuration file is created when missing and the sender is set to your relay account so hosted mail servers accept the reports |
-| **Email** | Sets up Postfix as an authenticated SMTP relay (smarthost) through **your own mail server** (the mail account hosted there), sending from an address hosted on that server, with the envelope sender (MAIL FROM) pinned to the relay account so servers that reject senders the login does not own don't bounce it; STARTTLS or SSL on any port; wires unattended-upgrades reports to a mailbox (falling back to the from address when left blank); one-click **test send** through the full mail pipeline. Detects **conflicting mail transfer agents** (`msmtp-mta`, `ssmtp`, `nullmailer`, `exim4`, `sendmail-bin`, `dma`) that would swallow reports and offers one-click removal (client-only tools like plain `msmtp`, `bsd-mailx`, `mailutils` are left untouched). **Existing `msmtp` setups are adopted, not bulldozed**: an `/etc/msmtprc` is detected and the relay form is pre-filled from it, and the password is picked up from the msmtp password file when left blank, so switching delivery to Postfix is one click |
+| **Email** | Sets up **Postfix** (local queue) **or msmtp** (lightweight, no daemon) as an authenticated SMTP relay (smarthost) through **your own mail server** (the mail account hosted there), sending from an address hosted on that server, with the envelope sender (MAIL FROM) pinned to the relay account so servers that reject senders the login does not own don't bounce it; STARTTLS or SSL on any port; wires unattended-upgrades reports to a mailbox (falling back to the from address when left blank); one-click **test send** through the full mail pipeline. Detects **conflicting mail transfer agents** (`msmtp-mta`, `ssmtp`, `nullmailer`, `exim4`, `sendmail-bin`, `dma`) that would swallow reports and offers one-click removal (client-only tools like plain `msmtp`, `bsd-mailx`, `mailutils` are left untouched). **Existing `msmtp` setups are adopted, not bulldozed**: an `/etc/msmtprc` is detected and the relay form is pre-filled from it, and the password is picked up from the msmtp password file when left blank, so switching delivery to Postfix is one click |
 | **Software** | Search, install, remove APT packages; list upgradable packages; one-click upgrade; **maintenance**: `update`, `upgrade`, `autoremove`, `autoclean`, `clean` - all as background jobs with live logs, plus cache size and autoremove-candidate previews |
 | **Users** | Create/maintain accounts: passwords (via `chpasswd`), full name, login shell, sudo membership, lock/unlock, delete (optionally with home); full **SSH key management** with key validation and locked-down `~/.ssh` permissions; **password aging** (`chage`), **login history** (`last`) and per-user **sudo rules** in `sudoers.d` (validated with `visudo -cf`) |
-| **Firewall** | UFW or nftables (auto-detected); allow/deny rules with ports and CIDRs, default policies, enable/disable; the SSH port is kept reachable automatically when switching to a deny-incoming policy; changes use the same **90-second auto-revert** as networking |
+| **Firewall** | UFW, nftables or firewalld (auto-detected; a running firewalld takes precedence); for firewalld the default zone's ports, services and rich rules are listed and edited, and its target is the incoming policy (zones do not filter outgoing traffic); allow/deny rules with ports and CIDRs, default policies, enable/disable; the SSH port is kept reachable automatically when switching to a deny-incoming policy; changes use the same **90-second auto-revert** as networking |
 | **SSH hardening** | `sshd_config` management: port, `PermitRootLogin`, password/key auth, `MaxAuthTries`, client-alive settings; every change is validated with `sshd -t` and applied with **90-second auto-revert** so a bad setting can't lock you out |
 | **Services** | Systemd service list with active/enabled state, one-click start/stop/restart/enable/disable as background jobs, and per-service journal output |
 | **Storage** | Filesystem usage (`df`) and a **directory-size explorer**: `du` scans run as background jobs with the results parsed into a sortable table |
@@ -106,6 +106,19 @@ is restored automatically. Roll back manually at any time from the GUI or:
 ```bash
 /opt/linustart/venv/bin/python -m linustart.updater rollback
 ```
+
+**Verified downloads.** The `Release assets` workflow attaches
+`linustart-<tag>.tar.gz` and a `SHA256SUMS` file to every published release.
+The panel and `install.sh` download that archive and refuse it if the checksum
+does not match. Releases without `SHA256SUMS` (older ones) still install, with a
+warning; set `"update_require_checksum": true` in `config.json` to refuse them.
+A checksum protects against corrupted or tampered downloads, not against
+someone who controls the GitHub repository itself.
+
+Updates and rollbacks also install the release's `systemd/linustart.service`
+when it differs from `/etc/systemd/system/linustart.service`, followed by
+`systemctl daemon-reload`, so changes to the service sandbox reach updated
+machines.
 
 Air-gapped servers can update from a downloaded archive:
 `python -m linustart.updater apply --tarball release.tar.gz --tag v0.2.0`.
@@ -181,10 +194,17 @@ first, so the panel can't cut off its own access.
 
 **File writes.** Every rewritten file is first copied to
 `/var/lib/linustart/backups/` with a timestamp, and writes are atomic
-(tempfile + rename), so a crash can't leave a half-written config.
+(tempfile + rename), so a crash can't leave a half-written config. The
+newest 20 backups of each file are kept, and the file's mode and owner are
+preserved.
 
 **Audit log.** Every action is appended to `/var/lib/linustart/audit.log`
-and shown in the UI.
+and shown in the UI. It rotates at 5 MiB, keeping five older files
+(`audit.log.1` … `audit.log.5`).
+
+**Retention.** The newest 5 application backups (self-update rollback points)
+and the newest 200 terminal recordings are kept; a single terminal session
+stops recording after 50 MiB of output and notes that in its log.
 
 ## Architecture
 
@@ -213,22 +233,29 @@ linustart/
 terminal.py           WebSocket web terminal (PTY + session logs)
 updater.py            Self-update from GitHub releases (apply/rollback CLI)
 └── static/           Plain HTML/CSS/JS UI (no build step, no Node needed)
-tests/                Unit tests for all config-editing logic (131 tests)
+tests/                Python tests (config logic and the HTTP API); tests/js: frontend helpers
 ```
 
-The UI intentionally has **no build step and no Node dependency** - the whole
-thing is one `.deb`-friendly Python package with a static frontend.
+The UI intentionally has **no build step and no Node runtime dependency** -
+the whole thing is one `.deb`-friendly Python package with a static frontend
+(xterm.js is vendored under `static/vendor`). Node is only used in development
+to lint and unit-test the JavaScript.
 
 ## Tests
 
 ```bash
 pip install -e '.[dev]'
-pytest            # or run any file directly: python tests/test_ifupdown.py
+pytest                                    # Python: config logic + HTTP API
+ruff check linustart tests conftest.py    # Python lint (rules in pyproject.toml)
+node --test tests/js/*.test.js            # frontend helper unit tests
+npx eslint@9 linustart/static tests/js    # frontend lint (eslint.config.js)
 ```
 
-The tests cover the config-manipulation logic (ifupdown/netplan editing,
-hosts-file updates, apt.conf editing, apt output parsing, input validation)
-without needing root or a Debian-family system.
+The Python tests cover the config-manipulation logic (ifupdown/netplan
+editing, hosts-file updates, apt.conf editing, firewall rulesets, input
+validation) and the HTTP API - including a check that every endpoint refuses
+requests without the token - without needing root or a Debian-family system.
+CI runs all four.
 
 ## Email setup in detail
 

@@ -1,5 +1,8 @@
 "use strict";
 
+/* Pure helpers (esc, fmtBytes, fmtUptime, niceMax, fmtMetric, mergeLogLines)
+   live in util.js, which is loaded first and unit-tested with node --test. */
+
 /* ---------------------------------------------------------------- helpers */
 
 const state = {
@@ -29,10 +32,6 @@ const state = {
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
-function esc(value) {
-  const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-  return String(value === undefined || value === null ? "" : value).replace(/[&<>"']/g, (c) => map[c]);
-}
 
 function toast(message, kind = "info") {
   const box = document.createElement("div");
@@ -42,22 +41,7 @@ function toast(message, kind = "info") {
   setTimeout(() => box.remove(), 5200);
 }
 
-function fmtBytes(bytes) {
-  if (!bytes) return "-";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
 
-function fmtUptime(seconds) {
-  if (!seconds) return "-";
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return `${d}d ${h}h ${m}m`;
-}
 
 function meter(label, used, total) {
   const pct = total ? Math.min(100, Math.round((used / total) * 100)) : 0;
@@ -167,6 +151,8 @@ function setView(name) {
   $(`#view-${name}`).classList.remove("hidden");
   $("#view-title").textContent = TITLES[name] || name;
   clearInterval(state.jobsTimer);
+  clearInterval(state.metricsTimer);
+  stopLogFollow();
   loadView();
 }
 
@@ -209,13 +195,244 @@ async function loadOverview() {
       .map((iface) => `<li><code>${esc(iface.name)}</code> ${esc((iface.addresses || []).join(", ") || "no address")}</li>`)
       .join("");
     const route = net.runtime.default_route;
+    const route6 = net.runtime.default_route6;
     $("#overview-addresses").innerHTML = `
       <ul class="list">${rows || "<li class='muted'>No interfaces found</li>"}</ul>
-      <div class="muted">Default route: ${route ? `${esc(route.via || "")} via ${esc(route.dev || "")}` : "none"}</div>`;
+      <div class="muted">Default route: ${route ? `${esc(route.via || "")} via ${esc(route.dev || "")}` : "none"}
+        ${route6 ? ` · IPv6: ${esc(route6.via || "")} via ${esc(route6.dev || "")}` : ""}</div>`;
   } catch (err) {
     $("#overview-addresses").innerHTML = `<div class="muted">${esc(err.message)}</div>`;
   }
+  await loadMetrics();
+  clearInterval(state.metricsTimer);
+  state.metricsTimer = setInterval(() => { if (state.view === "overview") loadMetrics(); }, 60000);
 }
+
+/* ---------------------------------------------------------------- metrics */
+
+// Small multiples: one single-series chart per metric (different units, so
+// never a shared or second axis). Line 2px in the accent, a 10% area wash,
+// hairline grid, the latest value labelled at the line's end, the alert
+// limit as a quiet reference line, and a crosshair tooltip on hover/focus.
+const METRIC_CHARTS = [
+  { key: "cpu", title: "CPU", unit: "%", max: 100 },
+  { key: "mem", title: "Memory", unit: "%", max: 100 },
+  { key: "disk", title: "Disk /", unit: "%", max: 100 },
+  { key: "load", title: "Load average (1 min)", unit: "", max: null },
+];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs || {}).forEach(([k, v]) => el.setAttribute(k, String(v)));
+  if (parent) parent.appendChild(el);
+  return el;
+}
+
+
+
+function fmtClock(t) {
+  return new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderMetricChart(box, spec, samples, limit, interval) {
+  box.textContent = "";
+  const title = document.createElement("h3");
+  title.textContent = spec.title;
+  box.appendChild(title);
+  const points = samples.filter((s) => typeof s[spec.key] === "number");
+  const width = Math.max(200, Math.round(box.getBoundingClientRect().width) || 300);
+  const height = 130;
+  const m = { left: 30, right: 52, top: 10, bottom: 18 };
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
+    "aria-label": `${spec.title} over the last 24 hours` }, box);
+  if (!points.length) {
+    const t = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "tick" }, svg);
+    t.textContent = "Collecting - the first points appear within a minute";
+    return;
+  }
+  const t1 = points[points.length - 1].t;
+  const t0 = Math.min(points[0].t, t1 - 3600);
+  const peak = Math.max(...points.map((p) => p[spec.key]), limit || 0);
+  const yMax = spec.max || niceMax(peak * 1.1);
+  const x = (t) => m.left + ((t - t0) / Math.max(1, t1 - t0)) * (width - m.left - m.right);
+  const y = (v) => m.top + (1 - Math.min(v, yMax) / yMax) * (height - m.top - m.bottom);
+  const grid = getComputedStyle(document.documentElement);
+  const border = grid.getPropertyValue("--border").trim() || "#e2e8f0";
+  const accent = grid.getPropertyValue("--accent").trim() || "#2563eb";
+  const muted = grid.getPropertyValue("--muted").trim() || "#64748b";
+  const panel = grid.getPropertyValue("--panel").trim() || "#ffffff";
+  [0, yMax / 2, yMax].forEach((v) => {
+    svgEl("line", { x1: m.left, x2: width - m.right, y1: y(v), y2: y(v), stroke: border, "stroke-width": 1 }, svg);
+    const label = svgEl("text", { x: m.left - 6, y: y(v) + 3, "text-anchor": "end", class: "tick" }, svg);
+    label.textContent = spec.unit === "%" ? `${v}` : `${+v.toFixed(2)}`;
+  });
+  [[t0, "start"], [t1, "end"]].forEach(([t, anchor]) => {
+    const label = svgEl("text", { x: x(t), y: height - 4, "text-anchor": anchor, class: "tick" }, svg);
+    label.textContent = fmtClock(t);
+  });
+  if (limit && limit <= yMax) {
+    svgEl("line", { x1: m.left, x2: width - m.right, y1: y(limit), y2: y(limit), stroke: muted, "stroke-width": 1 }, svg);
+    const ref = svgEl("text", { x: m.left + 4, y: y(limit) - 4, class: "ref-label" }, svg);
+    ref.textContent = `alert ${fmtMetric(limit, spec.unit)}`;
+  }
+  // a gap of more than two intervals (panel stopped) breaks the line
+  const segments = [];
+  points.forEach((p, i) => {
+    if (!i || p.t - points[i - 1].t > interval * 2.5) segments.push([]);
+    segments[segments.length - 1].push(p);
+  });
+  segments.forEach((seg) => {
+    const line = seg.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p[spec.key]).toFixed(1)}`).join("");
+    if (seg.length > 1) {
+      const base = y(0).toFixed(1);
+      svgEl("path", { d: `${line}L${x(seg[seg.length - 1].t).toFixed(1)},${base}L${x(seg[0].t).toFixed(1)},${base}Z`,
+        fill: accent, "fill-opacity": 0.1 }, svg);
+    }
+    svgEl("path", { d: line, fill: "none", stroke: accent, "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  });
+  const last = points[points.length - 1];
+  svgEl("circle", { cx: x(last.t), cy: y(last[spec.key]), r: 4, fill: accent, stroke: panel, "stroke-width": 2 }, svg);
+  const end = svgEl("text", { x: x(last.t) + 8, y: y(last[spec.key]) + 4, class: "end-label" }, svg);
+  end.textContent = fmtMetric(last[spec.key], spec.unit);
+
+  // crosshair + tooltip; the whole plot is the hit target
+  const cross = svgEl("line", { y1: m.top, y2: height - m.bottom, stroke: muted, "stroke-width": 1, visibility: "hidden" }, svg);
+  const dot = svgEl("circle", { r: 4, fill: accent, stroke: panel, "stroke-width": 2, visibility: "hidden" }, svg);
+  const tip = document.createElement("div");
+  tip.className = "chart-tip hidden";
+  const tipValue = document.createElement("strong");
+  const tipTime = document.createElement("span");
+  tip.append(tipValue, tipTime);
+  box.appendChild(tip);
+  let focusIndex = points.length - 1;
+  const show = (index) => {
+    const p = points[Math.max(0, Math.min(points.length - 1, index))];
+    focusIndex = points.indexOf(p);
+    const px = x(p.t);
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", px); dot.setAttribute("cy", y(p[spec.key])); dot.setAttribute("visibility", "visible");
+    tipValue.textContent = fmtMetric(p[spec.key], spec.unit);
+    tipTime.textContent = fmtClock(p.t);
+    tip.classList.remove("hidden");
+    const scale = svg.getBoundingClientRect().width / width || 1;
+    const left = Math.min(px * scale + 10, svg.getBoundingClientRect().width - tip.offsetWidth - 4);
+    tip.style.left = `${Math.max(0, left)}px`;
+    tip.style.top = `${title.offsetHeight + 4}px`;
+  };
+  const hide = () => {
+    cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden");
+    tip.classList.add("hidden");
+  };
+  const hit = svgEl("rect", { x: m.left, y: 0, width: width - m.left - m.right, height, fill: "transparent" }, svg);
+  hit.addEventListener("pointermove", (event) => {
+    const rect = svg.getBoundingClientRect();
+    const t = t0 + ((event.clientX - rect.left) * (width / rect.width) - m.left) / (width - m.left - m.right) * (t1 - t0);
+    let best = 0;
+    points.forEach((p, i) => { if (Math.abs(p.t - t) < Math.abs(points[best].t - t)) best = i; });
+    show(best);
+  });
+  hit.addEventListener("pointerleave", hide);
+  svg.addEventListener("focus", () => show(focusIndex));
+  svg.addEventListener("blur", hide);
+  svg.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft") { show(focusIndex - 1); event.preventDefault(); }
+    if (event.key === "ArrowRight") { show(focusIndex + 1); event.preventDefault(); }
+  });
+}
+
+function renderMetricTable(samples) {
+  // one row per 10 minutes keeps the table readable; values match the charts
+  const rows = samples.filter((s, i) => i === samples.length - 1 || s.t % 600 < 60).reverse().map((s) => `
+    <tr><td>${esc(new Date(s.t * 1000).toLocaleString())}</td>
+      ${METRIC_CHARTS.map((c) => `<td class="num">${esc(fmtMetric(s[c.key], c.unit))}</td>`).join("")}</tr>`).join("");
+  $("#metrics-table").innerHTML = `
+    <thead><tr><th>Time</th>${METRIC_CHARTS.map((c) => `<th>${esc(c.title)}</th>`).join("")}</tr></thead>
+    <tbody>${rows || "<tr><td colspan='5' class='muted'>No samples yet</td></tr>"}</tbody>`;
+}
+
+function renderAlerts(alerts, recipient) {
+  const cfg = alerts.config || {};
+  $("#alert-enabled").checked = !!cfg.enabled;
+  $("#alert-cpu").value = cfg.cpu;
+  $("#alert-mem").value = cfg.mem;
+  $("#alert-disk").value = cfg.disk;
+  $("#alert-load").value = cfg.load_per_cpu;
+  $("#alert-sustain").value = cfg.sustain_minutes;
+  $("#alert-cooldown").value = cfg.cooldown_minutes;
+  $("#alert-recipient").value = cfg.recipient || "";
+  $("#alert-recipient").placeholder = recipient && !cfg.recipient
+    ? `${recipient} (from the Email page)` : "ops@example.com or root";
+  const status = $("#alerts-status");
+  const active = alerts.active || [];
+  if (!cfg.enabled) { status.className = "badge muted"; status.textContent = "off"; }
+  else if (active.length) {
+    status.className = "badge warn";
+    status.textContent = `⚠ alerting: ${active.map((k) => (METRIC_CHARTS.find((c) => c.key === k) || {}).title || k).join(", ")}`;
+  } else { status.className = "badge ok"; status.textContent = "✓ on, all within limits"; }
+}
+
+async function loadMetrics() {
+  try {
+    const data = await api("/metrics");
+    state.metricsData = data;
+    renderMetrics(data);
+  } catch (err) { $("#metrics-note").textContent = err.message; }
+}
+
+function renderMetrics(data) {
+  const samples = data.samples || [];
+  const thresholds = (data.alerts && data.alerts.thresholds) || {};
+  const enabled = data.alerts && data.alerts.config && data.alerts.config.enabled;
+  const container = $("#metrics-charts");
+  container.textContent = "";
+  // lay every box out first, then measure: a box measured before its
+  // siblings exist gets the whole row's width and renders at the wrong scale
+  const boxes = METRIC_CHARTS.map(() => {
+    const box = document.createElement("div");
+    box.className = "chart";
+    container.appendChild(box);
+    return box;
+  });
+  METRIC_CHARTS.forEach((spec, i) => {
+    renderMetricChart(boxes[i], spec, samples, enabled ? thresholds[spec.key] : null, data.interval || 60);
+  });
+  $("#metrics-note").textContent = `sampled every ${data.interval || 60}s · ${data.cpus} CPU(s)`;
+  renderMetricTable(samples);
+  renderAlerts(data.alerts || {}, data.recipient);
+}
+
+window.addEventListener("resize", () => {
+  clearTimeout(state.metricsResize);
+  state.metricsResize = setTimeout(() => { if (state.view === "overview" && state.metricsData) renderMetrics(state.metricsData); }, 200);
+});
+
+$("#alerts-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = {
+    enabled: $("#alert-enabled").checked,
+    cpu: Number($("#alert-cpu").value),
+    mem: Number($("#alert-mem").value),
+    disk: Number($("#alert-disk").value),
+    load_per_cpu: Number($("#alert-load").value),
+    sustain_minutes: Number($("#alert-sustain").value),
+    cooldown_minutes: Number($("#alert-cooldown").value),
+    recipient: $("#alert-recipient").value.trim(),
+  };
+  try {
+    await api("/metrics/alerts", { method: "POST", body });
+    toast("Alert settings saved", "success");
+    loadMetrics();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#alert-test").addEventListener("click", async () => {
+  try {
+    await api("/metrics/alerts/test", { method: "POST" });
+    toast("Test alert sent", "success");
+  } catch (err) { toast(err.message, "error"); }
+});
 
 /* ---------------------------------------------------------------- network */
 
@@ -227,7 +444,7 @@ async function loadNetwork() {
     <tr>
       <td><code>${esc(iface.name)}</code></td>
       <td><span class="badge ${iface.state === "up" ? "ok" : "muted"}">${esc(iface.state)}</span></td>
-      <td>${esc((iface.addresses || []).join(", "))}</td>
+      <td>${esc([...(iface.addresses || []), ...(iface.addresses6 || [])].join(", "))}</td>
       <td class="muted">${esc(iface.mac || "")}</td>
     </tr>`).join("");
   $("#net-runtime-table").innerHTML = `
@@ -250,9 +467,14 @@ async function loadNetwork() {
          still applies to this interface. Saving this interface switches DHCP off in every
          file that has it.</p>`
       : "";
+    const v6 = iface.ipv6 || null;
+    const v6method = v6 ? v6.method : "";
+    const kind = iface.kind && iface.kind !== "ethernets" && iface.kind !== "ethernet"
+      ? ` <span class="badge muted">${esc(String(iface.kind).replace(/s$/, ""))}</span>` : "";
+    const inactive = iface.active === false ? ' <span class="badge warn">inactive</span>' : "";
     return `
     <div class="card">
-      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span></h2>
+      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}</h2>
       ${duplicated}
       ${dhcpElsewhere}
       <form class="form" data-iface="${esc(iface.name)}">
@@ -270,7 +492,22 @@ async function loadNetwork() {
           <input type="text" name="gateway" value="${esc(iface.gateway || "")}" placeholder="192.168.1.1">
         </label>
         <label>DNS servers (comma separated)
-          <input type="text" name="dns" value="${esc((iface.dns || []).join(", "))}" placeholder="1.1.1.1, 8.8.8.8">
+          <input type="text" name="dns" value="${esc((iface.dns || []).join(", "))}" placeholder="1.1.1.1, 2606:4700:4700::1111">
+        </label>
+        <label>IPv6
+          <select name="ipv6_method">
+            <option value="" selected>Leave unchanged${v6method ? ` (currently ${esc(v6method)})` : ""}</option>
+            <option value="none">Not configured</option>
+            <option value="auto">Automatic (SLAAC)</option>
+            <option value="dhcp">DHCPv6</option>
+            <option value="static">Static</option>
+          </select>
+        </label>
+        <label>IPv6 address (CIDR)
+          <input type="text" name="ipv6_address" value="${esc((v6 && v6.address) || "")}" placeholder="2001:db8::10/64">
+        </label>
+        <label>IPv6 gateway
+          <input type="text" name="ipv6_gateway" value="${esc((v6 && v6.gateway) || "")}" placeholder="fe80::1">
         </label>
         <button class="btn btn-primary" type="submit">Apply (with 90s Auto-Revert)</button>
       </form>
@@ -289,6 +526,11 @@ async function loadNetwork() {
         gateway: el.gateway.value.trim() || null,
         dns: el.dns.value.split(",").map((s) => s.trim()).filter(Boolean),
       };
+      if (el.ipv6_method.value) {
+        body.ipv6_method = el.ipv6_method.value;
+        body.ipv6_address = el.ipv6_address.value.trim() || null;
+        body.ipv6_gateway = el.ipv6_gateway.value.trim() || null;
+      }
       try {
         const result = await api(`/network/interfaces/${encodeURIComponent(name)}`, { method: "POST", body });
         toast(`Changes applied to ${name}`, "success");
@@ -320,7 +562,7 @@ function startRevertBar(session) {
   const tick = () => {
     $("#revert-countdown").textContent = `revert in ${left}s`;
     left -= 1;
-    if (left < 0) { hideRevertBar(); loadNetwork(); }
+    if (left < 0) { hideRevertBar(); loadView(); }
   };
   tick();
   state.sessionTimer = setInterval(tick, 1000);
@@ -780,18 +1022,34 @@ $("#sysctl-modal-delete").addEventListener("click", async () => {
 
 /* ------------------------------------------------------------------ email */
 
+const MAIL_PACKAGES = { postfix: "postfix", msmtp: "msmtp-mta" };
+
+function mailInstallButton() {
+  const chosen = $("#mail-transport-select").value;
+  const configured = state.mailData && state.mailData.transport;
+  const button = $("#mail-install");
+  button.textContent = `Install ${MAIL_PACKAGES[chosen]}`;
+  // offer the install whenever the chosen transport is not the one known to be installed
+  button.classList.toggle("hidden", !!(state.mailData && state.mailData.installed && chosen === configured));
+}
+
 async function loadMail() {
   const data = await api("/mail");
+  state.mailData = data;
+  const transport = data.transport || "postfix";
+  $("#mail-transport-select").value = transport;
   const badge = $("#mail-status-badge");
   if (!data.installed) {
-    badge.textContent = "postfix not installed";
+    badge.textContent = `${MAIL_PACKAGES[transport]} not installed`;
     badge.className = "badge warn";
-    $("#mail-install").classList.remove("hidden");
+  } else if (transport === "msmtp") {
+    badge.textContent = "msmtp installed";
+    badge.className = "badge ok";
   } else {
     badge.textContent = data.service_active ? "postfix active" : "postfix installed";
     badge.className = `badge ${data.service_active ? "ok" : "warn"}`;
-    $("#mail-install").classList.add("hidden");
   }
+  mailInstallButton();
   $("#mail-host").value = data.host || "";
   $("#mail-port").value = data.port || 587;
   $("#mail-security").value = data.security || "starttls";
@@ -802,14 +1060,14 @@ async function loadMail() {
   $("#mail-password-hint").textContent = data.credentials_set ? "(password on file)" : "";
   const msmtp = data.msmtp || {};
   const msmtpHint = $("#mail-msmtp-hint");
-  if (msmtp.detected && !data.relayhost) {
+  if (msmtp.detected && !data.relayhost && transport === "postfix") {
     msmtpHint.classList.remove("hidden");
     msmtpHint.textContent =
       "Existing msmtp configuration found - the form is pre-filled from /etc/msmtprc. " +
       (msmtp.password_available
         ? "Leave the password blank and the msmtp password file is used automatically. "
         : "") +
-      "After saving, use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
+      "Keep msmtp by choosing it under Delivery, or save with Postfix and use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
     $("#mail-host").value = msmtp.host || $("#mail-host").value;
     $("#mail-port").value = msmtp.port || $("#mail-port").value;
     $("#mail-security").value = msmtp.security || $("#mail-security").value;
@@ -820,7 +1078,7 @@ async function loadMail() {
   }
   const mailer = data.mailer || {};
   const conflicts = mailer.conflicts || [];
-  const transport = $("#mail-transport");
+  const transportLine = $("#mail-transport");
   let transportText = mailer.sendmail
     ? `sendmail provided by ${mailer.sendmail_provider} (${mailer.sendmail})`
     : "no sendmail provider found";
@@ -828,18 +1086,19 @@ async function loadMail() {
   if (mailer.msmtp_client && !conflicts.length) {
     transportText += " · msmtp client present (not used for delivery, left untouched)";
   }
-  transport.textContent = transportText;
+  transportLine.textContent = transportText;
   $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
   let summary = "No relay configured yet.";
   if (data.relayhost) {
-    summary =
-      `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`;
+    summary = transport === "msmtp"
+      ? `msmtp hands mail to ${data.relayhost}, sending as ${data.from_address || "-"}.`
+      : `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`;
     if (data.envelope_sender) {
       summary += data.envelope_sender === data.from_address
         ? ` Envelope sender (MAIL FROM): ${data.envelope_sender}.`
         : ` The relay account owns the envelope sender, so messages leave with MAIL FROM ${data.envelope_sender} and From: ${data.from_address || "-"} - your mail server would reject the From: address as a sender it does not own.`;
     }
-    if (data.credentials_set && !data.sender_canonical_set) {
+    if (transport === "postfix" && data.credentials_set && !data.sender_canonical_set) {
       summary += " Save these settings to pin the envelope sender to the relay account.";
     }
   }
@@ -857,6 +1116,7 @@ $("#mail-form").addEventListener("submit", async (event) => {
     from_address: $("#mail-from").value.trim(),
     report_to: $("#mail-report-to").value.trim(),
     report_mode: $("#mail-report-mode").value,
+    transport: $("#mail-transport-select").value,
   };
   try {
     await api("/mail", { method: "POST", body });
@@ -878,17 +1138,20 @@ $("#mail-test-form").addEventListener("submit", async (event) => {
   } catch (err) { toast(err.message, "error"); }
 });
 
+$("#mail-transport-select").addEventListener("change", mailInstallButton);
+
 $("#mail-install").addEventListener("click", async () => {
+  const chosen = $("#mail-transport-select").value;
   try {
-    const job = await api("/mail/install", { method: "POST" });
-    toast("Installing postfix…", "success");
+    const job = await api(`/mail/install?transport=${chosen}`, { method: "POST" });
+    toast(`Installing ${MAIL_PACKAGES[chosen]}…`, "success");
     openJob(job.id);
   } catch (err) { toast(err.message, "error"); }
 });
 
 $("#mail-remove-conflicts").addEventListener("click", async () => {
   if (!window.confirm(
-    "Remove the conflicting mail transfer agent(s)? Postfix (or its installer) will handle mail delivery afterwards. Their config files are kept.",
+    `Remove the conflicting mail transfer agent(s)? ${(state.mailData && state.mailData.transport) === "msmtp" ? "msmtp" : "Postfix"} handles mail delivery afterwards. Their config files are kept.`,
   )) return;
   try {
     const job = await api("/mail/remove-conflicts", { method: "POST" });
@@ -917,11 +1180,80 @@ async function loadUsers() {
   $("#users-table").innerHTML = `
     <thead><tr><th>User</th><th>Full name</th><th>Shell</th><th>Status</th><th></th></tr></thead>
     <tbody>${rows || "<tr><td colspan='5' class='muted'>No user accounts found</td></tr>"}</tbody>`;
+  loadGroups();
 }
 
 $("#users-table").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-user]");
   if (button) openUser(button.dataset.user);
+});
+
+/* ----------------------------------------------------------------- groups */
+
+function renderGroups(data) {
+  state.groupsData = data;
+  const showSystem = $("#groups-system").checked;
+  const users = data.users || [];
+  const rows = (data.groups || []).filter((g) => showSystem || !g.system).map((g) => {
+    const members = (g.members || []).map((m) =>
+      `<span class="chip"><code>${esc(m)}</code><button class="chip-x" title="Remove ${esc(m)}"
+        data-group="${esc(g.name)}" data-remove-member="${esc(m)}">&times;</button></span>`).join(" ");
+    const primary = (g.primary_of || []).length
+      ? `<div class="muted">primary group of ${g.primary_of.map(esc).join(", ")}</div>` : "";
+    const candidates = users.filter((u) => !(g.members || []).includes(u));
+    return `<tr>
+      <td><code>${esc(g.name)}</code>${g.system ? ' <span class="badge muted">system</span>' : ""}</td>
+      <td>${esc(g.gid)}</td>
+      <td>${members || '<span class="muted">no supplementary members</span>'}${primary}</td>
+      <td class="nowrap">
+        <select data-add-select="${esc(g.name)}">${candidates.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join("")}</select>
+        <button class="btn btn-small" data-add-member="${esc(g.name)}" ${candidates.length ? "" : "disabled"}>Add</button>
+        ${g.deletable ? `<button class="btn btn-small btn-danger" data-delete-group="${esc(g.name)}">Delete</button>` : ""}
+      </td>
+    </tr>`;
+  }).join("");
+  $("#groups-table").innerHTML = `
+    <thead><tr><th>Group</th><th>GID</th><th>Members</th><th></th></tr></thead>
+    <tbody>${rows || "<tr><td colspan='4' class='muted'>No groups to show</td></tr>"}</tbody>`;
+}
+
+async function loadGroups() {
+  try { renderGroups(await api("/groups")); } catch (err) { toast(err.message, "error"); }
+}
+
+$("#groups-system").addEventListener("change", () => { if (state.groupsData) renderGroups(state.groupsData); });
+
+$("#groups-table").addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  try {
+    if (target.dataset.removeMember) {
+      const { group, removeMember } = target.dataset;
+      if (!window.confirm(`Remove ${removeMember} from ${group}?`)) return;
+      renderGroups(await api(`/groups/${encodeURIComponent(group)}/members/${encodeURIComponent(removeMember)}`, { method: "DELETE" }));
+      toast(`${removeMember} removed from ${group}`, "success");
+    } else if (target.dataset.addMember) {
+      const group = target.dataset.addMember;
+      const user = $(`select[data-add-select="${CSS.escape(group)}"]`).value;
+      renderGroups(await api(`/groups/${encodeURIComponent(group)}/members`, { method: "POST", body: { user } }));
+      toast(`${user} added to ${group}`, "success");
+    } else if (target.dataset.deleteGroup) {
+      const group = target.dataset.deleteGroup;
+      if (!window.confirm(`Delete group ${group}?`)) return;
+      renderGroups(await api(`/groups/${encodeURIComponent(group)}`, { method: "DELETE" }));
+      toast(`Group ${group} deleted`, "success");
+    }
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#group-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = $("#new-group").value.trim();
+  try {
+    renderGroups(await api("/groups", { method: "POST", body: { name, system: $("#new-group-system").checked } }));
+    $("#new-group").value = "";
+    toast(`Group ${name} created`, "success");
+  } catch (err) { toast(err.message, "error"); }
 });
 
 async function openUser(name) {
@@ -1195,6 +1527,9 @@ async function checkUpdate() {
       (data.newer_available
         ? '<span class="badge warn">update available</span>'
         : '<span class="badge ok">up to date</span>') +
+      (data.checksum_published
+        ? ' <span class="badge ok">SHA-256 verified on install</span>'
+        : ` <span class="badge warn">no checksum published${data.require_checksum ? " - install refused" : ""}</span>`) +
       commitNote +
       (data.update_supported
         ? ""
@@ -1403,7 +1738,11 @@ async function loadAudit() {
 
 async function loadFirewall() {
   const data = await api("/firewall");
-  $("#fw-backend").textContent = `backend: ${data.backend}`;
+  const firewalld = data.backend === "firewalld";
+  $("#fw-backend").textContent = `backend: ${data.backend}${firewalld && data.zone ? ` (zone ${data.zone})` : ""}`;
+  // firewalld zones only filter incoming traffic
+  $("#fw-outgoing").disabled = firewalld;
+  $('#fw-direction option[value="out"]').disabled = firewalld;
   const status = $("#fw-status");
   status.textContent = data.enabled ? "enabled" : "disabled";
   status.className = `badge ${data.enabled ? "ok" : "warn"}`;
@@ -1411,14 +1750,16 @@ async function loadFirewall() {
   $("#fw-outgoing").value = data.default_outgoing || "allow";
   $("#fw-enabled").checked = !!data.enabled;
   const rows = (data.rules || []).map((rule, index) => {
-    const target = rule.to
+    let target = rule.to
       ? `<code>${esc(rule.to)}</code>`
       : `<code>${esc((rule.protocol === "any" ? "all" : rule.protocol) + (rule.port ? `/${rule.port}` : ""))}</code>`;
+    if (rule.action === "custom") target = `<code>${esc(rule.raw || "")}</code>`;
+    else if (rule.label) target += ` <span class="muted">${esc(rule.label)}</span>`;
     const side = rule.direction === "out" ? "to" : "from";
     const address = rule.to ? rule.from : rule.address;
     return `<tr>
       <td><span class="badge">${rule.direction === "out" ? "out" : "in"}</span></td>
-      <td><span class="badge ${rule.action === "allow" ? "ok" : "danger"}">${esc(rule.action)}</span></td>
+      <td><span class="badge ${rule.action === "allow" ? "ok" : rule.action === "custom" ? "muted" : "danger"}">${esc(rule.action)}</span></td>
       <td>${target}</td>
       <td class="muted">${side} ${esc(address || "any")}${rule.ipv6 ? " (v6)" : ""}</td>
       <td><button class="btn btn-small btn-danger" data-fw-remove="${index}">Remove</button></td>
@@ -1568,6 +1909,29 @@ $("#svc-table").addEventListener("click", (event) => {
   if (button) openService(button.dataset.svcUnit);
 });
 
+function renderOverride(data) {
+  $("#svc-override-path").textContent = data.path || "";
+  $("#svc-override").value = data.content || "";
+  $("#svc-definition").textContent = data.definition || "";
+}
+
+async function loadOverride(unit) {
+  try { renderOverride(await api(`/services/${encodeURIComponent(unit)}/override`)); }
+  catch (err) { $("#svc-definition").textContent = err.message; }
+}
+
+$("#svc-override-save").addEventListener("click", async () => {
+  if (!state.svcEdit) return;
+  const content = $("#svc-override").value;
+  if (!content.trim() && !window.confirm(`Remove the override for ${state.svcEdit}?`)) return;
+  try {
+    renderOverride(await api(`/services/${encodeURIComponent(state.svcEdit)}/override`, {
+      method: "PUT", body: { content },
+    }));
+    toast(content.trim() ? "Override saved - restart the service to apply it" : "Override removed", "success");
+  } catch (err) { toast(err.message, "error"); }
+});
+
 async function openService(unit) {
   try {
     const data = await api(`/services/${encodeURIComponent(unit)}`);
@@ -1576,6 +1940,7 @@ async function openService(unit) {
     $("#service-modal-meta").textContent =
       `${data.description} · ${data.active}/${data.sub} · ${data.enabled || "unknown"} · pid ${data.main_pid || "-"}`;
     $("#service-modal-log").textContent = (data.journal || []).join("\n") || "No journal entries.";
+    loadOverride(unit);
     $("#service-modal").classList.remove("hidden");
   } catch (err) { toast(err.message, "error"); }
 }
@@ -1677,22 +2042,72 @@ async function loadLogsView() {
   await loadJournal();
 }
 
-async function loadJournal() {
+const LOG_KEEP_LINES = 5000;
+
+function logParams() {
   const source = $("#log-source").value || "journal";
   const lines = $("#log-lines").value;
+  if (source === "journal") {
+    const unit = encodeURIComponent($("#log-unit").value.trim());
+    const priority = encodeURIComponent($("#log-priority").value);
+    return { source, path: `/logs/journal?lines=${lines}&unit=${unit}&priority=${priority}` };
+  }
+  const name = source.slice("file:".length);
+  return { source, path: `/logs/files/${encodeURIComponent(name)}?lines=${lines}` };
+}
+
+async function loadJournal() {
+  stopLogFollow();
   try {
-    let data;
-    if (source === "journal") {
-      const unit = encodeURIComponent($("#log-unit").value.trim());
-      const priority = encodeURIComponent($("#log-priority").value);
-      data = await api(`/logs/journal?lines=${lines}&unit=${unit}&priority=${priority}`);
-    } else {
-      const name = source.slice("file:".length);
-      data = await api(`/logs/files/${encodeURIComponent(name)}?lines=${lines}`);
-    }
+    const { path } = logParams();
+    const data = await api(path);
+    state.logCursor = data.cursor || "";
+    state.logOffset = data.offset;
     $("#log-output").textContent = (data.lines || []).join("\n") || "No entries.";
+    const out = $("#log-output");
+    out.scrollTop = out.scrollHeight;
+    if ($("#log-follow").checked) startLogFollow();
   } catch (err) { toast(err.message, "error"); }
 }
+
+// Following asks only for what is new: entries after the journal cursor, or
+// bytes after the last offset of a file.
+function startLogFollow() {
+  stopLogFollow();
+  state.logTimer = setInterval(followTick, 3000);
+}
+
+function stopLogFollow() {
+  clearInterval(state.logTimer);
+  state.logTimer = null;
+}
+
+async function followTick() {
+  const { source, path } = logParams();
+  const extra = source === "journal"
+    ? (state.logCursor ? `&after_cursor=${encodeURIComponent(state.logCursor)}` : "")
+    : (state.logOffset !== undefined && state.logOffset !== null ? `&offset=${state.logOffset}` : "");
+  try {
+    const data = await api(path + extra);
+    if (source === "journal") state.logCursor = data.cursor || state.logCursor;
+    else state.logOffset = data.offset;
+    const fresh = data.lines || [];
+    if (!fresh.length) return;
+    const out = $("#log-output");
+    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+    const existing = out.textContent === "No entries." ? [] : out.textContent.split("\n");
+    out.textContent = mergeLogLines(existing, fresh, LOG_KEEP_LINES).join("\n");
+    if (atBottom) out.scrollTop = out.scrollHeight;
+  } catch (err) {
+    stopLogFollow();
+    $("#log-follow").checked = false;
+    toast(err.message, "error");
+  }
+}
+
+$("#log-follow").addEventListener("change", (event) => {
+  if (event.target.checked) startLogFollow(); else stopLogFollow();
+});
 
 $("#log-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1742,135 +2157,85 @@ $("#proc-table").addEventListener("click", async (event) => {
 
 /* ---------------------------------------------------------------- terminal */
 
-const term = { ws: null, cols: 100, rows: 30, lines: [""], cx: 0, cy: 0 };
+// xterm.js (vendored under /static/vendor) renders the shell: full-screen
+// programs, colours, selection and paste all work, and the fit add-on keeps
+// the PTY's size in step with the browser window.
+const term = { ws: null, xterm: null, fit: null, resizeTimer: null };
 
-function termReset() {
-  term.lines = [""];
-  term.cx = 0;
-  term.cy = 0;
+function termSend(message) {
+  if (term.ws && term.ws.readyState === WebSocket.OPEN) term.ws.send(JSON.stringify(message));
 }
 
-function termEnsureRow(row) {
-  while (term.lines.length <= row) term.lines.push("");
-}
-
-function termRender() {
-  const html = term.lines.map((line, index) => {
-    if (index === term.cy) {
-      return esc(line.slice(0, term.cx)) +
-        `<span class="term-cursor">${esc(line.charAt(term.cx) || " ")}</span>` +
-        esc(line.slice(term.cx + 1));
-    }
-    return esc(line);
-  }).join("\n");
-  const screen = $("#term-screen");
-  screen.innerHTML = html;
-  screen.scrollTop = screen.scrollHeight;
-}
-
-function termPutChar(ch) {
-  termEnsureRow(term.cy);
-  const line = term.lines[term.cy];
-  term.lines[term.cy] = term.cx < line.length
-    ? line.slice(0, term.cx) + ch + line.slice(term.cx + 1)
-    : line + " ".repeat(term.cx - line.length) + ch;
-  term.cx += 1;
-}
-
-function termCsi(args, cmd) {
-  const nums = (args || "").split(";").map((n) => parseInt(n, 10) || 0);
-  const n = nums[0] || 0;
-  const m = nums[1] || 0;
-  switch (cmd) {
-    case "H": case "f":
-      term.cy = Math.max(0, (n || 1) - 1);
-      term.cx = Math.max(0, (m || 1) - 1);
-      termEnsureRow(term.cy);
-      break;
-    case "A": term.cy = Math.max(0, term.cy - Math.max(1, n)); break;
-    case "B": term.cy += Math.max(1, n); termEnsureRow(term.cy); break;
-    case "C": term.cx += Math.max(1, n); break;
-    case "D": term.cx = Math.max(0, term.cx - Math.max(1, n)); break;
-    case "J":
-      if (n === 2 || n === 3) {
-        termReset();
-      } else if (n === 0) {
-        term.lines = term.lines.slice(0, term.cy + 1);
-        term.lines[term.cy] = (term.lines[term.cy] || "").slice(0, term.cx);
-      } else {
-        termEnsureRow(term.cy);
-        for (let row = 0; row < term.cy; row += 1) term.lines[row] = "";
-        term.lines[term.cy] = term.lines[term.cy].slice(term.cx);
-        term.cx = 0;
-      }
-      break;
-    case "K":
-      termEnsureRow(term.cy);
-      if (n === 0) term.lines[term.cy] = term.lines[term.cy].slice(0, term.cx);
-      else if (n === 1) term.lines[term.cy] = " ".repeat(term.cx) + term.lines[term.cy].slice(term.cx);
-      else term.lines[term.cy] = "";
-      break;
-    default:
-      break; /* colors and rare sequences are intentionally dropped */
+function termEnsure() {
+  if (term.xterm) return term.xterm;
+  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+    toast("The terminal library failed to load", "error");
+    return null;
   }
+  const xterm = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    fontSize: 13,
+    scrollback: 5000,
+    theme: { background: "#0b1220", foreground: "#d7e0ea" },
+  });
+  const fit = new FitAddon.FitAddon();
+  xterm.loadAddon(fit);
+  xterm.open($("#term-screen"));
+  // onData carries typing and pasted text alike.
+  xterm.onData((data) => termSend({ type: "input", data }));
+  xterm.onResize(({ cols, rows }) => termSend({ type: "resize", cols, rows }));
+  window.addEventListener("resize", () => {
+    clearTimeout(term.resizeTimer);
+    term.resizeTimer = setTimeout(termFit, 150);
+  });
+  term.xterm = xterm;
+  term.fit = fit;
+  return xterm;
 }
 
-function termFeed(text) {
-  let index = 0;
-  while (index < text.length) {
-    const ch = text[index];
-    if (ch === "\x1b") {
-      const rest = text.slice(index);
-      const csi = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(rest);
-      if (csi) { termCsi(csi[1], csi[2]); index += csi[0].length; continue; }
-      const osc = /^\x1b\][^\x07\x1b]*(\x07|\x1b\\)/.exec(rest);
-      if (osc) { index += osc[0].length; continue; }
-      const simple = /^\x1b[()#][A-Za-z0-9]|^\x1b[=>78MDEHc]/.exec(rest);
-      if (simple) { index += simple[0].length; continue; }
-      index += 1;
-      continue;
-    }
-    if (ch === "\r") term.cx = 0;
-    else if (ch === "\n") { term.cy += 1; termEnsureRow(term.cy); }
-    else if (ch === "\b") term.cx = Math.max(0, term.cx - 1);
-    else if (ch === "\t") term.cx = Math.ceil((term.cx + 1) / 8) * 8;
-    else if (ch >= " " && ch !== "\x7f") termPutChar(ch);
-    index += 1;
-  }
-  termRender();
+function termFit() {
+  if (!term.fit || $("#view-terminal").classList.contains("hidden")) return;
+  try { term.fit.fit(); } catch (err) { /* not laid out yet */ }
 }
 
 function termConnect() {
   if (term.ws) return;
+  const xterm = termEnsure();
+  if (!xterm) return;
+  termFit();
+  xterm.reset();
   const user = $("#term-user").value;
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   // The token goes in the first message, not the URL: query strings land in
   // server access logs.
   const params = new URLSearchParams({
     user,
-    cols: String(term.cols),
-    rows: String(term.rows),
+    cols: String(xterm.cols),
+    rows: String(xterm.rows),
   });
-  termReset();
-  termRender();
   const ws = new WebSocket(`${protocol}://${location.host}/api/terminal/ws?${params}`);
   term.ws = ws;
   $("#term-status").textContent = "Connecting…";
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: "auth", token: state.token }));
     $("#term-status").textContent = `Connected as ${user || "root"} (session recorded)`;
-    $("#term-screen").focus();
+    xterm.focus();
   };
   ws.onmessage = (event) => {
     const message = JSON.parse(event.data);
-    if (message.type === "output") termFeed(message.data);
-    else if (message.type === "closed") { $("#term-status").textContent = "Session closed"; term.ws = null; }
-    else if (message.type === "error") { toast(message.detail, "error"); termDisconnect(); }
+    if (message.type === "output") xterm.write(message.data);
+    else if (message.type === "closed") {
+      $("#term-status").textContent = message.detail === "idle timeout"
+        ? "Session closed after being idle" : "Session closed";
+      term.ws = null;
+    } else if (message.type === "error") { toast(message.detail, "error"); termDisconnect(); }
   };
   ws.onclose = (event) => {
     term.ws = null;
     if (event.code === 4401) toast("Terminal authentication failed - check the access token", "error");
-    if ($("#term-status").textContent !== "Session closed") $("#term-status").textContent = "Disconnected";
+    if (event.code === 4429) toast("Too many wrong tokens from this address - try again later", "error");
+    if (!$("#term-status").textContent.startsWith("Session closed")) $("#term-status").textContent = "Disconnected";
   };
 }
 
@@ -1885,23 +2250,6 @@ function termDisconnect() {
 
 $("#term-connect").addEventListener("click", termConnect);
 $("#term-disconnect").addEventListener("click", termDisconnect);
-$("#term-screen").addEventListener("click", () => $("#term-screen").focus());
-$("#term-screen").addEventListener("keydown", (event) => {
-  if (!term.ws) return;
-  event.preventDefault();
-  const map = {
-    Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b",
-    ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D",
-    Home: "\x1b[H", End: "\x1b[F", PageUp: "\x1b[5~", PageDown: "\x1b[6~", Delete: "\x1b[3~",
-  };
-  let data = map[event.key];
-  if (!data && event.ctrlKey && event.key.length === 1) {
-    const code = event.key.toUpperCase().charCodeAt(0) - 64;
-    if (code >= 1 && code <= 26) data = String.fromCharCode(code);
-  }
-  if (!data && event.key.length === 1 && !event.ctrlKey && !event.metaKey) data = event.key;
-  if (data) term.ws.send(JSON.stringify({ type: "input", data }));
-});
 
 async function loadTerminal() {
   try {
@@ -1912,6 +2260,9 @@ async function loadTerminal() {
     if (current) $("#term-user").value = current;
   } catch (err) { toast(err.message, "error"); }
   $("#term-status").textContent = term.ws ? "Connected" : "Not connected";
+  // The view was hidden until now, so this is the first moment it has a size.
+  termEnsure();
+  termFit();
 }
 
 /* ------------------------------------------------------------------- init */
@@ -1921,3 +2272,13 @@ async function loadTerminal() {
 // panel forever. api() opens it on a real 401, and the logout button opens it
 // when a token is needed again.
 loadView();
+resumePendingSession();
+
+// A change applied before this page was loaded (or before the panel
+// restarted) is still waiting for confirmation: show its countdown.
+async function resumePendingSession() {
+  try {
+    const data = await api("/sessions");
+    if (!state.session && (data.sessions || []).length) startRevertBar(data.sessions[0]);
+  } catch (err) { /* not signed in yet; the view loader reports that */ }
+}

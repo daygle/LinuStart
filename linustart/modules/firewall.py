@@ -1,12 +1,16 @@
-"""Firewall management for UFW and nftables.
+"""Firewall management for UFW, nftables and firewalld.
 
-The panel supports two backends and detects which one is available:
+The panel supports three backends and detects which one is in use:
 
 * ``ufw``      - rules are managed through the ``ufw`` CLI, state parsed from
   ``ufw status verbose``. Snapshots of ``/etc/ufw`` back every change.
 * ``nftables`` - a clearly marked managed block inside ``/etc/nftables.conf``
   holds the panel's table (``inet linustart``); the rest of the file is left
   untouched. Every apply is validated with ``nft -c`` first.
+* ``firewalld`` - the default zone's permanent configuration, changed with
+  ``firewall-cmd --permanent`` (``firewall-offline-cmd`` while the daemon is
+  stopped) and then reloaded; ``/etc/firewalld/zones`` backs every change.
+  Zones filter incoming traffic only, so outgoing rules are refused.
 
 A firewall change can lock you out of a server just like a network change, so
 routes.py wraps every apply in a confirm-or-revert session: the old state is
@@ -17,12 +21,14 @@ Pure helpers operate on text/payloads so they can be tested without root.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 import shutil
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
-from ..paths import NFTABLES_CONF, SSHD_CONFIG, UFW_DIR
+from ..paths import FIREWALLD_DIR, NFTABLES_CONF, SSHD_CONFIG, UFW_DIR
 from ..util import read_text, run, write_text
 from .sshd import parse_sshd_config
 
@@ -425,15 +431,130 @@ def parse_nftables_managed(text: str) -> Dict[str, object]:
 
 
 # --------------------------------------------------------------------------
+# firewalld: pure helpers
+# --------------------------------------------------------------------------
+
+FIREWALLD_PORT_RE = re.compile(r"^(?P<low>\d{1,5})(?:-(?P<high>\d{1,5}))?/(?P<proto>tcp|udp|sctp|dccp)$")
+RICH_RE = re.compile(
+    r'^rule(?:\s+family="(?P<family>ipv4|ipv6)")?'
+    r'(?:\s+source\s+address="(?P<address>[^"]+)")?'
+    r'(?:\s+port\s+port="(?P<port>\d{1,5}(?:-\d{1,5})?)"\s+protocol="(?P<proto>tcp|udp)"'
+    r'|\s+protocol\s+value="(?P<l4>tcp|udp)")?'
+    r'\s+(?P<verdict>accept|drop|reject)$'
+)
+# zone target -> panel policy; "default" rejects what no rule allows
+FIREWALLD_TARGET_POLICY = {"ACCEPT": "allow", "DROP": "deny", "REJECT": "deny", "%%REJECT%%": "deny", "default": "deny"}
+FIREWALLD_POLICY_TARGET = {"allow": "ACCEPT", "deny": "DROP"}
+
+
+def parse_firewalld_ports(text: str, *, source: str = "port", name: str = "") -> List[Dict[str, str]]:
+    """``22/tcp 8000-8100/udp`` -> allow-in rules in the panel's shape."""
+    rules: List[Dict[str, str]] = []
+    for token in (text or "").split():
+        match = FIREWALLD_PORT_RE.match(token)
+        if not match or match.group("proto") not in ("tcp", "udp"):
+            continue
+        port = match.group("low") + (f":{match.group('high')}" if match.group("high") else "")
+        rules.append({
+            "action": "allow", "direction": "in", "protocol": match.group("proto"),
+            "port": port, "address": "any", "source": source, "name": name or token,
+        })
+    return rules
+
+
+def parse_rich_rule(line: str) -> Dict[str, str]:
+    """A rich rule in the panel's shape; rules it cannot express stay raw."""
+    raw = (line or "").strip()
+    match = RICH_RE.match(raw)
+    if not match:
+        return {"action": "custom", "direction": "in", "protocol": "any", "port": "",
+                "address": "any", "source": "rich", "raw": raw}
+    port = (match.group("port") or "").replace("-", ":")
+    return {
+        "action": "allow" if match.group("verdict") == "accept" else "deny",
+        "direction": "in",
+        "protocol": match.group("proto") or match.group("l4") or "any",
+        "port": port,
+        "address": match.group("address") or "any",
+        "source": "rich",
+        "raw": raw,
+    }
+
+
+def rich_rules_for(rule: Mapping[str, str]) -> List[str]:
+    """Rich rules expressing a normalized panel rule (one per port token)."""
+    if rule["direction"] != "in":
+        raise ValueError("firewalld zones filter incoming traffic only; outgoing rules are not supported")
+    verdict = "accept" if rule["action"] == "allow" else "drop"
+    head = "rule"
+    if rule["address"] != "any":
+        family = "ipv6" if ":" in rule["address"] else "ipv4"
+        head += f' family="{family}" source address="{rule["address"]}"'
+    if rule["port"]:
+        return [
+            f'{head} port port="{token.replace(":", "-")}" protocol="{rule["protocol"]}" {verdict}'
+            for token in rule["port"].split(",")
+        ]
+    if rule["protocol"] != "any":
+        return [f'{head} protocol value="{rule["protocol"]}" {verdict}']
+    if rule["address"] == "any":
+        raise ValueError("a rule matching all traffic is the default policy; change that instead")
+    return [f"{head} {verdict}"]
+
+
+def firewalld_add_args(rule: Mapping[str, str]) -> List[str]:
+    """firewall-cmd arguments adding a normalized rule.
+
+    A plain "allow this port from anywhere" becomes ``--add-port`` (how
+    firewalld users write it); everything else is a rich rule.
+    """
+    if rule["direction"] == "in" and rule["action"] == "allow" and rule["address"] == "any" and rule["port"]:
+        return [f"--add-port={token.replace(':', '-')}/{rule['protocol']}" for token in rule["port"].split(",")]
+    return [f"--add-rich-rule={line}" for line in rich_rules_for(rule)]
+
+
+def firewalld_remove_args(row: Mapping[str, str]) -> List[str]:
+    source = row.get("source")
+    if source == "service":
+        return [f"--remove-service={row['name']}"]
+    if source == "port":
+        return [f"--remove-port={row['name']}"]
+    if source == "rich" and row.get("raw"):
+        return [f"--remove-rich-rule={row['raw']}"]
+    raise ValueError("this firewalld entry cannot be removed from the panel")
+
+
+def firewalld_default_zone(conf_text: str) -> str:
+    for line in conf_text.splitlines():
+        key, _, value = line.strip().partition("=")
+        if key.strip() == "DefaultZone" and value.strip():
+            return value.strip()
+    return "public"
+
+
+# --------------------------------------------------------------------------
 # Async backend operations
 # --------------------------------------------------------------------------
 
+async def firewalld_running() -> bool:
+    if not shutil.which("firewall-cmd"):
+        return False
+    result = await run(["firewall-cmd", "--state"])
+    return result.ok and result.stdout.strip() == "running"
+
+
 async def detect_backend() -> str:
+    # A running firewalld owns the ruleset; managing ufw or nft next to it
+    # would fight it, so it wins even when the others are installed.
+    if await firewalld_running():
+        return "firewalld"
     if shutil.which("ufw"):
         return "ufw"
     if shutil.which("nft"):
         return "nftables"
-    raise RuntimeError("no supported firewall backend found (install 'ufw' or 'nftables')")
+    if shutil.which("firewall-cmd"):
+        return "firewalld"
+    raise RuntimeError("no supported firewall backend found (install 'ufw', 'nftables' or 'firewalld')")
 
 
 def ssh_port() -> str:
@@ -441,7 +562,20 @@ def ssh_port() -> str:
     return parse_sshd_config(read_text(SSHD_CONFIG)).get("Port", "22")
 
 
+def firewalld_zone_file() -> Path:
+    zone = firewalld_default_zone(read_text(FIREWALLD_DIR / "firewalld.conf"))
+    return FIREWALLD_DIR / "zones" / f"{zone}.xml"
+
+
 def managed_config_files(backend: str) -> List:
+    if backend == "firewalld":
+        # The default zone's file is listed even when it does not exist yet:
+        # the first permanent change creates it, and reverting must remove it
+        # again so the shipped defaults apply.
+        zones = FIREWALLD_DIR / "zones"
+        files = sorted(zones.glob("*.xml")) if zones.is_dir() else []
+        target = firewalld_zone_file()
+        return files if target in files else files + [target]
     if backend == "ufw":
         return [
             UFW_DIR / "user.rules",
@@ -453,9 +587,87 @@ def managed_config_files(backend: str) -> List:
     return [NFTABLES_CONF]
 
 
+async def firewalld_cmd() -> List[str]:
+    """firewall-cmd talks to the daemon; firewall-offline-cmd edits the
+    permanent configuration while it is stopped."""
+    if await firewalld_running():
+        return ["firewall-cmd", "--permanent"]
+    if shutil.which("firewall-offline-cmd"):
+        return ["firewall-offline-cmd"]
+    raise RuntimeError("firewalld is stopped and firewall-offline-cmd is not available")
+
+
+async def firewalld_status() -> Dict[str, object]:
+    running = await firewalld_running()
+    base = await firewalld_cmd()
+    zone_result = await run(base + ["--get-default-zone"])
+    zone = zone_result.stdout.strip() or "public"
+    scoped = base + [f"--zone={zone}"]
+    target, services, ports, rich = await asyncio.gather(
+        run(scoped + ["--get-target"]),
+        run(scoped + ["--list-services"]),
+        run(scoped + ["--list-ports"]),
+        run(scoped + ["--list-rich-rules"]),
+    )
+    service_names = services.stdout.split()
+    service_ports = await asyncio.gather(
+        *(run(base + [f"--service={name}", "--get-ports"]) for name in service_names)
+    )
+    rules: List[Dict[str, object]] = []
+    for name, result in zip(service_names, service_ports):
+        expanded = parse_firewalld_ports(result.stdout, source="service", name=name)
+        if expanded:
+            rules.extend({**rule, "label": f"service {name}"} for rule in expanded)
+        else:  # a service without plain ports (helpers, protocols): show it anyway
+            rules.append({"action": "allow", "direction": "in", "protocol": "any", "port": "",
+                          "address": "any", "source": "service", "name": name, "label": f"service {name}"})
+    rules.extend(parse_firewalld_ports(ports.stdout))
+    rules.extend(parse_rich_rule(line) for line in rich.stdout.splitlines() if line.strip())
+    return {
+        "enabled": running,
+        "default_incoming": FIREWALLD_TARGET_POLICY.get(target.stdout.strip(), "deny"),
+        "default_outgoing": "allow",
+        "zone": zone,
+        "rules": rules,
+        "installed": True,
+    }
+
+
+async def firewalld_apply(args: Sequence[str]) -> List[str]:
+    """Run permanent changes, then reload so they take effect."""
+    base = await firewalld_cmd()
+    ran: List[str] = []
+    for arg in args:
+        argv = base + [arg]
+        result = await run(argv)
+        ran.append(" ".join(argv))
+        if not result.ok and "ALREADY_ENABLED" not in result.stderr and "NOT_ENABLED" not in result.stderr:
+            raise RuntimeError(f"{' '.join(argv)} failed: {(result.stderr or result.stdout).strip()}")
+    if await firewalld_running():
+        await _firewalld_reload()
+        ran.append("firewall-cmd --reload")
+    return ran
+
+
+async def _firewalld_reload() -> None:
+    result = await run(["firewall-cmd", "--reload"])
+    if not result.ok:
+        raise RuntimeError(f"firewall-cmd --reload failed: {(result.stderr or result.stdout).strip()}")
+
+
+async def firewalld_set_running(enabled: bool) -> str:
+    argv = ["systemctl", "enable" if enabled else "disable", "--now", "firewalld"]
+    result = await run(argv)
+    if not result.ok:
+        raise RuntimeError(f"{' '.join(argv)} failed: {(result.stderr or result.stdout).strip()}")
+    return " ".join(argv)
+
+
 async def status() -> Dict[str, object]:
     backend = await detect_backend()
-    if backend == "ufw":
+    if backend == "firewalld":
+        data = await firewalld_status()
+    elif backend == "ufw":
         result = await run(["ufw", "status", "verbose"])
         data = parse_ufw_status(result.stdout)
         data["installed"] = True
@@ -500,8 +712,23 @@ async def nftables_apply(
         await run(["nft", "delete", "table", *NFT_TABLE.split()])
 
 
-async def reapply(backend: str) -> None:
-    """Re-apply the on-disk configuration (used when reverting a change)."""
+async def reapply(backend: str, running: Optional[str] = None) -> None:
+    """Re-apply the on-disk configuration (used when reverting a change).
+
+    For firewalld, *running* ("yes"/"no") restores whether the daemon was
+    running before the change, since enabling or disabling it is a change
+    too.
+    """
+    if backend == "firewalld":
+        if running == "no":
+            if await firewalld_running():
+                await firewalld_set_running(False)
+            return
+        if running == "yes" and not await firewalld_running():
+            await firewalld_set_running(True)
+        if await firewalld_running():
+            await _firewalld_reload()
+        return
     if backend == "ufw":
         result = await run(["ufw", "--force", "reload"])
         if not result.ok:

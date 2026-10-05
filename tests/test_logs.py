@@ -140,4 +140,40 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(func):
             func()
             print(f"ok: {name}")
-    print("all logs tests passed")
+    print("all logs tests passed")
+
+# --- following -----------------------------------------------------------------
+
+def test_journal_command_follows_a_cursor():
+    argv = journal_command(100, after_cursor="s=abc;i=1f;b=0;m=2;t=5;x=9")
+    assert "--after-cursor=s=abc;i=1f;b=0;m=2;t=5;x=9" in argv
+    for bad in ["a b", "x\n-n 1", "$(id)", "a" * 600]:
+        try:
+            journal_command(100, after_cursor=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_split_cursor():
+    lines, cursor = logs_mod.split_cursor("one\ntwo\n-- cursor: s=1;i=2\n")
+    assert lines == ["one", "two"] and cursor == "s=1;i=2"
+    assert logs_mod.split_cursor("no cursor\n") == (["no cursor"], "")
+
+
+def test_file_follow_returns_only_new_complete_lines():
+    with sandbox_log_dir() as log_dir:
+        path = log_dir / "app.log"
+        path.write_text("a\nb\n")
+        first = logs_mod.read_log_file("app.log", 50)
+        assert first["lines"] == ["a", "b"] and first["offset"] == 4
+        with path.open("a") as handle:
+            handle.write("c\npartial")
+        step = logs_mod.read_log_file("app.log", 50, offset=first["offset"])
+        assert step["lines"] == ["c"]  # the partial line waits for its newline
+        with path.open("a") as handle:
+            handle.write(" done\n")
+        step = logs_mod.read_log_file("app.log", 50, offset=step["offset"])
+        assert step["lines"] == ["partial done"]
+        path.write_text("rotated\n")  # smaller than the offset: start over
+        assert logs_mod.read_log_file("app.log", 50, offset=step["offset"])["lines"] == ["rotated"]

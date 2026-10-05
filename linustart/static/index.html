@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LinuStart</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -53,6 +54,40 @@
             <h2>Network Addresses</h2>
             <div id="overview-addresses"></div>
           </div>
+        </div>
+        <div class="card">
+          <div class="toolbar">
+            <h2>Last 24 Hours</h2>
+            <span class="muted" id="metrics-note"></span>
+          </div>
+          <div class="chart-grid" id="metrics-charts"></div>
+          <details>
+            <summary class="muted">Show as table</summary>
+            <div class="table-scroll"><table class="table" id="metrics-table"></table></div>
+          </details>
+        </div>
+        <div class="card">
+          <div class="toolbar">
+            <h2>Resource Alerts</h2>
+            <span id="alerts-status"></span>
+          </div>
+          <p class="muted">Email when a resource stays above its limit, and again when it recovers. Sent through the relay on the Email page.</p>
+          <form id="alerts-form" class="form">
+            <label class="switch-row"><input type="checkbox" id="alert-enabled"> <span>Send alerts</span></label>
+            <div class="form-grid">
+              <label>CPU above (%) <input type="number" id="alert-cpu" min="1" max="100"></label>
+              <label>Memory above (%) <input type="number" id="alert-mem" min="1" max="100"></label>
+              <label>Disk / above (%) <input type="number" id="alert-disk" min="1" max="100"></label>
+              <label>Load above (per CPU) <input type="number" id="alert-load" min="0.1" max="100" step="0.1"></label>
+              <label>For at least (minutes) <input type="number" id="alert-sustain" min="1" max="120"></label>
+              <label>Repeat at most every (minutes) <input type="number" id="alert-cooldown" min="5" max="10080"></label>
+            </div>
+            <label>Recipient <input type="text" id="alert-recipient" autocomplete="off"></label>
+            <div class="form-row">
+              <button class="btn btn-primary" type="submit">Save Alerts</button>
+              <button class="btn" type="button" id="alert-test">Send Test Alert</button>
+            </div>
+          </form>
         </div>
       </section>
 
@@ -236,7 +271,7 @@
           </div>
           <div class="form-row">
             <button class="btn btn-danger hidden" id="mail-remove-conflicts" type="button">Remove Conflicting Mailers</button>
-            <button class="btn hidden" id="mail-install" type="button">Install Postfix</button>
+            <button class="btn hidden" id="mail-install" type="button">Install Mailer</button>
           </div>
         </div>
         <div class="cards">
@@ -244,6 +279,12 @@
             <h2>Mail Delivery (SMTP relay)</h2>
             <p id="mail-msmtp-hint" class="muted hidden"></p>
             <form id="mail-form" class="form">
+              <label>Delivery
+                <select id="mail-transport-select">
+                  <option value="postfix">Postfix (local queue, retries when the relay is down)</option>
+                  <option value="msmtp">msmtp (lightweight, hands mail straight to the relay)</option>
+                </select>
+              </label>
               <label>SMTP server (your mail server)
                 <input type="text" id="mail-host" placeholder="mail.example.com" autocomplete="off">
               </label>
@@ -327,6 +368,18 @@
               <button class="btn btn-primary" type="submit">Create User</button>
             </form>
           </div>
+        </div>
+        <div class="card">
+          <div class="toolbar">
+            <h2>Groups</h2>
+            <label class="switch-row"><input type="checkbox" id="groups-system"> <span>Show system groups</span></label>
+          </div>
+          <table class="table" id="groups-table"></table>
+          <form id="group-create-form" class="form form-inline">
+            <input type="text" id="new-group" placeholder="new group name" autocomplete="off">
+            <label class="switch-row"><input type="checkbox" id="new-group-system"> <span>System group</span></label>
+            <button class="btn btn-primary" type="submit">Create Group</button>
+          </form>
         </div>
       </section>
 
@@ -568,6 +621,7 @@
               <option value="1000">1000 lines</option>
             </select>
             <button class="btn btn-primary" type="submit">Load</button>
+            <label class="switch-row"><input type="checkbox" id="log-follow"> <span>Follow</span></label>
           </form>
           <pre class="log log-tall" id="log-output">Select a source and press Load.</pre>
         </div>
@@ -594,8 +648,8 @@
           <span class="muted" id="term-status">Not connected</span>
         </div>
         <div class="card">
-          <pre class="term" id="term-screen" tabindex="0"></pre>
-          <p class="muted">Click the terminal and start typing. Every session is recorded to <code>/var/lib/linustart/terminal/</code> and noted in the audit log.</p>
+          <div class="term" id="term-screen"></div>
+          <p class="muted">Click the terminal and start typing; paste with your browser's usual shortcut. Idle sessions close automatically. Every session is recorded to <code>/var/lib/linustart/terminal/</code> and noted in the audit log.</p>
         </div>
       </section>
 
@@ -729,6 +783,18 @@
         <button class="btn" data-svc-action="enable">Enable</button>
         <button class="btn" data-svc-action="disable">Disable</button>
       </div>
+      <h2 class="spaced">Override (drop-in)</h2>
+      <p class="muted">Settings here replace or extend the unit file, like <code>systemctl edit</code>;
+        saved to <code id="svc-override-path"></code> and loaded with <code>systemctl daemon-reload</code>.
+        Restart the service for them to take effect. Saving an empty override removes it.</p>
+      <textarea id="svc-override" class="mono" rows="8" spellcheck="false" placeholder="[Service]&#10;Restart=on-failure&#10;Environment=EXAMPLE=1"></textarea>
+      <div class="form-row">
+        <button class="btn btn-primary" id="svc-override-save" type="button">Save Override</button>
+      </div>
+      <details>
+        <summary class="muted">Full unit definition (systemctl cat)</summary>
+        <pre class="log" id="svc-definition"></pre>
+      </details>
       <h2 class="spaced">Recent Journal</h2>
       <pre class="log log-tall" id="service-modal-log"></pre>
     </div>
@@ -805,6 +871,9 @@
   </div>
 
   <div id="toasts"></div>
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/util.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

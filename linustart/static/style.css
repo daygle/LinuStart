@@ -61,7 +61,7 @@ body {
 .sidebar-footer { margin-top: auto; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
 
 /* Content */
-.content { padding: 22px 26px 80px; max-width: 1200px; }
+.content { padding: 22px 26px 80px; max-width: 1200px; min-width: 0; }
 .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 .topbar h1 { font-size: 21px; margin: 0; }
 .section-title { margin: 26px 0 12px; font-size: 16px; }
@@ -103,7 +103,7 @@ body {
 /* Forms */
 .form { display: flex; flex-direction: column; gap: 12px; }
 .form label { display: flex; flex-direction: column; gap: 5px; font-weight: 600; font-size: 13px; }
-.form input[type="text"], .form input[type="password"], .form select, .form textarea, .input-wide {
+.form input[type="text"], .form input[type="password"], .form input[type="number"], .form select, .form textarea, .input-wide {
   padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
   background: #fff; color: var(--text); width: 100%; font-family: inherit;
 }
@@ -183,14 +183,38 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 1
 
 /* Terminal */
 .term {
-  background: #0b1220; color: #d7e0ea; border-radius: 8px; padding: 14px;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px;
-  line-height: 1.45; min-height: 420px; max-height: 60vh; overflow: auto;
-  white-space: pre; margin: 0 0 12px; outline: none; cursor: text; tab-size: 8;
+  background: #0b1220; border-radius: 8px; padding: 8px;
+  height: 60vh; min-height: 320px; margin: 0 0 12px;
+  /* the canvas must follow the container, never size it */
+  min-width: 0; overflow: hidden;
 }
-.term:focus { box-shadow: 0 0 0 2px var(--accent-soft); }
-.term-cursor { background: #d7e0ea; color: #0b1220; animation: term-blink 1.1s steps(1) infinite; }
-@keyframes term-blink { 50% { background: transparent; color: inherit; } }
+.term .xterm { height: 100%; }
+
+textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; width: 100%; }
+
+/* Metric charts (small multiples) */
+.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-bottom: 12px; }
+.chart { position: relative; min-width: 0; }
+.chart h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+.chart svg { display: block; width: 100%; height: 130px; outline: none; }
+.chart svg:focus-visible { box-shadow: 0 0 0 2px var(--accent-soft); border-radius: 6px; }
+.chart .tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.chart .end-label { fill: var(--text); font-size: 11px; font-weight: 600; }
+.chart .ref-label { fill: var(--muted); font-size: 10px; }
+.chart-tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; box-shadow: var(--shadow); font-size: 12px; white-space: nowrap; }
+.chart-tip strong { display: block; color: var(--text); }
+.chart-tip span { color: var(--muted); }
+.table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.table-scroll { max-height: 320px; overflow: auto; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+
+/* Group member chips */
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 4px 1px 8px; margin: 2px 0;
+  border: 1px solid var(--border); border-radius: 999px; }
+.chip-x { border: 0; background: none; cursor: pointer; color: var(--muted); font-size: 15px; line-height: 1; padding: 0 4px; }
+.chip-x:hover { color: var(--danger); }
+.nowrap { white-space: nowrap; }
 
 /* Toasts */
 #toasts { position: fixed; right: 18px; top: 18px; display: flex; flex-direction: column; gap: 10px; z-index: 80; }

@@ -5,20 +5,19 @@ from __future__ import annotations
 import asyncio
 import functools
 import hmac
-import time
-import uuid
-from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from . import audit
+from . import metrics as metrics_mod
 from . import updater as updater_mod
 from .jobs import JobManager
 from .modules import disk as disk_mod
 from .modules import firewall as firewall_mod
+from .modules import groups as groups_mod
 from .modules import hostname as hostname_mod
 from .modules import logs as logs_mod
 from .modules import mail as mail_mod
@@ -35,9 +34,11 @@ from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
 from .modules import users as users_mod
 from .paths import SSHD_CONFIG
+from .ratelimit import AuthThrottle, client_key
+from .sessions import SessionManager
 from .settings import Settings
 from .terminal import TerminalManager
-from .util import now_iso, restore_files, snapshot_files
+from .util import restore_files, snapshot_files
 
 
 # --------------------------------------------------------------------------
@@ -61,6 +62,10 @@ class InterfaceBody(BaseModel):
     address: Optional[str] = None
     gateway: Optional[str] = None
     dns: List[str] = Field(default_factory=list)
+    # None leaves IPv6 exactly as it is
+    ipv6_method: Optional[str] = Field(default=None, pattern="^(none|auto|dhcp|static)$")
+    ipv6_address: Optional[str] = None
+    ipv6_gateway: Optional[str] = None
 
 
 class UpdatesBody(BaseModel):
@@ -91,6 +96,7 @@ class MailBody(BaseModel):
     from_address: str = ""
     report_to: Optional[str] = ""
     report_mode: Optional[str] = Field(default="only-on-error", pattern="^(always|only-on-error|on-change)$")
+    transport: str = Field(default="postfix", pattern="^(postfix|msmtp)$")
 
 
 class MailTestBody(BaseModel):
@@ -122,6 +128,15 @@ class UserUpdateBody(BaseModel):
     locked: Optional[bool] = None
 
 
+class GroupBody(BaseModel):
+    name: str
+    system: bool = False
+
+
+class MemberBody(BaseModel):
+    user: str
+
+
 class KeyBody(BaseModel):
     key: str
 
@@ -149,6 +164,21 @@ class FirewallRuleBody(BaseModel):
     protocol: str = "any"
     port: str = ""
     address: str = "any"
+
+
+class OverrideBody(BaseModel):
+    content: str = ""
+
+
+class AlertsBody(BaseModel):
+    enabled: bool = False
+    cpu: float = 90
+    mem: float = 90
+    disk: float = 90
+    load_per_cpu: float = 2.0
+    sustain_minutes: float = 5
+    cooldown_minutes: float = 360
+    recipient: str = ""
 
 
 class DiskScanBody(BaseModel):
@@ -213,101 +243,6 @@ class UpdateInstallBody(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Network change sessions (apply + auto-revert unless confirmed)
-# --------------------------------------------------------------------------
-
-@dataclass
-class RevertSession:
-    id: str
-    kind: str
-    label: str
-    snapshots: Dict[str, str]
-    reapply: Callable[[], Awaitable[None]]
-    created_at: str = field(default_factory=now_iso)
-    expires_at: float = 0.0
-    confirmed: bool = False
-    done: bool = False
-    task: Optional[asyncio.Task] = None
-
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "id": self.id,
-            "kind": self.kind,
-            "label": self.label,
-            "created_at": self.created_at,
-            "confirmed": self.confirmed,
-            "done": self.done,
-            "seconds_left": max(0, int(self.expires_at - time.monotonic())) if not self.confirmed else 0,
-        }
-
-
-class SessionManager:
-    def __init__(self) -> None:
-        self.sessions: Dict[str, RevertSession] = {}
-
-    def create(
-        self,
-        kind: str,
-        label: str,
-        snapshots: Dict[str, str],
-        timeout: int,
-        reapply: Callable[[], Awaitable[None]],
-    ) -> RevertSession:
-        session = RevertSession(
-            id=uuid.uuid4().hex[:12],
-            kind=kind,
-            label=label,
-            snapshots=snapshots,
-            reapply=reapply,
-            expires_at=time.monotonic() + timeout,
-        )
-        self.sessions[session.id] = session
-        session.task = asyncio.get_running_loop().create_task(self._expire(session, timeout))
-        return session
-
-    async def _expire(self, session: RevertSession, timeout: int) -> None:
-        await asyncio.sleep(timeout)
-        if session.confirmed or session.done:
-            return
-        session.done = True
-        restore_files(session.snapshots)
-        try:
-            await session.reapply()
-            audit.record(
-                f"{session.kind}.revert",
-                f"changes to {session.label} reverted automatically after {timeout}s",
-            )
-        except Exception as exc:  # noqa: BLE001 - log and keep running
-            audit.record(f"{session.kind}.revert", f"revert of {session.label} failed: {exc}", ok=False)
-
-    async def confirm(self, session_id: str) -> RevertSession:
-        session = self._get(session_id)
-        if session.task and not session.task.done():
-            session.task.cancel()
-        session.confirmed = True
-        session.done = True
-        audit.record(f"{session.kind}.confirm", f"changes to {session.label} confirmed")
-        return session
-
-    async def revert(self, session_id: str) -> RevertSession:
-        session = self._get(session_id)
-        if session.task and not session.task.done():
-            session.task.cancel()
-        if not session.done:
-            session.done = True
-            restore_files(session.snapshots)
-            await session.reapply()
-            audit.record(f"{session.kind}.revert", f"changes to {session.label} reverted manually")
-        return session
-
-    def _get(self, session_id: str) -> RevertSession:
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="no such network session")
-        return session
-
-
-# --------------------------------------------------------------------------
 # Router factory
 # --------------------------------------------------------------------------
 
@@ -316,6 +251,7 @@ def build_router(
     jobs: JobManager,
     sessions: SessionManager,
     terminals: TerminalManager,
+    recorder: Optional[metrics_mod.MetricsRecorder] = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -327,12 +263,38 @@ def build_router(
             (candidate or "").encode("utf-8"), str(settings.token).encode("utf-8")
         )
 
-    async def require_auth(authorization: Optional[str] = Header(None)) -> None:
+    throttle = AuthThrottle()
+
+    def locked_out(key: str) -> int:
+        return throttle.retry_after(key)
+
+    def note_failure(key: str) -> None:
+        if throttle.failure(key):
+            audit.record(
+                "auth.lockout",
+                f"{key} locked out for {throttle.lockout // 60} minutes after "
+                f"{throttle.max_failures} wrong tokens",
+                ok=False,
+            )
+
+    async def require_auth(request: Request, authorization: Optional[str] = Header(None)) -> None:
         if not settings.auth_enabled:
             return
+        key = client_key(request.client.host if request.client else None)
+        wait = locked_out(key)
+        if wait:
+            raise HTTPException(
+                status_code=429,
+                detail=f"too many wrong tokens; try again in {wait} seconds",
+                headers={"Retry-After": str(wait)},
+            )
         scheme, _, token = (authorization or "").partition(" ")
-        if scheme != "Bearer" or not token_ok(token):
-            raise HTTPException(status_code=401, detail="invalid or missing token")
+        if scheme == "Bearer" and token_ok(token):
+            throttle.success(key)
+            return
+        if authorization:  # a missing header is not a guess
+            note_failure(key)
+        raise HTTPException(status_code=401, detail="invalid or missing token")
 
     guard = [Depends(require_auth)]
 
@@ -411,7 +373,7 @@ def build_router(
             "backend": backend,
             "config": await network_mod.get_config(backend),
             "runtime": await network_mod.runtime_status(),
-            "sessions": [s.to_dict() for s in sessions.sessions.values() if not s.done],
+            "sessions": [s.to_dict() for s in sessions.pending()],
         }
 
     @router.post("/network/interfaces/{name}", dependencies=guard)
@@ -420,8 +382,9 @@ def build_router(
         files = network_mod.managed_config_files(backend)
         snapshots = snapshot_files(files)
         try:
+            ipv6 = network_mod.validate_ipv6(body.ipv6_method, body.ipv6_address, body.ipv6_gateway)
             await network_mod.write_interface_config(
-                backend, name, body.method, body.address, body.gateway, body.dns
+                backend, name, body.method, body.address, body.gateway, body.dns, ipv6
             )
             commands = await network_mod.apply_backend(backend, name)
         except ValueError as exc:
@@ -440,11 +403,12 @@ def build_router(
             f"{name} ({backend})",
             snapshots,
             timeout=90,
-            reapply=functools.partial(network_mod.apply_backend, backend, name),
+            reapply={"kind": "network", "backend": backend, "name": name},
         )
         audit.record(
             "network.configure",
-            f"{name}: {body.method} {body.address or ''} via {body.gateway or '-'}".strip(),
+            f"{name}: {body.method} {body.address or ''} via {body.gateway or '-'}".strip()
+            + (f"; ipv6 {body.ipv6_method} {body.ipv6_address or ''}".rstrip() if body.ipv6_method else ""),
         )
         return {"ok": True, "session": session.to_dict(), "applied": commands}
 
@@ -519,7 +483,7 @@ def build_router(
     @router.get("/mail", dependencies=guard)
     async def mail_status() -> Dict[str, object]:
         data = await mail_mod.status()
-        data["mailer"] = await mail_mod.mailer_status()
+        data["mailer"] = await mail_mod.mailer_status(str(data.get("transport") or "postfix"))
         data["msmtp"] = await mail_mod.msmtp_status()
         return data
 
@@ -535,13 +499,14 @@ def build_router(
                 password=body.password,
                 report_to=body.report_to or "",
                 report_mode=body.report_mode or "only-on-error",
+                transport=body.transport,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("mail.configure", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
-        audit.record("mail.configure", f"relay {body.host}:{body.port} as {body.from_address}")
+        audit.record("mail.configure", f"{body.transport} relay {body.host}:{body.port} as {body.from_address}")
         return result
 
     @router.post("/mail/test", dependencies=guard)
@@ -554,7 +519,7 @@ def build_router(
         job = await jobs.start(
             "mail.test",
             f"Test email to {recipient}",
-            mail_mod.test_command(from_address, recipient),
+            mail_mod.test_command(from_address, recipient, str(state.get("transport") or "postfix")),
             stdin_text=mail_mod.test_message(recipient, from_address),
         )
         audit.record("mail.test", f"test message to {recipient}")
@@ -567,7 +532,7 @@ def build_router(
         if not conflicts:
             raise HTTPException(status_code=400, detail="no conflicting mail transfer agents found")
         try:
-            argv = mail_mod.remove_conflicting_command(conflicts)
+            argv = mail_mod.remove_conflicting_command(conflicts, str(state.get("transport") or "postfix"))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         job = await jobs.start(
@@ -579,17 +544,19 @@ def build_router(
         return job.to_dict()
 
     @router.post("/mail/install", dependencies=guard)
-    async def mail_install() -> Dict[str, object]:
-        try:
-            await mail_mod.preseed_postfix()
-        except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+    async def mail_install(transport: str = Query("postfix", pattern="^(postfix|msmtp)$")) -> Dict[str, object]:
+        package = mail_mod.TRANSPORT_PACKAGE[transport]
+        if transport == "postfix":
+            try:
+                await mail_mod.preseed_postfix()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=500, detail=str(exc))
         job = await jobs.start(
             "mail.install",
-            "Install postfix (SMTP relay)",
-            packages_mod.install_command(["postfix"]),
+            f"Install {package} (SMTP relay)",
+            packages_mod.install_command([package]),
         )
-        audit.record("mail.install", "postfix install")
+        audit.record("mail.install", f"{package} install")
         return job.to_dict()
 
     # ---- packages --------------------------------------------------------
@@ -784,7 +751,52 @@ def build_router(
         audit.record("user.key.remove", f"removed SSH key {index} for {name}")
         return {"keys": keys}
 
+    # ---- groups ------------------------------------------------------------
+    async def group_action(action: str, detail: str, call) -> Dict[str, object]:
+        try:
+            result = await call
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record(action, f"{detail}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record(action, detail)
+        return result
+
+    @router.get("/groups", dependencies=guard)
+    async def groups_list() -> Dict[str, object]:
+        return await groups_mod.list_groups()
+
+    @router.post("/groups", dependencies=guard)
+    async def groups_create(body: GroupBody) -> Dict[str, object]:
+        return await group_action(
+            "group.create", f"created group {body.name}{' (system)' if body.system else ''}",
+            groups_mod.create_group(body.name, body.system),
+        )
+
+    @router.delete("/groups/{name}", dependencies=guard)
+    async def groups_delete(name: str) -> Dict[str, object]:
+        return await group_action("group.delete", f"deleted group {name}", groups_mod.delete_group(name))
+
+    @router.post("/groups/{name}/members", dependencies=guard)
+    async def groups_add_member(name: str, body: MemberBody) -> Dict[str, object]:
+        return await group_action(
+            "group.member.add", f"added {body.user} to {name}", groups_mod.add_member(name, body.user)
+        )
+
+    @router.delete("/groups/{name}/members/{user}", dependencies=guard)
+    async def groups_remove_member(name: str, user: str) -> Dict[str, object]:
+        return await group_action(
+            "group.member.remove", f"removed {user} from {name}", groups_mod.remove_member(name, user)
+        )
+
     # ---- generic confirm-or-revert sessions ------------------------------
+    @router.get("/sessions", dependencies=guard)
+    async def sessions_pending() -> Dict[str, object]:
+        # Lets a freshly loaded page (or one reloaded after a panel restart)
+        # find a change that is still waiting to be confirmed.
+        return {"sessions": [s.to_dict() for s in sessions.pending()]}
+
     @router.post("/sessions/{session_id}/confirm", dependencies=guard)
     async def sessions_confirm(session_id: str) -> Dict[str, object]:
         return (await sessions.confirm(session_id)).to_dict()
@@ -833,7 +845,7 @@ def build_router(
             audit.record("ssh.configure", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(
-            "ssh", "sshd settings", snapshots, timeout=90, reapply=sshd_mod.reload_service
+            "ssh", "sshd settings", snapshots, timeout=90, reapply={"kind": "ssh"}
         )
         audit.record("ssh.configure", ", ".join(f"{key}={value}" for key, value in values.items()))
         return {"ok": True, "session": session.to_dict(), "applied": values}
@@ -848,13 +860,22 @@ def build_router(
             "address": "any",
         }
 
-    def session_kwargs(backend: str) -> Dict[str, object]:
+    def session_kwargs(backend: str, was_running: Optional[bool] = None) -> Dict[str, object]:
+        reapply: Dict[str, Optional[str]] = {"kind": "firewall", "backend": backend}
+        if was_running is not None:
+            # firewalld: reverting also restores whether the daemon ran
+            reapply["running"] = "yes" if was_running else "no"
         return {
             "kind": "firewall",
             "label": f"firewall ({backend})",
             "timeout": 90,
-            "reapply": functools.partial(firewall_mod.reapply, backend),
+            "reapply": reapply,
         }
+
+    def revert_firewall(backend: str, was_running: Optional[bool] = None):
+        return functools.partial(
+            firewall_mod.reapply, backend, None if was_running is None else ("yes" if was_running else "no")
+        )
 
     @router.get("/firewall", dependencies=guard)
     async def firewall_status() -> Dict[str, object]:
@@ -870,8 +891,30 @@ def build_router(
         snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
         ssh_added = False
         applied: List[str] = []
+        was_running = bool(state["enabled"]) if backend == "firewalld" else None
         try:
-            if backend == "ufw":
+            if backend == "firewalld":
+                if body.default_outgoing and default_outgoing != "allow":
+                    raise ValueError("firewalld zones do not filter outgoing traffic; it stays allowed")
+                args: List[str] = []
+                if body.default_incoming:
+                    args.append(f"--set-target={firewall_mod.FIREWALLD_POLICY_TARGET[default_incoming]}")
+                if enabled and default_incoming == "deny" and not any(
+                    firewall_mod.rule_covers_port(rule, str(state["ssh_port"])) for rule in state["rules"]
+                ):
+                    args += firewall_mod.firewalld_add_args(ssh_allow_rule())
+                    ssh_added = True
+                if body.enabled is not None and bool(body.enabled) != bool(state["enabled"]):
+                    if body.enabled:
+                        # start it first, so the permanent changes are reloaded into it
+                        applied.append(await firewall_mod.firewalld_set_running(True))
+                        applied += await firewall_mod.firewalld_apply(args)
+                    else:
+                        applied += await firewall_mod.firewalld_apply(args)
+                        applied.append(await firewall_mod.firewalld_set_running(False))
+                else:
+                    applied += await firewall_mod.firewalld_apply(args)
+            elif backend == "ufw":
                 commands: List[List[str]] = []
                 if body.default_incoming:
                     commands.append(["ufw", "default", default_incoming, "incoming"])
@@ -906,9 +949,9 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("firewall.configure", str(exc), ok=False)
-            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
+            await restore_and_reapply(snapshots, revert_firewall(backend, was_running), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
-        session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
+        session = sessions.create(snapshots=snapshots, **session_kwargs(backend, was_running))  # type: ignore[arg-type]
         audit.record(
             "firewall.configure",
             f"enabled={enabled} default_incoming={default_incoming} default_outgoing={default_outgoing}",
@@ -936,11 +979,13 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         backend = await firewall_mod.detect_backend()
         state = await firewall_mod.status()
-        if backend != "ufw" and not bool(state["enabled"]):
+        if backend == "nftables" and not bool(state["enabled"]):
             raise HTTPException(status_code=400, detail="enable the firewall before editing rules")
         snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
         try:
-            if backend == "ufw":
+            if backend == "firewalld":
+                applied = await firewall_mod.firewalld_apply(firewall_mod.firewalld_add_args(rule))
+            elif backend == "ufw":
                 argv = firewall_mod.ufw_add_argv(rule)
                 await firewall_mod.ufw_apply(argv)
                 applied = [" ".join(argv)]
@@ -957,7 +1002,7 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("firewall.rule.add", str(exc), ok=False)
-            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
+            await restore_and_reapply(snapshots, revert_firewall(backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
         audit.record("firewall.rule.add", firewall_mod.rule_label(rule))
@@ -973,7 +1018,9 @@ def build_router(
         removed = rules.pop(index)
         snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
         try:
-            if backend == "ufw":
+            if backend == "firewalld":
+                applied = await firewall_mod.firewalld_apply(firewall_mod.firewalld_remove_args(removed))
+            elif backend == "ufw":
                 argv = firewall_mod.ufw_delete_argv(removed)
                 await firewall_mod.ufw_apply(argv)
                 applied = [" ".join(argv)]
@@ -990,10 +1037,17 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("firewall.rule.remove", str(exc), ok=False)
-            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
+            await restore_and_reapply(snapshots, revert_firewall(backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
-        label = firewall_mod.rule_label(removed) if "action" in removed else str(removed.get("to", index))
+        if removed.get("source") in ("service", "port"):
+            label = f"{removed['source']} {removed.get('name', '')}"
+        elif removed.get("raw"):
+            label = str(removed["raw"])
+        elif "action" in removed and "protocol" in removed:
+            label = firewall_mod.rule_label(removed)
+        else:
+            label = str(removed.get("to", index))
         audit.record("firewall.rule.remove", label)
         return {"ok": True, "session": session.to_dict(), "applied": applied}
 
@@ -1010,6 +1064,26 @@ def build_router(
             raise HTTPException(status_code=404, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/services/{unit}/override", dependencies=guard)
+    async def services_override(unit: str) -> Dict[str, object]:
+        try:
+            return await services_mod.get_override(unit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.put("/services/{unit}/override", dependencies=guard)
+    async def services_set_override(unit: str, body: OverrideBody) -> Dict[str, object]:
+        try:
+            result = await services_mod.set_override(unit, body.content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("services.override", f"{unit}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        action = "updated" if body.content.strip() else "removed"
+        audit.record("services.override", f"{action} override for {result['unit']}")
+        return result
 
     @router.post("/services/{unit}/action/{action}", dependencies=guard)
     async def services_action(unit: str, action: str) -> Dict[str, object]:
@@ -1052,9 +1126,10 @@ def build_router(
         lines: int = Query(200, ge=10, le=2000),
         unit: str = Query(""),
         priority: str = Query(""),
+        after_cursor: str = Query(""),
     ) -> Dict[str, object]:
         try:
-            return await logs_mod.journal(lines, unit, priority)
+            return await logs_mod.journal(lines, unit, priority, after_cursor)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1063,9 +1138,13 @@ def build_router(
         return logs_mod.list_log_files()
 
     @router.get("/logs/files/{name}", dependencies=guard)
-    async def logs_file(name: str, lines: int = Query(200, ge=10, le=2000)) -> Dict[str, object]:
+    async def logs_file(
+        name: str,
+        lines: int = Query(200, ge=10, le=2000),
+        offset: Optional[int] = Query(None, ge=0),
+    ) -> Dict[str, object]:
         try:
-            return logs_mod.read_log_file(name, lines)
+            return logs_mod.read_log_file(name, lines, offset)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
@@ -1303,6 +1382,10 @@ def build_router(
             return
         await websocket.accept()
         if settings.auth_enabled:
+            key = client_key(websocket.client.host if websocket.client else None)
+            if locked_out(key):
+                await websocket.close(code=4429)
+                return
             # The token arrives as the first message rather than in the URL:
             # query strings end up in access logs and browser history.
             try:
@@ -1312,8 +1395,11 @@ def build_router(
             if not isinstance(hello, dict) or hello.get("type") != "auth" or not token_ok(
                 str(hello.get("token", ""))
             ):
+                if isinstance(hello, dict) and hello.get("token"):
+                    note_failure(key)
                 await websocket.close(code=4401)
                 return
+            throttle.success(key)
         try:
             session = await terminals.create(user or None, cols, rows)
         except (ValueError, RuntimeError) as exc:
@@ -1334,9 +1420,22 @@ def build_router(
                 pass  # the browser went away; the receive loop cleans up
 
         pump_task = asyncio.create_task(pump())
+        idle_limit = settings.terminal_idle_minutes * 60 or None
+        close_reason = "closed by panel"
         try:
             while True:
-                message = await websocket.receive_json()
+                try:
+                    message = await asyncio.wait_for(websocket.receive_json(), timeout=idle_limit)
+                except asyncio.TimeoutError:
+                    # An abandoned browser tab must not keep a root shell open.
+                    close_reason = "idle timeout"
+                    pump_task.cancel()
+                    try:
+                        await websocket.send_json({"type": "closed", "detail": "idle timeout"})
+                        await websocket.close()
+                    except (RuntimeError, OSError):
+                        pass
+                    break
                 if not isinstance(message, dict):
                     continue
                 kind = message.get("type")
@@ -1350,11 +1449,19 @@ def build_router(
             pass
         finally:
             pump_task.cancel()
-            closed = await terminals.close(session.id)
-            audit.record(
-                "terminal.close",
-                f"session {session.id} closed (user {closed['user']}, log {closed['log']})",
-            )
+
+            async def finish() -> None:
+                closed = await terminals.close(session.id, close_reason)
+                audit.record(
+                    "terminal.close",
+                    f"session {session.id} closed ({close_reason}; user {closed['user']}, log {closed['log']})",
+                )
+
+            # Shielded: when the handler itself is cancelled (the client went
+            # away mid-await), the shell must still be hung up and the close
+            # still audited - a cancelled cleanup would leave a root shell
+            # running with no record of it ending.
+            await asyncio.shield(asyncio.ensure_future(finish()))
 
     # ---- self-update ------------------------------------------------------
     @router.get("/update/check", dependencies=guard)
@@ -1398,6 +1505,8 @@ def build_router(
             "newer_available": updater_mod.is_newer(release["tag"], str(details["base"])),
             "no_releases": False,
             "release_url": release["url"],
+            "checksum_published": updater_mod.choose_download(release)[2] is not None,
+            "require_checksum": settings.update_require_checksum,
             "published_at": release["published_at"],
             "notes": release["body"],
             "repo": settings.update_repo,
@@ -1408,7 +1517,9 @@ def build_router(
     @router.post("/update/install", dependencies=guard)
     async def update_install(body: UpdateInstallBody) -> Dict[str, object]:
         try:
-            argv = updater_mod.apply_command(settings.update_repo, body.tag)
+            argv = updater_mod.apply_command(
+                settings.update_repo, body.tag, settings.update_require_checksum
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if not updater_mod.is_managed_install():
@@ -1437,6 +1548,41 @@ def build_router(
         )
         audit.record("update.rollback", "rollback to the most recent application backup")
         return job.to_dict()
+
+    # ---- metrics and alerts ----------------------------------------------
+    def alerts_view(config: Dict[str, object]) -> Dict[str, object]:
+        active = [k for k, on in recorder.active.items() if on] if recorder else []
+        return {"config": config, "active": active,
+                "thresholds": recorder.thresholds(config) if recorder else {}}
+
+    @router.get("/metrics", dependencies=guard)
+    async def metrics_history() -> Dict[str, object]:
+        return {
+            "samples": list(recorder.samples) if recorder else [],
+            "interval": recorder.interval if recorder else metrics_mod.INTERVAL,
+            "cpus": recorder.cpus if recorder else 1,
+            "alerts": alerts_view(metrics_mod.load_alert_config()),
+            "recipient": await metrics_mod.alert_recipient(metrics_mod.load_alert_config()),
+        }
+
+    @router.post("/metrics/alerts", dependencies=guard)
+    async def metrics_alerts(body: AlertsBody) -> Dict[str, object]:
+        try:
+            config = metrics_mod.save_alert_config(body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        audit.record("alerts.configure", "resource alerts " + ("enabled" if config["enabled"] else "disabled"))
+        return alerts_view(config)
+
+    @router.post("/metrics/alerts/test", dependencies=guard)
+    async def metrics_alerts_test() -> Dict[str, object]:
+        sent = await metrics_mod.send_alert({"kind": "test", "metric": "test"})
+        if not sent:
+            raise HTTPException(
+                status_code=400,
+                detail="the test alert could not be sent - set a recipient and check the Email page",
+            )
+        return {"ok": True}
 
     # ---- audit -----------------------------------------------------------
     @router.get("/audit", dependencies=guard)

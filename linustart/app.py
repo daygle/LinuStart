@@ -12,7 +12,9 @@ from fastapi.staticfiles import StaticFiles
 
 from . import audit
 from .jobs import JobManager
-from .routes import SessionManager, build_router
+from .metrics import MetricsRecorder, send_alert
+from .routes import build_router
+from .sessions import SessionManager
 from .settings import Settings
 from .terminal import TerminalManager
 from .updater import running_version, version_details
@@ -26,7 +28,13 @@ def create_app(settings: Settings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         audit.record("app.start", f"LinuStart {version} started")
-        yield
+        # Changes left unconfirmed when the panel last stopped still revert.
+        sessions.resume()
+        recorder.start(send_alert)
+        try:
+            yield
+        finally:
+            await recorder.stop()
 
     app = FastAPI(
         title="LinuStart",
@@ -38,11 +46,13 @@ def create_app(settings: Settings) -> FastAPI:
     jobs = JobManager()
     sessions = SessionManager()
     terminals = TerminalManager()
+    recorder = MetricsRecorder()
 
     app.state.settings = settings
     app.state.jobs = jobs
     app.state.sessions = sessions
     app.state.terminals = terminals
+    app.state.recorder = recorder
 
     @app.exception_handler(ValueError)
     async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
@@ -64,7 +74,7 @@ def create_app(settings: Settings) -> FastAPI:
             "commit": details["commit"],
         }
 
-    app.include_router(build_router(settings, jobs, sessions, terminals), prefix="/api")
+    app.include_router(build_router(settings, jobs, sessions, terminals, recorder), prefix="/api")
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
