@@ -16,6 +16,7 @@ from . import updater as updater_mod
 from .jobs import JobManager
 from .modules import disk as disk_mod
 from .modules import firewall as firewall_mod
+from .modules import groups as groups_mod
 from .modules import hostname as hostname_mod
 from .modules import logs as logs_mod
 from .modules import mail as mail_mod
@@ -123,6 +124,15 @@ class UserUpdateBody(BaseModel):
     shell: Optional[str] = None
     sudo: Optional[bool] = None
     locked: Optional[bool] = None
+
+
+class GroupBody(BaseModel):
+    name: str
+    system: bool = False
+
+
+class MemberBody(BaseModel):
+    user: str
 
 
 class KeyBody(BaseModel):
@@ -719,6 +729,45 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         audit.record("user.key.remove", f"removed SSH key {index} for {name}")
         return {"keys": keys}
+
+    # ---- groups ------------------------------------------------------------
+    async def group_action(action: str, detail: str, call) -> Dict[str, object]:
+        try:
+            result = await call
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record(action, f"{detail}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record(action, detail)
+        return result
+
+    @router.get("/groups", dependencies=guard)
+    async def groups_list() -> Dict[str, object]:
+        return await groups_mod.list_groups()
+
+    @router.post("/groups", dependencies=guard)
+    async def groups_create(body: GroupBody) -> Dict[str, object]:
+        return await group_action(
+            "group.create", f"created group {body.name}{' (system)' if body.system else ''}",
+            groups_mod.create_group(body.name, body.system),
+        )
+
+    @router.delete("/groups/{name}", dependencies=guard)
+    async def groups_delete(name: str) -> Dict[str, object]:
+        return await group_action("group.delete", f"deleted group {name}", groups_mod.delete_group(name))
+
+    @router.post("/groups/{name}/members", dependencies=guard)
+    async def groups_add_member(name: str, body: MemberBody) -> Dict[str, object]:
+        return await group_action(
+            "group.member.add", f"added {body.user} to {name}", groups_mod.add_member(name, body.user)
+        )
+
+    @router.delete("/groups/{name}/members/{user}", dependencies=guard)
+    async def groups_remove_member(name: str, user: str) -> Dict[str, object]:
+        return await group_action(
+            "group.member.remove", f"removed {user} from {name}", groups_mod.remove_member(name, user)
+        )
 
     # ---- generic confirm-or-revert sessions ------------------------------
     @router.get("/sessions", dependencies=guard)

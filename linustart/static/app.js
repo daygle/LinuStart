@@ -945,11 +945,80 @@ async function loadUsers() {
   $("#users-table").innerHTML = `
     <thead><tr><th>User</th><th>Full name</th><th>Shell</th><th>Status</th><th></th></tr></thead>
     <tbody>${rows || "<tr><td colspan='5' class='muted'>No user accounts found</td></tr>"}</tbody>`;
+  loadGroups();
 }
 
 $("#users-table").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-user]");
   if (button) openUser(button.dataset.user);
+});
+
+/* ----------------------------------------------------------------- groups */
+
+function renderGroups(data) {
+  state.groupsData = data;
+  const showSystem = $("#groups-system").checked;
+  const users = data.users || [];
+  const rows = (data.groups || []).filter((g) => showSystem || !g.system).map((g) => {
+    const members = (g.members || []).map((m) =>
+      `<span class="chip"><code>${esc(m)}</code><button class="chip-x" title="Remove ${esc(m)}"
+        data-group="${esc(g.name)}" data-remove-member="${esc(m)}">&times;</button></span>`).join(" ");
+    const primary = (g.primary_of || []).length
+      ? `<div class="muted">primary group of ${g.primary_of.map(esc).join(", ")}</div>` : "";
+    const candidates = users.filter((u) => !(g.members || []).includes(u));
+    return `<tr>
+      <td><code>${esc(g.name)}</code>${g.system ? ' <span class="badge muted">system</span>' : ""}</td>
+      <td>${esc(g.gid)}</td>
+      <td>${members || '<span class="muted">no supplementary members</span>'}${primary}</td>
+      <td class="nowrap">
+        <select data-add-select="${esc(g.name)}">${candidates.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join("")}</select>
+        <button class="btn btn-small" data-add-member="${esc(g.name)}" ${candidates.length ? "" : "disabled"}>Add</button>
+        ${g.deletable ? `<button class="btn btn-small btn-danger" data-delete-group="${esc(g.name)}">Delete</button>` : ""}
+      </td>
+    </tr>`;
+  }).join("");
+  $("#groups-table").innerHTML = `
+    <thead><tr><th>Group</th><th>GID</th><th>Members</th><th></th></tr></thead>
+    <tbody>${rows || "<tr><td colspan='4' class='muted'>No groups to show</td></tr>"}</tbody>`;
+}
+
+async function loadGroups() {
+  try { renderGroups(await api("/groups")); } catch (err) { toast(err.message, "error"); }
+}
+
+$("#groups-system").addEventListener("change", () => { if (state.groupsData) renderGroups(state.groupsData); });
+
+$("#groups-table").addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  try {
+    if (target.dataset.removeMember) {
+      const { group, removeMember } = target.dataset;
+      if (!window.confirm(`Remove ${removeMember} from ${group}?`)) return;
+      renderGroups(await api(`/groups/${encodeURIComponent(group)}/members/${encodeURIComponent(removeMember)}`, { method: "DELETE" }));
+      toast(`${removeMember} removed from ${group}`, "success");
+    } else if (target.dataset.addMember) {
+      const group = target.dataset.addMember;
+      const user = $(`select[data-add-select="${CSS.escape(group)}"]`).value;
+      renderGroups(await api(`/groups/${encodeURIComponent(group)}/members`, { method: "POST", body: { user } }));
+      toast(`${user} added to ${group}`, "success");
+    } else if (target.dataset.deleteGroup) {
+      const group = target.dataset.deleteGroup;
+      if (!window.confirm(`Delete group ${group}?`)) return;
+      renderGroups(await api(`/groups/${encodeURIComponent(group)}`, { method: "DELETE" }));
+      toast(`Group ${group} deleted`, "success");
+    }
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#group-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = $("#new-group").value.trim();
+  try {
+    renderGroups(await api("/groups", { method: "POST", body: { name, system: $("#new-group-system").checked } }));
+    $("#new-group").value = "";
+    toast(`Group ${name} created`, "success");
+  } catch (err) { toast(err.message, "error"); }
 });
 
 async function openUser(name) {
