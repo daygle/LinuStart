@@ -242,10 +242,18 @@ async function loadNetwork() {
          so a leftover DHCP block here still runs alongside the settings below - saving this
          interface collapses them into one.</p>`
       : "";
+    const dhcpElsewhere = (iface.dhcp_sources || []).length
+      ? `<p class="muted"><span class="badge warn">DHCP elsewhere</span> netplan merges every
+         file in /etc/netplan, so DHCP set in
+         ${iface.dhcp_sources.map((s) => `<code>${esc(String(s).split("/").pop())}</code>`).join(", ")}
+         still applies to this interface. Saving this interface switches DHCP off in every
+         file that has it.</p>`
+      : "";
     return `
     <div class="card">
       <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span></h2>
       ${duplicated}
+      ${dhcpElsewhere}
       <form class="form" data-iface="${esc(iface.name)}">
         <label>Mode
           <select name="method">

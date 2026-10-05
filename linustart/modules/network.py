@@ -9,7 +9,8 @@ from __future__ import annotations
 import copy
 import ipaddress
 import re
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from ..paths import INTERFACES_FILE, INTERFACES_D_DIR, NETPLAN_DIR
 from ..util import read_text, run, write_text
@@ -280,6 +281,94 @@ def read_netplan_interfaces(data: Dict[str, object]) -> List[Dict[str, object]]:
     return result
 
 
+NETPLAN_DHCP_KEYS = ("dhcp4", "dhcp6")
+
+
+def netplan_ethernets(data: Mapping[str, object]) -> Dict[str, object]:
+    """The 'network.ethernets' mapping of a netplan document ('' if absent)."""
+    network = data.get("network") if isinstance(data, Mapping) else None
+    ethernets = network.get("ethernets") if isinstance(network, Mapping) else None
+    return ethernets if isinstance(ethernets, dict) else {}
+
+
+def netplan_dhcp_sources(
+    documents: Mapping[str, Mapping[str, object]], name: str
+) -> List[str]:
+    """Every document that enables DHCP on *name*.
+
+    netplan merges all the files in /etc/netplan, so a `dhcp4: true` in one
+    file still applies after a static address is written into another one.
+    That is how an interface ends up requesting a lease and holding a static
+    address at the same time, and it is invisible in the file being edited.
+    """
+    sources: List[str] = []
+    for source in sorted(documents):
+        node = netplan_ethernets(documents[source]).get(name)
+        if isinstance(node, dict) and any(node.get(key) for key in NETPLAN_DHCP_KEYS):
+            sources.append(source)
+    return sources
+
+
+def clear_netplan_dhcp(
+    data: Mapping[str, object], name: str
+) -> Tuple[Dict[str, object], bool]:
+    """A copy of *data* with DHCP switched off for *name*, plus whether it changed.
+
+    Only the DHCP keys are touched: another file's addresses, routes and
+    nameservers belong to whoever wrote them and must survive.
+    """
+    node = netplan_ethernets(data).get(name)
+    if not isinstance(node, dict) or not any(key in node for key in NETPLAN_DHCP_KEYS):
+        return dict(data), False
+    updated = copy.deepcopy(dict(data))
+    ethernets = updated.setdefault("network", {}).setdefault("ethernets", {})  # type: ignore[union-attr]
+    ethernets[name] = {**node, **{key: False for key in NETPLAN_DHCP_KEYS if key in node}}
+    return updated, True
+
+
+def apply_netplan_across(
+    documents: Mapping[str, Dict[str, object]],
+    target: str,
+    name: str,
+    method: str,
+    address: Optional[str] = None,
+    gateway: Optional[str] = None,
+    dns: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, Dict[str, object]], List[str]]:
+    """Set *name* to *method* in *target* and clear DHCP from every other file.
+
+    Returns the updated documents and the sources that actually changed, so
+    only those are rewritten - a netplan directory is full of files the panel
+    has no business touching.
+    """
+    if target not in documents:
+        raise ValueError(f"target document was not loaded: {target!r}")
+    updated: Dict[str, Dict[str, object]] = {
+        source: copy.deepcopy(data) for source, data in documents.items()
+    }
+    updated[target] = update_netplan_interface(
+        updated[target], name, method, address, gateway, dns
+    )
+    changed = [target]
+    if method == "dhcp":
+        # The user asked for DHCP: leave every other file's DHCP exactly as it
+        # is. Clearing it here would turn DHCP off in the file that had it on
+        # while switching it on in the one we are writing.
+        return updated, changed
+    # DHCP has to be off in every file, not just this one. The target is
+    # cleared here too because update_netplan_interface only ever touches
+    # dhcp4 - a file configured with dhcp6 would otherwise keep its lease.
+    cleared, _rewritten = clear_netplan_dhcp(updated[target], name)
+    updated[target] = cleared
+    for source in netplan_dhcp_sources(updated, name):
+        if source == target:
+            continue
+        updated[source], rewritten = clear_netplan_dhcp(updated[source], name)
+        if rewritten:
+            changed.append(source)
+    return updated, changed
+
+
 def update_netplan_interface(
     data: Dict[str, object],
     name: str,
@@ -342,7 +431,7 @@ async def detect_backend() -> str:
     return "ifupdown"
 
 
-def _netplan_files() -> List:
+def _netplan_files() -> List[Path]:
     return sorted(NETPLAN_DIR.glob("*.yaml")) if NETPLAN_DIR.is_dir() else []
 
 
@@ -374,10 +463,16 @@ async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
         if yaml is None:
             raise RuntimeError("netplan support requires the PyYAML package")
         interfaces: List[Dict[str, object]] = []
-        for path in _netplan_files():
-            data = yaml.safe_load(read_text(path)) or {}
+        documents = {str(path): (yaml.safe_load(read_text(path)) or {}) for path in _netplan_files()}
+        for source, data in documents.items():
             for info in read_netplan_interfaces(data):
-                info["source"] = str(path)
+                info["source"] = source
+                # DHCP set anywhere else merges into this one on apply.
+                info["dhcp_sources"] = [
+                    other
+                    for other in netplan_dhcp_sources(documents, str(info["name"]))
+                    if other != source
+                ]
                 interfaces.append(info)
         return {"backend": backend, "interfaces": interfaces}
     if backend == "NetworkManager":
@@ -428,21 +523,25 @@ async def write_interface_config(
     if backend == "netplan":
         if yaml is None:
             raise RuntimeError("netplan support requires the PyYAML package")
-        target = None
-        for path in _netplan_files():
-            data = yaml.safe_load(read_text(path)) or {}
-            ethernets = (data.get("network") or {}).get("ethernets") or {}
-            if name in ethernets:
-                target = path
-                break
-        if target is None:
-            files = _netplan_files()
-            if not files:
-                raise RuntimeError("no netplan YAML files found in /etc/netplan")
-            target = files[0]
-        data = yaml.safe_load(read_text(target)) or {}
-        data = update_netplan_interface(data, name, method, address, gateway, dns)
-        write_text(target, yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+        files = _netplan_files()
+        if not files:
+            raise RuntimeError("no netplan YAML files found in /etc/netplan")
+        documents = {str(path): (yaml.safe_load(read_text(path)) or {}) for path in files}
+        target = next(
+            (source for source in documents if name in netplan_ethernets(documents[source])),
+            str(files[0]),
+        )
+        # netplan merges every file in this directory, so writing the address
+        # into one of them is not enough: a 'dhcp4: true' in another file
+        # still applies, and the interface comes up with both.
+        updated, changed = apply_netplan_across(
+            documents, target, name, method, address, gateway, dns
+        )
+        for source in changed:
+            write_text(
+                Path(source),
+                yaml.safe_dump(updated[source], sort_keys=False, default_flow_style=False),
+            )
         return
     if backend == "NetworkManager":
         config = await get_config(backend)
