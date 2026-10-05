@@ -26,7 +26,7 @@ linustart = "linustart.__main__:main"
 include = ["linustart*"]
 
 [tool.setuptools.package-data]
-linustart = ["static/*"]
+linustart = ["static/*", "static/vendor/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -502,3 +502,32 @@ def test_requests_without_a_token_are_not_counted(client):
     for _ in range(30):
         assert client.get("/api/audit").status_code == 401
     assert client.get("/api/audit", headers={"Authorization": "Bearer s3cret-token"}).status_code == 200
+
+
+def test_terminal_closes_idle_sessions(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from linustart import audit, sessions as sessions_mod, terminal
+    from linustart.app import create_app
+    from linustart.settings import Settings
+
+    monkeypatch.setattr(audit, "AUDIT_LOG", tmp_path / "audit.log")
+    monkeypatch.setattr(sessions_mod, "PENDING_REVERTS_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(terminal, "TERMINAL_LOG_DIR", tmp_path / "term")
+    app = create_app(Settings(token=None, terminal_idle_minutes=0.02))  # ~1.2 s
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/api/terminal/ws") as ws:
+            kinds = []
+            while True:
+                message = ws.receive_json()
+                kinds.append(message)
+                if message["type"] == "closed":
+                    break
+        # the shell is hung up after the message; the audit entry follows it
+        import time
+
+        deadline = time.time() + 10
+        while "idle timeout" not in (tmp_path / "audit.log").read_text() and time.time() < deadline:
+            time.sleep(0.1)
+    assert kinds[-1] == {"type": "closed", "detail": "idle timeout"}
+    assert "idle timeout" in (tmp_path / "audit.log").read_text()

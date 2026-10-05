@@ -1772,136 +1772,85 @@ $("#proc-table").addEventListener("click", async (event) => {
 
 /* ---------------------------------------------------------------- terminal */
 
-const term = { ws: null, cols: 100, rows: 30, lines: [""], cx: 0, cy: 0 };
+// xterm.js (vendored under /static/vendor) renders the shell: full-screen
+// programs, colours, selection and paste all work, and the fit add-on keeps
+// the PTY's size in step with the browser window.
+const term = { ws: null, xterm: null, fit: null, resizeTimer: null };
 
-function termReset() {
-  term.lines = [""];
-  term.cx = 0;
-  term.cy = 0;
+function termSend(message) {
+  if (term.ws && term.ws.readyState === WebSocket.OPEN) term.ws.send(JSON.stringify(message));
 }
 
-function termEnsureRow(row) {
-  while (term.lines.length <= row) term.lines.push("");
-}
-
-function termRender() {
-  const html = term.lines.map((line, index) => {
-    if (index === term.cy) {
-      return esc(line.slice(0, term.cx)) +
-        `<span class="term-cursor">${esc(line.charAt(term.cx) || " ")}</span>` +
-        esc(line.slice(term.cx + 1));
-    }
-    return esc(line);
-  }).join("\n");
-  const screen = $("#term-screen");
-  screen.innerHTML = html;
-  screen.scrollTop = screen.scrollHeight;
-}
-
-function termPutChar(ch) {
-  termEnsureRow(term.cy);
-  const line = term.lines[term.cy];
-  term.lines[term.cy] = term.cx < line.length
-    ? line.slice(0, term.cx) + ch + line.slice(term.cx + 1)
-    : line + " ".repeat(term.cx - line.length) + ch;
-  term.cx += 1;
-}
-
-function termCsi(args, cmd) {
-  const nums = (args || "").split(";").map((n) => parseInt(n, 10) || 0);
-  const n = nums[0] || 0;
-  const m = nums[1] || 0;
-  switch (cmd) {
-    case "H": case "f":
-      term.cy = Math.max(0, (n || 1) - 1);
-      term.cx = Math.max(0, (m || 1) - 1);
-      termEnsureRow(term.cy);
-      break;
-    case "A": term.cy = Math.max(0, term.cy - Math.max(1, n)); break;
-    case "B": term.cy += Math.max(1, n); termEnsureRow(term.cy); break;
-    case "C": term.cx += Math.max(1, n); break;
-    case "D": term.cx = Math.max(0, term.cx - Math.max(1, n)); break;
-    case "J":
-      if (n === 2 || n === 3) {
-        termReset();
-      } else if (n === 0) {
-        term.lines = term.lines.slice(0, term.cy + 1);
-        term.lines[term.cy] = (term.lines[term.cy] || "").slice(0, term.cx);
-      } else {
-        termEnsureRow(term.cy);
-        for (let row = 0; row < term.cy; row += 1) term.lines[row] = "";
-        term.lines[term.cy] = term.lines[term.cy].slice(term.cx);
-        term.cx = 0;
-      }
-      break;
-    case "K":
-      termEnsureRow(term.cy);
-      if (n === 0) term.lines[term.cy] = term.lines[term.cy].slice(0, term.cx);
-      else if (n === 1) term.lines[term.cy] = " ".repeat(term.cx) + term.lines[term.cy].slice(term.cx);
-      else term.lines[term.cy] = "";
-      break;
-    default:
-      break; /* colors and rare sequences are intentionally dropped */
+function termEnsure() {
+  if (term.xterm) return term.xterm;
+  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+    toast("The terminal library failed to load", "error");
+    return null;
   }
+  const xterm = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    fontSize: 13,
+    scrollback: 5000,
+    theme: { background: "#0b1220", foreground: "#d7e0ea" },
+  });
+  const fit = new FitAddon.FitAddon();
+  xterm.loadAddon(fit);
+  xterm.open($("#term-screen"));
+  // onData carries typing and pasted text alike.
+  xterm.onData((data) => termSend({ type: "input", data }));
+  xterm.onResize(({ cols, rows }) => termSend({ type: "resize", cols, rows }));
+  window.addEventListener("resize", () => {
+    clearTimeout(term.resizeTimer);
+    term.resizeTimer = setTimeout(termFit, 150);
+  });
+  term.xterm = xterm;
+  term.fit = fit;
+  return xterm;
 }
 
-function termFeed(text) {
-  let index = 0;
-  while (index < text.length) {
-    const ch = text[index];
-    if (ch === "\x1b") {
-      const rest = text.slice(index);
-      const csi = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(rest);
-      if (csi) { termCsi(csi[1], csi[2]); index += csi[0].length; continue; }
-      const osc = /^\x1b\][^\x07\x1b]*(\x07|\x1b\\)/.exec(rest);
-      if (osc) { index += osc[0].length; continue; }
-      const simple = /^\x1b[()#][A-Za-z0-9]|^\x1b[=>78MDEHc]/.exec(rest);
-      if (simple) { index += simple[0].length; continue; }
-      index += 1;
-      continue;
-    }
-    if (ch === "\r") term.cx = 0;
-    else if (ch === "\n") { term.cy += 1; termEnsureRow(term.cy); }
-    else if (ch === "\b") term.cx = Math.max(0, term.cx - 1);
-    else if (ch === "\t") term.cx = Math.ceil((term.cx + 1) / 8) * 8;
-    else if (ch >= " " && ch !== "\x7f") termPutChar(ch);
-    index += 1;
-  }
-  termRender();
+function termFit() {
+  if (!term.fit || $("#view-terminal").classList.contains("hidden")) return;
+  try { term.fit.fit(); } catch (err) { /* not laid out yet */ }
 }
 
 function termConnect() {
   if (term.ws) return;
+  const xterm = termEnsure();
+  if (!xterm) return;
+  termFit();
+  xterm.reset();
   const user = $("#term-user").value;
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   // The token goes in the first message, not the URL: query strings land in
   // server access logs.
   const params = new URLSearchParams({
     user,
-    cols: String(term.cols),
-    rows: String(term.rows),
+    cols: String(xterm.cols),
+    rows: String(xterm.rows),
   });
-  termReset();
-  termRender();
   const ws = new WebSocket(`${protocol}://${location.host}/api/terminal/ws?${params}`);
   term.ws = ws;
   $("#term-status").textContent = "Connecting…";
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: "auth", token: state.token }));
     $("#term-status").textContent = `Connected as ${user || "root"} (session recorded)`;
-    $("#term-screen").focus();
+    xterm.focus();
   };
   ws.onmessage = (event) => {
     const message = JSON.parse(event.data);
-    if (message.type === "output") termFeed(message.data);
-    else if (message.type === "closed") { $("#term-status").textContent = "Session closed"; term.ws = null; }
-    else if (message.type === "error") { toast(message.detail, "error"); termDisconnect(); }
+    if (message.type === "output") xterm.write(message.data);
+    else if (message.type === "closed") {
+      $("#term-status").textContent = message.detail === "idle timeout"
+        ? "Session closed after being idle" : "Session closed";
+      term.ws = null;
+    } else if (message.type === "error") { toast(message.detail, "error"); termDisconnect(); }
   };
   ws.onclose = (event) => {
     term.ws = null;
     if (event.code === 4401) toast("Terminal authentication failed - check the access token", "error");
     if (event.code === 4429) toast("Too many wrong tokens from this address - try again later", "error");
-    if ($("#term-status").textContent !== "Session closed") $("#term-status").textContent = "Disconnected";
+    if (!$("#term-status").textContent.startsWith("Session closed")) $("#term-status").textContent = "Disconnected";
   };
 }
 
@@ -1916,23 +1865,6 @@ function termDisconnect() {
 
 $("#term-connect").addEventListener("click", termConnect);
 $("#term-disconnect").addEventListener("click", termDisconnect);
-$("#term-screen").addEventListener("click", () => $("#term-screen").focus());
-$("#term-screen").addEventListener("keydown", (event) => {
-  if (!term.ws) return;
-  event.preventDefault();
-  const map = {
-    Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b",
-    ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D",
-    Home: "\x1b[H", End: "\x1b[F", PageUp: "\x1b[5~", PageDown: "\x1b[6~", Delete: "\x1b[3~",
-  };
-  let data = map[event.key];
-  if (!data && event.ctrlKey && event.key.length === 1) {
-    const code = event.key.toUpperCase().charCodeAt(0) - 64;
-    if (code >= 1 && code <= 26) data = String.fromCharCode(code);
-  }
-  if (!data && event.key.length === 1 && !event.ctrlKey && !event.metaKey) data = event.key;
-  if (data) term.ws.send(JSON.stringify({ type: "input", data }));
-});
 
 async function loadTerminal() {
   try {
@@ -1943,6 +1875,9 @@ async function loadTerminal() {
     if (current) $("#term-user").value = current;
   } catch (err) { toast(err.message, "error"); }
   $("#term-status").textContent = term.ws ? "Connected" : "Not connected";
+  // The view was hidden until now, so this is the first moment it has a size.
+  termEnsure();
+  termFit();
 }
 
 /* ------------------------------------------------------------------- init */

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LinuStart</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -594,8 +595,8 @@
           <span class="muted" id="term-status">Not connected</span>
         </div>
         <div class="card">
-          <pre class="term" id="term-screen" tabindex="0"></pre>
-          <p class="muted">Click the terminal and start typing. Every session is recorded to <code>/var/lib/linustart/terminal/</code> and noted in the audit log.</p>
+          <div class="term" id="term-screen"></div>
+          <p class="muted">Click the terminal and start typing; paste with your browser's usual shortcut. Idle sessions close automatically. Every session is recorded to <code>/var/lib/linustart/terminal/</code> and noted in the audit log.</p>
         </div>
       </section>
 
@@ -805,6 +806,8 @@
   </div>
 
   <div id="toasts"></div>
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

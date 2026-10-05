@@ -1283,9 +1283,22 @@ def build_router(
                 pass  # the browser went away; the receive loop cleans up
 
         pump_task = asyncio.create_task(pump())
+        idle_limit = settings.terminal_idle_minutes * 60 or None
+        close_reason = "closed by panel"
         try:
             while True:
-                message = await websocket.receive_json()
+                try:
+                    message = await asyncio.wait_for(websocket.receive_json(), timeout=idle_limit)
+                except asyncio.TimeoutError:
+                    # An abandoned browser tab must not keep a root shell open.
+                    close_reason = "idle timeout"
+                    pump_task.cancel()
+                    try:
+                        await websocket.send_json({"type": "closed", "detail": "idle timeout"})
+                        await websocket.close()
+                    except (RuntimeError, OSError):
+                        pass
+                    break
                 if not isinstance(message, dict):
                     continue
                 kind = message.get("type")
@@ -1299,10 +1312,10 @@ def build_router(
             pass
         finally:
             pump_task.cancel()
-            closed = await terminals.close(session.id)
+            closed = await terminals.close(session.id, close_reason)
             audit.record(
                 "terminal.close",
-                f"session {session.id} closed (user {closed['user']}, log {closed['log']})",
+                f"session {session.id} closed ({close_reason}; user {closed['user']}, log {closed['log']})",
             )
 
     # ---- self-update ------------------------------------------------------
