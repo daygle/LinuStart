@@ -743,6 +743,18 @@
         <button class="btn" data-svc-action="enable">Enable</button>
         <button class="btn" data-svc-action="disable">Disable</button>
       </div>
+      <h2 class="spaced">Override (drop-in)</h2>
+      <p class="muted">Settings here replace or extend the unit file, like <code>systemctl edit</code>;
+        saved to <code id="svc-override-path"></code> and loaded with <code>systemctl daemon-reload</code>.
+        Restart the service for them to take effect. Saving an empty override removes it.</p>
+      <textarea id="svc-override" class="mono" rows="8" spellcheck="false" placeholder="[Service]&#10;Restart=on-failure&#10;Environment=EXAMPLE=1"></textarea>
+      <div class="form-row">
+        <button class="btn btn-primary" id="svc-override-save" type="button">Save Override</button>
+      </div>
+      <details>
+        <summary class="muted">Full unit definition (systemctl cat)</summary>
+        <pre class="log" id="svc-definition"></pre>
+      </details>
       <h2 class="spaced">Recent Journal</h2>
       <pre class="log log-tall" id="service-modal-log"></pre>
     </div>

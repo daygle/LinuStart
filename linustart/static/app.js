@@ -1674,6 +1674,29 @@ $("#svc-table").addEventListener("click", (event) => {
   if (button) openService(button.dataset.svcUnit);
 });
 
+function renderOverride(data) {
+  $("#svc-override-path").textContent = data.path || "";
+  $("#svc-override").value = data.content || "";
+  $("#svc-definition").textContent = data.definition || "";
+}
+
+async function loadOverride(unit) {
+  try { renderOverride(await api(`/services/${encodeURIComponent(unit)}/override`)); }
+  catch (err) { $("#svc-definition").textContent = err.message; }
+}
+
+$("#svc-override-save").addEventListener("click", async () => {
+  if (!state.svcEdit) return;
+  const content = $("#svc-override").value;
+  if (!content.trim() && !window.confirm(`Remove the override for ${state.svcEdit}?`)) return;
+  try {
+    renderOverride(await api(`/services/${encodeURIComponent(state.svcEdit)}/override`, {
+      method: "PUT", body: { content },
+    }));
+    toast(content.trim() ? "Override saved - restart the service to apply it" : "Override removed", "success");
+  } catch (err) { toast(err.message, "error"); }
+});
+
 async function openService(unit) {
   try {
     const data = await api(`/services/${encodeURIComponent(unit)}`);
@@ -1682,6 +1705,7 @@ async function openService(unit) {
     $("#service-modal-meta").textContent =
       `${data.description} · ${data.active}/${data.sub} · ${data.enabled || "unknown"} · pid ${data.main_pid || "-"}`;
     $("#service-modal-log").textContent = (data.journal || []).join("\n") || "No journal entries.";
+    loadOverride(unit);
     $("#service-modal").classList.remove("hidden");
   } catch (err) { toast(err.message, "error"); }
 }

@@ -164,6 +164,10 @@ class FirewallRuleBody(BaseModel):
     address: str = "any"
 
 
+class OverrideBody(BaseModel):
+    content: str = ""
+
+
 class DiskScanBody(BaseModel):
     path: str
 
@@ -1043,6 +1047,26 @@ def build_router(
             raise HTTPException(status_code=404, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/services/{unit}/override", dependencies=guard)
+    async def services_override(unit: str) -> Dict[str, object]:
+        try:
+            return await services_mod.get_override(unit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.put("/services/{unit}/override", dependencies=guard)
+    async def services_set_override(unit: str, body: OverrideBody) -> Dict[str, object]:
+        try:
+            result = await services_mod.set_override(unit, body.content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            audit.record("services.override", f"{unit}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        action = "updated" if body.content.strip() else "removed"
+        audit.record("services.override", f"{action} override for {result['unit']}")
+        return result
 
     @router.post("/services/{unit}/action/{action}", dependencies=guard)
     async def services_action(unit: str, action: str) -> Dict[str, object]:

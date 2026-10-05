@@ -49,6 +49,7 @@ SYSCTL_CONF = rooted("etc", "sysctl.conf")
 SYSCTL_D = rooted("etc", "sysctl.d")
 PROC_SYS = rooted("proc", "sys")
 CRON_D = rooted("etc", "cron.d")
+SYSTEMD_SYSTEM_DIR = rooted("etc", "systemd", "system")
 CRON_SPOOL = rooted("var", "spool", "cron", "crontabs")
 VAR_LOG_DIR = rooted("var", "log")
 

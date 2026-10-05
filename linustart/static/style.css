@@ -190,6 +190,8 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 1
 }
 .term .xterm { height: 100%; }
 
+textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; width: 100%; }
+
 /* Group member chips */
 .chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 4px 1px 8px; margin: 2px 0;
   border: 1px solid var(--border); border-radius: 999px; }
