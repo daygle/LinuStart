@@ -13,6 +13,8 @@ from ..util import run
 _SKIP_DIRS = {"posix", "right"}
 _SKIP_SUFFIXES = (".tab", ".zi", ".list", ".jpg", ".png", ".awk", ".sh")
 _SKIP_FILES = {"Factory", "leapseconds", "leap-seconds.list", "tzdata.zi", "iso3166.tab"}
+# Rewritten by every tzdata upgrade; see _tzdata_stamp.
+_INDEX_FILES = ("tzdata.zi", "zone1970.tab", "zone.tab", "+VERSION")
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
@@ -21,12 +23,38 @@ def list_timezones() -> List[str]:
 
     Walking the tree touches ~1800 files, and it ran on every page load and
     every timezone change; the result only changes when tzdata is upgraded,
-    so it is cached per directory and modification time.
+    so it is cached against :func:`_tzdata_stamp`.
     """
     base = ZONEINFO_DIR
     if not base.is_dir():
         return []
-    return list(_scan_timezones(str(base), base.stat().st_mtime))
+    return list(_scan_timezones(str(base), _tzdata_stamp(base)))
+
+
+def _tzdata_stamp(base: Path) -> Tuple[float, ...]:
+    """Modification times that change whenever tzdata is upgraded.
+
+    The top directory's own mtime is not enough: a new zone lands in a
+    subdirectory (America/Ciudad_Juarez), which leaves the top untouched. The
+    index files tzdata rewrites on every upgrade - plus the subdirectories
+    themselves - catch it, for the price of a few dozen stat() calls instead
+    of walking every zone file.
+    """
+    stamps: List[float] = []
+    for path in [base, *(base / name for name in _INDEX_FILES)]:
+        try:
+            stamps.append(path.stat().st_mtime)
+        except OSError:
+            stamps.append(0.0)
+    try:
+        stamps.extend(
+            entry.stat().st_mtime
+            for entry in sorted(base.iterdir())
+            if entry.is_dir() and entry.name not in _SKIP_DIRS
+        )
+    except OSError:
+        pass
+    return tuple(stamps)
 
 
 @functools.lru_cache(maxsize=4)

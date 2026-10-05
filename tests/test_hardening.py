@@ -357,3 +357,102 @@ def test_terminal_ws_origin_check_allows_reverse_proxies(client):
             ws.send_json({"type": "auth", "token": "wrong"})
             ws.receive_json()
     assert excinfo.value.code == 4401
+
+
+# --------------------------------------------------------------------------
+# ifupdown: files pulled in with source / source-directory
+# --------------------------------------------------------------------------
+
+from linustart.modules import network as network_mod  # noqa: E402
+from linustart.modules import timezone as timezone_mod  # noqa: E402
+
+MAIN = "auto lo\niface lo inet loopback\n\nsource /etc/network/interfaces.d/*\n"
+DROPIN_DHCP = "auto eth0\niface eth0 inet dhcp\n"
+
+
+def test_parse_source_directives():
+    text = MAIN + "source-directory interfaces.d\n# source /nope\n"
+    assert network_mod.parse_source_directives(text) == [
+        ("source", "/etc/network/interfaces.d/*"),
+        ("source-directory", "interfaces.d"),
+    ]
+
+
+def test_interface_defined_in_a_dropin_is_edited_there():
+    docs = {"/main": MAIN, "/d/eth0": DROPIN_DHCP}
+    updated, changed = network_mod.apply_ifupdown_across(
+        docs, "/main", "eth0", "static", "10.0.0.5/24", "10.0.0.1", ["1.1.1.1"]
+    )
+    assert changed == ["/d/eth0"]  # the main file is left alone
+    assert "iface eth0 inet static" in updated["/d/eth0"]
+    assert updated["/d/eth0"].count("auto eth0") == 1
+    assert "eth0" not in updated["/main"]
+
+
+def test_duplicate_stanzas_in_other_files_are_removed():
+    main = MAIN + "\nauto eth0\niface eth0 inet static\n    address 10.0.0.9\n    netmask 255.255.255.0\n"
+    docs = {"/main": main, "/d/eth0": DROPIN_DHCP}
+    updated, changed = network_mod.apply_ifupdown_across(
+        docs, "/main", "eth0", "static", "10.0.0.5/24", None, []
+    )
+    assert sorted(changed) == ["/d/eth0", "/main"]
+    assert "address 10.0.0.5" in updated["/main"]
+    # the leftover DHCP stanza is gone; the drop-in's auto line may stay
+    assert "inet dhcp" not in updated["/d/eth0"]
+    assert network_mod.stanza_counts("".join(updated.values())).get("eth0 inet") == 1
+
+
+def test_new_interface_goes_to_the_main_file_without_a_second_auto():
+    docs = {"/main": MAIN, "/d/hotplug": "auto eth1\n"}
+    updated, changed = network_mod.apply_ifupdown_across(docs, "/main", "eth1", "dhcp")
+    assert changed == ["/main"]
+    assert "iface eth1 inet dhcp" in updated["/main"]
+    assert "auto eth1" not in updated["/main"]  # already brought up elsewhere
+
+
+def test_ifupdown_files_follow_source_lines(tmp_path, monkeypatch):
+    netdir = tmp_path / "etc" / "network"
+    (netdir / "interfaces.d").mkdir(parents=True)
+    (netdir / "extra").mkdir()
+    main = netdir / "interfaces"
+    main.write_text(MAIN + "source-directory extra\n")
+    (netdir / "interfaces.d" / "eth0").write_text(DROPIN_DHCP)  # no .cfg suffix
+    (netdir / "interfaces.d" / "eth1.cfg").write_text("iface eth1 inet dhcp\n")
+    (netdir / "extra" / "eth2").write_text("iface eth2 inet dhcp\n")
+    (netdir / "extra" / "eth2.dpkg-old").write_text("iface eth2 inet static\n")  # run-parts skips
+    monkeypatch.setattr(network_mod, "ROOT", tmp_path)
+    monkeypatch.setattr(network_mod, "INTERFACES_FILE", main)
+    names = [p.relative_to(netdir).as_posix() for p in network_mod.ifupdown_files()]
+    assert names == ["interfaces", "interfaces.d/eth0", "interfaces.d/eth1.cfg", "extra/eth2"]
+    assert network_mod.managed_config_files("ifupdown") == network_mod.ifupdown_files()
+
+    config = asyncio.run(network_mod.get_config("ifupdown"))
+    by_name = {iface["name"]: iface for iface in config["interfaces"]}
+    assert set(by_name) == {"eth0", "eth1", "eth2"}
+    assert by_name["eth0"]["source"].endswith("interfaces.d/eth0")
+
+
+def test_source_lines_cannot_escape_the_root():
+    assert network_mod._rooted_relative("../../etc/shadow") is None
+    assert network_mod._rooted_relative("/etc/network/interfaces.d/*") == "etc/network/interfaces.d/*"
+    assert network_mod._rooted_relative("interfaces.d/*") == "etc/network/interfaces.d/*"
+
+
+# --------------------------------------------------------------------------
+# timezone cache sees zones added in subdirectories
+# --------------------------------------------------------------------------
+
+def test_timezone_cache_picks_up_a_new_zone_in_a_subdirectory(tmp_path, monkeypatch):
+    base = tmp_path / "zoneinfo"
+    (base / "America").mkdir(parents=True)
+    (base / "America" / "New_York").write_bytes(b"TZif")
+    (base / "UTC").write_bytes(b"TZif")
+    monkeypatch.setattr(timezone_mod, "ZONEINFO_DIR", base)
+    assert timezone_mod.list_timezones() == ["America/New_York", "UTC"]
+
+    # what a tzdata upgrade does: a new file in a subdirectory only
+    top_mtime = base.stat().st_mtime
+    (base / "America" / "Ciudad_Juarez").write_bytes(b"TZif")
+    os.utime(base / "America", (top_mtime + 5, top_mtime + 5))
+    os.utime(base, (top_mtime, top_mtime))
+    assert "America/Ciudad_Juarez" in timezone_mod.list_timezones()

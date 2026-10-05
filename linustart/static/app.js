@@ -239,7 +239,7 @@ async function loadNetwork() {
     const stanzas = Number(iface.stanza_count || 1);
     const duplicated = stanzas > 1
       ? `<p class="muted"><span class="badge warn">${stanzas} stanzas</span> this interface is
-         configured ${stanzas} times in /etc/network/interfaces. ifupdown applies all of them,
+         configured ${stanzas} times across /etc/network/interfaces and the files it sources. ifupdown applies all of them,
          so a leftover DHCP block here still runs alongside the settings below - saving this
          interface collapses them into one.</p>`
       : "";

@@ -11,11 +11,11 @@ import copy
 import ipaddress
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from ..paths import INTERFACES_FILE, INTERFACES_D_DIR, NETPLAN_DIR
-from ..util import read_text, run, write_text
+from ..paths import INTERFACES_FILE, NETPLAN_DIR, ROOT
+from ..util import is_within, read_text, run, write_text
 
 try:  # PyYAML is only required for the netplan backend.
     import yaml
@@ -29,6 +29,10 @@ MANAGED_KEYS = ("address", "netmask", "gateway", "dns-nameservers")
 IFACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,14}$")
 IFACE_HEADER_RE = re.compile(r"^(?P<indent>\s*)iface\s+(?P<name>\S+)\s+(?P<family>\S+)\s+(?P<method>\S+)\s*$")
 AUTO_RE = re.compile(r"^\s*auto\s+(?P<names>.+?)\s*$")
+SOURCE_RE = re.compile(r"^\s*(?P<kind>source|source-directory)\s+(?P<target>\S+)\s*$")
+# source-directory only picks up files run-parts would run: no dots, so
+# editor backups (eth0.cfg~) and dpkg leftovers (eth0.dpkg-old) are skipped.
+RUN_PARTS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 # --------------------------------------------------------------------------
@@ -187,10 +191,14 @@ def update_ifupdown_interface(
     address: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[Sequence[str]] = None,
+    *,
+    ensure_auto: bool = True,
 ) -> str:
     """Return new /etc/network/interfaces content for *name*.
 
-    Everything outside the managed keys is preserved verbatim.
+    Everything outside the managed keys is preserved verbatim. With
+    *ensure_auto* off no ``auto`` line is added - the caller knows another
+    sourced file already brings the interface up.
     """
     if method not in ("static", "dhcp", "manual"):
         raise ValueError(f"unsupported method: {method!r}")
@@ -214,7 +222,7 @@ def update_ifupdown_interface(
 
     if not occurrences:
         # Append a fresh stanza.
-        block: List[str] = [f"auto {name}", f"iface {name} inet {method}"]
+        block: List[str] = ([f"auto {name}"] if ensure_auto else []) + [f"iface {name} inet {method}"]
         block.extend(_render_options(method, address, gateway, dns))
         prefix = list(lines)
         if prefix and prefix[-1] != "":
@@ -256,9 +264,78 @@ def update_ifupdown_interface(
         for m in [AUTO_RE.match(line)]
         if m
     )
-    if not has_auto:
+    if ensure_auto and not has_auto:
         before = before + [f"auto {name}"]
     return "\n".join(before + new_lines + after) + "\n"
+
+
+def has_auto_line(text: str, name: str) -> bool:
+    return any(
+        name in (m.group("names") or "").split()
+        for line in text.splitlines()
+        for m in [AUTO_RE.match(line)]
+        if m
+    )
+
+
+def remove_ifupdown_interface(text: str, name: str) -> str:
+    """Drop every ``iface <name> inet`` stanza from *text*; nothing else changes."""
+    lines = text.splitlines()
+    drop: Set[int] = set()
+    for key, start, end in _all_stanza_spans(lines):
+        if key == f"{name} inet":
+            drop.update(range(start, end))
+    if not drop:
+        return text
+    kept = [line for index, line in enumerate(lines) if index not in drop]
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def apply_ifupdown_across(
+    documents: Mapping[str, str],
+    main: str,
+    name: str,
+    method: str,
+    address: Optional[str] = None,
+    gateway: Optional[str] = None,
+    dns: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Configure *name* across the interfaces file and everything it sources.
+
+    ifupdown reads ``/etc/network/interfaces`` and every file pulled in with
+    ``source``/``source-directory`` as one configuration, so the interface is
+    edited where it is already defined (the first file that has it, or the
+    main file for a new one) and its stanzas in every other file are removed;
+    a leftover DHCP stanza in ``interfaces.d`` would otherwise still run next
+    to the static address. Returns the updated documents and the sources that
+    changed, so only those are rewritten.
+    """
+    if main not in documents:
+        raise ValueError(f"main interfaces file was not loaded: {main!r}")
+    key = f"{name} inet"
+    holders = [source for source, text in documents.items() if stanza_counts(text).get(key)]
+    target = holders[0] if holders else main
+    auto_elsewhere = any(
+        has_auto_line(text, name) for source, text in documents.items() if source != target
+    )
+    updated = dict(documents)
+    updated[target] = update_ifupdown_interface(
+        documents[target], name, method, address, gateway, dns, ensure_auto=not auto_elsewhere
+    )
+    for source in holders[1:]:
+        updated[source] = remove_ifupdown_interface(documents[source], name)
+    changed = [source for source in updated if updated[source] != documents[source]]
+    return updated, changed
+
+
+def parse_source_directives(text: str) -> List[Tuple[str, str]]:
+    """``(kind, target)`` for each ``source`` / ``source-directory`` line."""
+    directives: List[Tuple[str, str]] = []
+    for line in text.splitlines():
+        match = SOURCE_RE.match(line)
+        if match:
+            directives.append((match.group("kind"), match.group("target")))
+    return directives
 
 
 def _render_options(
@@ -470,20 +547,62 @@ def _netplan_files() -> List[Path]:
     return sorted(NETPLAN_DIR.glob("*.yaml")) if NETPLAN_DIR.is_dir() else []
 
 
+def _rooted_relative(target: str) -> Optional[str]:
+    """A source target as a pattern relative to ROOT (None if it is unsafe).
+
+    Relative targets are resolved against /etc/network, as ifupdown does.
+    """
+    pure = PurePosixPath(target)
+    if ".." in pure.parts:
+        return None
+    if pure.is_absolute():
+        return str(pure.relative_to("/"))
+    return str(PurePosixPath("etc", "network", pure))
+
+
+def ifupdown_files() -> List[Path]:
+    """/etc/network/interfaces plus every file it sources, in ifupdown order.
+
+    Debian's default is ``source /etc/network/interfaces.d/*`` (any name, not
+    just ``*.cfg``); ``source-directory`` takes run-parts style names only.
+    One level is followed, which is how every stock layout is built.
+    """
+    files: List[Path] = [INTERFACES_FILE]
+    for kind, target in parse_source_directives(read_text(INTERFACES_FILE)):
+        relative = _rooted_relative(target)
+        if not relative:
+            continue
+        if kind == "source":
+            candidates = sorted(ROOT.glob(relative))
+        else:
+            directory = ROOT / relative
+            candidates = (
+                sorted(p for p in directory.iterdir() if RUN_PARTS_NAME_RE.match(p.name))
+                if directory.is_dir()
+                else []
+            )
+        for path in candidates:
+            # a symlink in interfaces.d must not lead the panel outside ROOT
+            if path.is_file() and path not in files and is_within(ROOT, path):
+                files.append(path)
+    return files
+
+
 def managed_config_files(backend: str) -> List:
     if backend == "netplan":
         return _netplan_files()
     if backend == "ifupdown":
-        return [INTERFACES_FILE]
+        return ifupdown_files()
     return []
 
 
 async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
     backend = backend or await detect_backend()
     if backend == "ifupdown":
-        text = read_text(INTERFACES_FILE)
-        for extra in sorted(INTERFACES_D_DIR.glob("*.cfg")) if INTERFACES_D_DIR.is_dir() else []:
-            text += "\n" + read_text(extra)
+        documents = {path: read_text(path) for path in ifupdown_files()}
+        # Each file is joined on a fresh line so a stanza never runs into the
+        # next file's first line.
+        text = "\n".join(content.rstrip("\n") for content in documents.values()) + "\n"
         names = re.findall(r"^\s*iface\s+(\S+)\s+inet\s+\S+", text, re.M)
         counts = stanza_counts(text)
         interfaces = []
@@ -492,8 +611,18 @@ async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
             # Only surface interfaces we can actually manage.
             if info and info.get("method") in ("static", "dhcp", "manual"):
                 info["stanza_count"] = counts.get(f"{name} inet", 0)
+                info["source"] = next(
+                    (str(path) for path, content in documents.items()
+                     if stanza_counts(content).get(f"{name} inet")),
+                    str(INTERFACES_FILE),
+                )
                 interfaces.append(info)
-        return {"backend": backend, "interfaces": interfaces, "source": str(INTERFACES_FILE)}
+        return {
+            "backend": backend,
+            "interfaces": interfaces,
+            "source": str(INTERFACES_FILE),
+            "files": [str(path) for path in documents],
+        }
     if backend == "netplan":
         if yaml is None:
             raise RuntimeError("netplan support requires the PyYAML package")
@@ -553,9 +682,12 @@ async def write_interface_config(
     name = validate_interface_name(name)
     dns = validate_dns(dns)
     if backend == "ifupdown":
-        text = read_text(INTERFACES_FILE)
-        updated = update_ifupdown_interface(text, name, method, address, gateway, dns)
-        write_text(INTERFACES_FILE, updated)
+        documents = {str(path): read_text(path) for path in ifupdown_files()}
+        updated, changed = apply_ifupdown_across(
+            documents, str(INTERFACES_FILE), name, method, address, gateway, dns
+        )
+        for source in changed:
+            write_text(Path(source), updated[source])
         return
     if backend == "netplan":
         if yaml is None:

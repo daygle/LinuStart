@@ -22,7 +22,6 @@ def rooted(*parts: str) -> Path:
 HOSTNAME_FILE = rooted("etc", "hostname")
 HOSTS_FILE = rooted("etc", "hosts")
 INTERFACES_FILE = rooted("etc", "network", "interfaces")
-INTERFACES_D_DIR = rooted("etc", "network", "interfaces.d")
 NETPLAN_DIR = rooted("etc", "netplan")
 APT_CONF_D_DIR = rooted("etc", "apt", "apt.conf.d")
 AUTO_UPGRADES_FILE = APT_CONF_D_DIR / "20auto-upgrades"
