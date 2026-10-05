@@ -1312,11 +1312,19 @@ def build_router(
             pass
         finally:
             pump_task.cancel()
-            closed = await terminals.close(session.id, close_reason)
-            audit.record(
-                "terminal.close",
-                f"session {session.id} closed ({close_reason}; user {closed['user']}, log {closed['log']})",
-            )
+
+            async def finish() -> None:
+                closed = await terminals.close(session.id, close_reason)
+                audit.record(
+                    "terminal.close",
+                    f"session {session.id} closed ({close_reason}; user {closed['user']}, log {closed['log']})",
+                )
+
+            # Shielded: when the handler itself is cancelled (the client went
+            # away mid-await), the shell must still be hung up and the close
+            # still audited - a cancelled cleanup would leave a root shell
+            # running with no record of it ending.
+            await asyncio.shield(asyncio.ensure_future(finish()))
 
     # ---- self-update ------------------------------------------------------
     @router.get("/update/check", dependencies=guard)
