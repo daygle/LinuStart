@@ -233,22 +233,29 @@ linustart/
 terminal.py           WebSocket web terminal (PTY + session logs)
 updater.py            Self-update from GitHub releases (apply/rollback CLI)
 └── static/           Plain HTML/CSS/JS UI (no build step, no Node needed)
-tests/                Unit tests for all config-editing logic (131 tests)
+tests/                Python tests (config logic and the HTTP API); tests/js: frontend helpers
 ```
 
-The UI intentionally has **no build step and no Node dependency** - the whole
-thing is one `.deb`-friendly Python package with a static frontend.
+The UI intentionally has **no build step and no Node runtime dependency** -
+the whole thing is one `.deb`-friendly Python package with a static frontend
+(xterm.js is vendored under `static/vendor`). Node is only used in development
+to lint and unit-test the JavaScript.
 
 ## Tests
 
 ```bash
 pip install -e '.[dev]'
-pytest            # or run any file directly: python tests/test_ifupdown.py
+pytest                                    # Python: config logic + HTTP API
+ruff check linustart tests conftest.py    # Python lint (rules in pyproject.toml)
+node --test tests/js/*.test.js            # frontend helper unit tests
+npx eslint@9 linustart/static tests/js    # frontend lint (eslint.config.js)
 ```
 
-The tests cover the config-manipulation logic (ifupdown/netplan editing,
-hosts-file updates, apt.conf editing, apt output parsing, input validation)
-without needing root or a Debian-family system.
+The Python tests cover the config-manipulation logic (ifupdown/netplan
+editing, hosts-file updates, apt.conf editing, firewall rulesets, input
+validation) and the HTTP API - including a check that every endpoint refuses
+requests without the token - without needing root or a Debian-family system.
+CI runs all four.
 
 ## Email setup in detail
 

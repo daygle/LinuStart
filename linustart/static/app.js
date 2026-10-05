@@ -1,5 +1,8 @@
 "use strict";
 
+/* Pure helpers (esc, fmtBytes, fmtUptime, niceMax, fmtMetric, mergeLogLines)
+   live in util.js, which is loaded first and unit-tested with node --test. */
+
 /* ---------------------------------------------------------------- helpers */
 
 const state = {
@@ -29,10 +32,6 @@ const state = {
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
-function esc(value) {
-  const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-  return String(value === undefined || value === null ? "" : value).replace(/[&<>"']/g, (c) => map[c]);
-}
 
 function toast(message, kind = "info") {
   const box = document.createElement("div");
@@ -42,22 +41,7 @@ function toast(message, kind = "info") {
   setTimeout(() => box.remove(), 5200);
 }
 
-function fmtBytes(bytes) {
-  if (!bytes) return "-";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
 
-function fmtUptime(seconds) {
-  if (!seconds) return "-";
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return `${d}d ${h}h ${m}m`;
-}
 
 function meter(label, used, total) {
   const pct = total ? Math.min(100, Math.round((used / total) * 100)) : 0;
@@ -245,17 +229,7 @@ function svgEl(tag, attrs, parent) {
   return el;
 }
 
-function niceMax(value) {
-  if (!(value > 0)) return 1;
-  const step = Math.pow(10, Math.floor(Math.log10(value)));
-  for (const m of [1, 2, 2.5, 5, 10]) if (m * step >= value) return m * step;
-  return 10 * step;
-}
 
-function fmtMetric(value, unit) {
-  if (value === null || value === undefined) return "-";
-  return unit === "%" ? `${Number(value).toFixed(1)}%` : Number(value).toFixed(2);
-}
 
 function fmtClock(t) {
   return new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -2122,7 +2096,7 @@ async function followTick() {
     const out = $("#log-output");
     const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
     const existing = out.textContent === "No entries." ? [] : out.textContent.split("\n");
-    out.textContent = existing.concat(fresh).slice(-LOG_KEEP_LINES).join("\n");
+    out.textContent = mergeLogLines(existing, fresh, LOG_KEEP_LINES).join("\n");
     if (atBottom) out.scrollTop = out.scrollHeight;
   } catch (err) {
     stopLogFollow();

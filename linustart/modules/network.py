@@ -1045,15 +1045,23 @@ async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
 
 async def runtime_status() -> Dict[str, object]:
     """Live interface state straight from the kernel."""
+    async def query(argv):
+        # A missing `ip` (no iproute2) leaves live status empty instead of
+        # failing the whole page; the configuration can still be edited.
+        try:
+            return await run(argv)
+        except RuntimeError:
+            return None
+
     addr, route, route6 = await asyncio.gather(
-        run(["ip", "-j", "addr", "show"]),
-        run(["ip", "-j", "route", "show"]),
-        run(["ip", "-j", "-6", "route", "show", "default"]),
+        query(["ip", "-j", "addr", "show"]),
+        query(["ip", "-j", "route", "show"]),
+        query(["ip", "-j", "-6", "route", "show", "default"]),
     )
 
     def parsed(result) -> list:
         try:
-            return json.loads(result.stdout) if result.ok and result.stdout.strip() else []
+            return json.loads(result.stdout) if result and result.ok and result.stdout.strip() else []
         except ValueError:
             return []
 

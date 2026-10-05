@@ -52,15 +52,30 @@ jobs:
 
       # Static checks are cheap and fast - they run on the current commit
       # regardless of what the tests do next to it.
+      - name: Lint the Python code (ruff, configured in pyproject.toml)
+        run: .venv/bin/ruff check linustart tests conftest.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Check the frontend JavaScript
-        run: node --check linustart/static/app.js
+        run: |
+          node --check linustart/static/app.js
+          node --check linustart/static/util.js
+
+      - name: Lint the frontend JavaScript (ESLint core rules, eslint.config.js)
+        run: npx --yes eslint@9 linustart/static tests/js eslint.config.js
+
+      - name: Unit-test the frontend helpers
+        run: node --test tests/js/*.test.js
 
       - name: Check the installer shell script
         run: bash -n install.sh
 
       - name: Confirm the installed package actually imports
         run: |
-          .venv/bin/python -c "import linustart.app, linustart.routes, linustart.updater, linustart.modules.cron, linustart.modules.sysctl, linustart.modules.users, linustart.modules.logs, linustart.modules.sudoers; print('imports ok')"
+          .venv/bin/python -c "import linustart.app, linustart.routes, linustart.updater, linustart.sessions, linustart.metrics, linustart.ratelimit, linustart.modules.cron, linustart.modules.sysctl, linustart.modules.users, linustart.modules.groups, linustart.modules.logs, linustart.modules.sudoers; print('imports ok')"
 
   # The shell always returns the status of the last command in the pipeline,
   # so a failing earlier step is reported here as a failing gate.

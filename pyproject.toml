@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "httpx>=0.27"]
+dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.5"]
 
 [project.scripts]
 linustart = "linustart.__main__:main"
@@ -30,3 +30,14 @@ linustart = ["static/*", "static/vendor/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py39"
+extend-exclude = ["linustart/static"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, warnings and bugbear. The typing-modernisation rules
+# (UP) are left out on purpose: the code keeps Python 3.9-compatible typing.
+select = ["E", "F", "W", "B"]
+ignore = ["B904"]  # `raise ... from` inside except: style, not a bug here
