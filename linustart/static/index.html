@@ -271,7 +271,7 @@
           </div>
           <div class="form-row">
             <button class="btn btn-danger hidden" id="mail-remove-conflicts" type="button">Remove Conflicting Mailers</button>
-            <button class="btn hidden" id="mail-install" type="button">Install Postfix</button>
+            <button class="btn hidden" id="mail-install" type="button">Install Mailer</button>
           </div>
         </div>
         <div class="cards">
@@ -279,6 +279,12 @@
             <h2>Mail Delivery (SMTP relay)</h2>
             <p id="mail-msmtp-hint" class="muted hidden"></p>
             <form id="mail-form" class="form">
+              <label>Delivery
+                <select id="mail-transport-select">
+                  <option value="postfix">Postfix (local queue, retries when the relay is down)</option>
+                  <option value="msmtp">msmtp (lightweight, hands mail straight to the relay)</option>
+                </select>
+              </label>
               <label>SMTP server (your mail server)
                 <input type="text" id="mail-host" placeholder="mail.example.com" autocomplete="off">
               </label>

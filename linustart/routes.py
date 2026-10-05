@@ -96,6 +96,7 @@ class MailBody(BaseModel):
     from_address: str = ""
     report_to: Optional[str] = ""
     report_mode: Optional[str] = Field(default="only-on-error", pattern="^(always|only-on-error|on-change)$")
+    transport: str = Field(default="postfix", pattern="^(postfix|msmtp)$")
 
 
 class MailTestBody(BaseModel):
@@ -482,7 +483,7 @@ def build_router(
     @router.get("/mail", dependencies=guard)
     async def mail_status() -> Dict[str, object]:
         data = await mail_mod.status()
-        data["mailer"] = await mail_mod.mailer_status()
+        data["mailer"] = await mail_mod.mailer_status(str(data.get("transport") or "postfix"))
         data["msmtp"] = await mail_mod.msmtp_status()
         return data
 
@@ -498,13 +499,14 @@ def build_router(
                 password=body.password,
                 report_to=body.report_to or "",
                 report_mode=body.report_mode or "only-on-error",
+                transport=body.transport,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("mail.configure", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
-        audit.record("mail.configure", f"relay {body.host}:{body.port} as {body.from_address}")
+        audit.record("mail.configure", f"{body.transport} relay {body.host}:{body.port} as {body.from_address}")
         return result
 
     @router.post("/mail/test", dependencies=guard)
@@ -517,7 +519,7 @@ def build_router(
         job = await jobs.start(
             "mail.test",
             f"Test email to {recipient}",
-            mail_mod.test_command(from_address, recipient),
+            mail_mod.test_command(from_address, recipient, str(state.get("transport") or "postfix")),
             stdin_text=mail_mod.test_message(recipient, from_address),
         )
         audit.record("mail.test", f"test message to {recipient}")
@@ -530,7 +532,7 @@ def build_router(
         if not conflicts:
             raise HTTPException(status_code=400, detail="no conflicting mail transfer agents found")
         try:
-            argv = mail_mod.remove_conflicting_command(conflicts)
+            argv = mail_mod.remove_conflicting_command(conflicts, str(state.get("transport") or "postfix"))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         job = await jobs.start(
@@ -542,17 +544,19 @@ def build_router(
         return job.to_dict()
 
     @router.post("/mail/install", dependencies=guard)
-    async def mail_install() -> Dict[str, object]:
-        try:
-            await mail_mod.preseed_postfix()
-        except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+    async def mail_install(transport: str = Query("postfix", pattern="^(postfix|msmtp)$")) -> Dict[str, object]:
+        package = mail_mod.TRANSPORT_PACKAGE[transport]
+        if transport == "postfix":
+            try:
+                await mail_mod.preseed_postfix()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=500, detail=str(exc))
         job = await jobs.start(
             "mail.install",
-            "Install postfix (SMTP relay)",
-            packages_mod.install_command(["postfix"]),
+            f"Install {package} (SMTP relay)",
+            packages_mod.install_command([package]),
         )
-        audit.record("mail.install", "postfix install")
+        audit.record("mail.install", f"{package} install")
         return job.to_dict()
 
     # ---- packages --------------------------------------------------------

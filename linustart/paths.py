@@ -58,6 +58,7 @@ CONFIG_DIR = rooted("etc", "linustart")
 CONFIG_FILE = CONFIG_DIR / "config.json"
 MAIL_STATE_FILE = CONFIG_DIR / "mail.json"
 ALERTS_FILE = CONFIG_DIR / "alerts.json"
+MSMTP_PASSWORD_FILE = CONFIG_DIR / "msmtp-password"
 STATE_DIR = rooted("var", "lib", "linustart")
 BACKUP_DIR = STATE_DIR / "backups"
 AUDIT_LOG = STATE_DIR / "audit.log"

@@ -312,10 +312,12 @@ async def send_alert(event: Mapping[str, object]) -> bool:
     if not recipient or not mail.valid_recipient(recipient):
         audit.record("alert", f"{detail} (no recipient configured; not emailed)", ok=False)
         return False
-    sender = str((await mail.status()).get("from_address") or "")
+    state = await mail.status()
+    sender = str(state.get("from_address") or "")
     message = alert_message(event, socket.gethostname(), recipient, sender)
     try:
-        result = await run(mail.test_command(sender, recipient), input_text=message, timeout=60)
+        argv = mail.test_command(sender, recipient, str(state.get("transport") or "postfix"))
+        result = await run(argv, input_text=message, timeout=60)
         ok = result.ok
     except RuntimeError:
         ok = False

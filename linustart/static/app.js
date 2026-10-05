@@ -1048,18 +1048,34 @@ $("#sysctl-modal-delete").addEventListener("click", async () => {
 
 /* ------------------------------------------------------------------ email */
 
+const MAIL_PACKAGES = { postfix: "postfix", msmtp: "msmtp-mta" };
+
+function mailInstallButton() {
+  const chosen = $("#mail-transport-select").value;
+  const configured = state.mailData && state.mailData.transport;
+  const button = $("#mail-install");
+  button.textContent = `Install ${MAIL_PACKAGES[chosen]}`;
+  // offer the install whenever the chosen transport is not the one known to be installed
+  button.classList.toggle("hidden", !!(state.mailData && state.mailData.installed && chosen === configured));
+}
+
 async function loadMail() {
   const data = await api("/mail");
+  state.mailData = data;
+  const transport = data.transport || "postfix";
+  $("#mail-transport-select").value = transport;
   const badge = $("#mail-status-badge");
   if (!data.installed) {
-    badge.textContent = "postfix not installed";
+    badge.textContent = `${MAIL_PACKAGES[transport]} not installed`;
     badge.className = "badge warn";
-    $("#mail-install").classList.remove("hidden");
+  } else if (transport === "msmtp") {
+    badge.textContent = "msmtp installed";
+    badge.className = "badge ok";
   } else {
     badge.textContent = data.service_active ? "postfix active" : "postfix installed";
     badge.className = `badge ${data.service_active ? "ok" : "warn"}`;
-    $("#mail-install").classList.add("hidden");
   }
+  mailInstallButton();
   $("#mail-host").value = data.host || "";
   $("#mail-port").value = data.port || 587;
   $("#mail-security").value = data.security || "starttls";
@@ -1070,14 +1086,14 @@ async function loadMail() {
   $("#mail-password-hint").textContent = data.credentials_set ? "(password on file)" : "";
   const msmtp = data.msmtp || {};
   const msmtpHint = $("#mail-msmtp-hint");
-  if (msmtp.detected && !data.relayhost) {
+  if (msmtp.detected && !data.relayhost && transport === "postfix") {
     msmtpHint.classList.remove("hidden");
     msmtpHint.textContent =
       "Existing msmtp configuration found - the form is pre-filled from /etc/msmtprc. " +
       (msmtp.password_available
         ? "Leave the password blank and the msmtp password file is used automatically. "
         : "") +
-      "After saving, use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
+      "Keep msmtp by choosing it under Delivery, or save with Postfix and use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
     $("#mail-host").value = msmtp.host || $("#mail-host").value;
     $("#mail-port").value = msmtp.port || $("#mail-port").value;
     $("#mail-security").value = msmtp.security || $("#mail-security").value;
@@ -1088,7 +1104,7 @@ async function loadMail() {
   }
   const mailer = data.mailer || {};
   const conflicts = mailer.conflicts || [];
-  const transport = $("#mail-transport");
+  const transportLine = $("#mail-transport");
   let transportText = mailer.sendmail
     ? `sendmail provided by ${mailer.sendmail_provider} (${mailer.sendmail})`
     : "no sendmail provider found";
@@ -1096,18 +1112,19 @@ async function loadMail() {
   if (mailer.msmtp_client && !conflicts.length) {
     transportText += " · msmtp client present (not used for delivery, left untouched)";
   }
-  transport.textContent = transportText;
+  transportLine.textContent = transportText;
   $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
   let summary = "No relay configured yet.";
   if (data.relayhost) {
-    summary =
-      `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`;
+    summary = transport === "msmtp"
+      ? `msmtp hands mail to ${data.relayhost}, sending as ${data.from_address || "-"}.`
+      : `Mail is relayed via ${data.relayhost}, sending as ${data.from_address || "-"} (sender domain ${data.myorigin || "-"}).`;
     if (data.envelope_sender) {
       summary += data.envelope_sender === data.from_address
         ? ` Envelope sender (MAIL FROM): ${data.envelope_sender}.`
         : ` The relay account owns the envelope sender, so messages leave with MAIL FROM ${data.envelope_sender} and From: ${data.from_address || "-"} - your mail server would reject the From: address as a sender it does not own.`;
     }
-    if (data.credentials_set && !data.sender_canonical_set) {
+    if (transport === "postfix" && data.credentials_set && !data.sender_canonical_set) {
       summary += " Save these settings to pin the envelope sender to the relay account.";
     }
   }
@@ -1125,6 +1142,7 @@ $("#mail-form").addEventListener("submit", async (event) => {
     from_address: $("#mail-from").value.trim(),
     report_to: $("#mail-report-to").value.trim(),
     report_mode: $("#mail-report-mode").value,
+    transport: $("#mail-transport-select").value,
   };
   try {
     await api("/mail", { method: "POST", body });
@@ -1146,17 +1164,20 @@ $("#mail-test-form").addEventListener("submit", async (event) => {
   } catch (err) { toast(err.message, "error"); }
 });
 
+$("#mail-transport-select").addEventListener("change", mailInstallButton);
+
 $("#mail-install").addEventListener("click", async () => {
+  const chosen = $("#mail-transport-select").value;
   try {
-    const job = await api("/mail/install", { method: "POST" });
-    toast("Installing postfix…", "success");
+    const job = await api(`/mail/install?transport=${chosen}`, { method: "POST" });
+    toast(`Installing ${MAIL_PACKAGES[chosen]}…`, "success");
     openJob(job.id);
   } catch (err) { toast(err.message, "error"); }
 });
 
 $("#mail-remove-conflicts").addEventListener("click", async () => {
   if (!window.confirm(
-    "Remove the conflicting mail transfer agent(s)? Postfix (or its installer) will handle mail delivery afterwards. Their config files are kept.",
+    `Remove the conflicting mail transfer agent(s)? ${(state.mailData && state.mailData.transport) === "msmtp" ? "msmtp" : "Postfix"} handles mail delivery afterwards. Their config files are kept.`,
   )) return;
   try {
     const job = await api("/mail/remove-conflicts", { method: "POST" });

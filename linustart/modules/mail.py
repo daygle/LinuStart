@@ -22,6 +22,7 @@ from typing import Dict, List, Mapping, Optional, Sequence
 
 from ..paths import (
     MAIL_STATE_FILE,
+    MSMTP_PASSWORD_FILE,
     MSMTPRC,
     POSTFIX_MAIN_CF,
     POSTFIX_SASL_PASSWD,
@@ -42,6 +43,12 @@ LOCAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}$")
 MAIN_CF_LINE_RE = re.compile(r"^(?P<key>[A-Za-z0-9_]+)\s*=\s*(?P<value>.*)$")
 
 SECURITIES = ("starttls", "ssl", "none")
+# Postfix: a local relay daemon with a queue. msmtp: a sendmail replacement
+# that hands each message straight to the relay (no queue, no daemon).
+TRANSPORTS = ("postfix", "msmtp")
+TRANSPORT_PACKAGE = {"postfix": "postfix", "msmtp": "msmtp-mta"}
+MSMTP_PASSWORD_MODE = 0o600
+MSMTPRC_MODE = 0o600
 REPORT_MODES = ("always", "only-on-error", "on-change")
 
 
@@ -115,22 +122,30 @@ def known_mailers(installed: Sequence[str]) -> List[str]:
     return sorted(set(installed) & set(MAILER_PACKAGES))
 
 
-def conflicting_mailers(installed: Sequence[str]) -> List[str]:
-    """Installed MTAs that compete with Postfix for the sendmail role."""
+def valid_transport(transport: str) -> str:
+    if transport not in TRANSPORTS:
+        raise ValueError(f"transport must be one of {TRANSPORTS}")
+    return transport
+
+
+def conflicting_mailers(installed: Sequence[str], transport: str = "postfix") -> List[str]:
+    """Installed MTAs that compete with the chosen transport for the sendmail role."""
+    own = TRANSPORT_PACKAGE[valid_transport(transport)]
     return [
         name
         for name in known_mailers(installed)
-        if MAILER_PACKAGES[name]["kind"] == "mta" and not MAILER_PACKAGES[name]["supported"]
+        if MAILER_PACKAGES[name]["kind"] == "mta" and name != own
     ]
 
 
-def remove_conflicting_command(packages: Sequence[str]) -> List[str]:
+def remove_conflicting_command(packages: Sequence[str], transport: str = "postfix") -> List[str]:
     """argv to remove conflicting MTAs (allowlisted names only, configs kept)."""
+    own = TRANSPORT_PACKAGE[valid_transport(transport)]
     names = sorted(set(packages))
     if not names:
         raise ValueError("no conflicting mailers to remove")
     for name in names:
-        if name not in MAILER_PACKAGES or MAILER_PACKAGES[name]["supported"]:
+        if name not in MAILER_PACKAGES or MAILER_PACKAGES[name]["kind"] != "mta" or name == own:
             raise ValueError(f"refusing to remove {name!r}")
     return ["apt-get", "remove", "-y"] + names
 
@@ -143,13 +158,15 @@ async def installed_mailers() -> List[str]:
     return known_mailers(parse_dpkg_status(result.stdout))
 
 
-async def mailer_status() -> Dict[str, object]:
-    """What handles sendmail on this system, and what conflicts with Postfix."""
+async def mailer_status(transport: Optional[str] = None) -> Dict[str, object]:
+    """What handles sendmail on this system, and what conflicts with the transport."""
+    transport = transport or current_transport()
     installed = await installed_mailers()
     sendmail = shutil.which("sendmail")
     return {
         "packages": installed,
-        "conflicts": conflicting_mailers(installed),
+        "transport": transport,
+        "conflicts": conflicting_mailers(installed, transport),
         "sendmail": sendmail or "",
         "sendmail_provider": classify_sendmail_target(os.path.realpath(sendmail)) if sendmail else "none",
         "msmtp_client": "msmtp" in installed,
@@ -464,9 +481,78 @@ def relay_settings(host: str, port: int, security: str, from_address: str) -> Di
 # IO helpers
 # --------------------------------------------------------------------------
 
-def installed() -> bool:
-    """Is Postfix available? (Not installed by default on minimal servers.)"""
+def installed(transport: str = "postfix") -> bool:
+    """Is the transport available? (Neither is installed on minimal servers.)"""
+    if transport == "msmtp":
+        return shutil.which("msmtp") is not None
     return shutil.which("postmap") is not None or POSTFIX_MAIN_CF.exists()
+
+
+def current_transport() -> str:
+    transport = str(_read_state().get("transport") or "postfix")
+    return transport if transport in TRANSPORTS else "postfix"
+
+
+def msmtp_tls(security: str) -> Dict[str, str]:
+    return {
+        "starttls": {"tls": "on", "tls_starttls": "on"},
+        "ssl": {"tls": "on", "tls_starttls": "off"},
+        "none": {"tls": "off", "tls_starttls": "off"},
+    }[security]
+
+
+def build_msmtprc(host: str, port: int, security: str, username: str, from_address: str) -> str:
+    """The /etc/msmtprc the panel manages.
+
+    ``from`` is the envelope sender, pinned to the relay account like the
+    Postfix sender_canonical map; the visible From: header stays whatever
+    the message (unattended-upgrades' Sender) says. The password lives in a
+    separate root-only file read through passwordeval.
+    """
+    if security not in SECURITIES:
+        raise ValueError(f"security must be one of {SECURITIES}")
+    tls = msmtp_tls(security)
+    lines = [
+        "# Managed by LinuStart - changes made here are overwritten from the Email page.",
+        "defaults",
+        "auth           on",
+        f"tls            {tls['tls']}",
+        f"tls_starttls   {tls['tls_starttls']}",
+        "tls_trust_file /etc/ssl/certs/ca-certificates.crt",
+        "syslog         LOG_MAIL",
+        "",
+        "account        linustart",
+        f"host           {host}",
+        f"port           {int(port)}",
+        f"from           {envelope_sender(username, from_address)}",
+        f"user           {username}",
+        f'passwordeval   "cat {logical(MSMTP_PASSWORD_FILE)}"',
+        "",
+        "account default : linustart",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def logical(path) -> str:
+    """A path as it appears on the real system (without LINUSTART_ROOT)."""
+    try:
+        return "/" + path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def stored_password(location: str) -> str:
+    """A password already on file for this relay, from any transport."""
+    panel = read_text(MSMTP_PASSWORD_FILE).strip()
+    if panel:
+        return panel
+    for line in read_text(POSTFIX_SASL_PASSWD).splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            stored = parse_sasl_line(line)
+            credentials = line.strip().split(None, 1)[1] if " " in line.strip() else ""
+            if stored["location"] == location and ":" in credentials:
+                return credentials.split(":", 1)[1]
+    return read_msmtp_password()
 
 
 async def service_active() -> bool:
@@ -487,11 +573,22 @@ def _read_state() -> Dict[str, object]:
 
 async def status() -> Dict[str, object]:
     state = _read_state()
+    transport = current_transport()
     main_cf = parse_main_cf(read_text(POSTFIX_MAIN_CF))
-    sasl_exists = bool(read_text(POSTFIX_SASL_PASSWD).strip())
+    if transport == "msmtp":
+        msmtp = parse_msmtprc(read_text(MSMTPRC))
+        credentials = bool(read_text(MSMTP_PASSWORD_FILE).strip())
+        relayhost = f"{msmtp['host']}:{msmtp.get('port', '587')}" if msmtp.get("host") else ""
+        active: Optional[bool] = None  # msmtp has no daemon
+    else:
+        credentials = bool(read_text(POSTFIX_SASL_PASSWD).strip())
+        relayhost = main_cf.get("relayhost", "")
+        active = await service_active()
     return {
-        "installed": installed(),
-        "service_active": await service_active(),
+        "transport": transport,
+        "transports": list(TRANSPORTS),
+        "installed": installed(transport),
+        "service_active": active,
         "host": state.get("host", ""),
         "port": state.get("port", 587),
         "security": state.get("security", "starttls"),
@@ -503,8 +600,8 @@ async def status() -> Dict[str, object]:
         "sender_canonical_set": bool(read_text(POSTFIX_SENDER_CANONICAL).strip()),
         "report_to": state.get("report_to", ""),
         "report_mode": state.get("report_mode", "only-on-error"),
-        "credentials_set": sasl_exists,
-        "relayhost": main_cf.get("relayhost", ""),
+        "credentials_set": credentials,
+        "relayhost": relayhost,
         "myorigin": main_cf.get("myorigin", ""),
         "securities": list(SECURITIES),
         "report_modes": list(REPORT_MODES),
@@ -520,8 +617,10 @@ async def apply(
     password: Optional[str] = None,
     report_to: str = "",
     report_mode: str = "only-on-error",
+    transport: str = "postfix",
 ) -> Dict[str, object]:
-    """Write the relay configuration and reload Postfix."""
+    """Write the relay configuration for the chosen transport."""
+    valid_transport(transport)
     host = host.strip()
     username = username.strip()
     from_address = from_address.strip()
@@ -541,8 +640,11 @@ async def apply(
     if report_mode not in REPORT_MODES:
         raise ValueError(f"report_mode must be one of {REPORT_MODES}")
     report_to = resolve_report_target(report_to, from_address)
-    if not installed():
-        raise RuntimeError("postfix is not installed")
+    if not installed(transport):
+        raise RuntimeError(f"{TRANSPORT_PACKAGE[transport]} is not installed")
+    if transport == "msmtp":
+        return await _apply_msmtp(host, port, security, username, from_address, password,
+                                  report_to, report_mode)
 
     location = format_relayhost(host, port)
     existing = read_text(POSTFIX_SASL_PASSWD)
@@ -568,7 +670,17 @@ async def apply(
         main_cf = upsert_main_cf(main_cf, key, value)
     write_text(POSTFIX_MAIN_CF, main_cf)
 
+    _save_state("postfix", host, port, security, username, from_address, report_to, report_mode)
+    await apply_report_settings(report_to, report_mode, from_address)
+
+    await run(["systemctl", "reload", "postfix"], check=True)
+    return await status()
+
+
+def _save_state(transport: str, host: str, port: int, security: str, username: str,
+                from_address: str, report_to: str, report_mode: str) -> None:
     state = {
+        "transport": transport,
         "host": host,
         "port": port,
         "security": security,
@@ -579,9 +691,22 @@ async def apply(
     }
     write_text(MAIL_STATE_FILE, json.dumps(state, indent=2) + "\n")
 
-    await apply_report_settings(report_to, report_mode, from_address)
 
-    await run(["systemctl", "reload", "postfix"], check=True)
+async def _apply_msmtp(host: str, port: int, security: str, username: str, from_address: str,
+                       password: Optional[str], report_to: str, report_mode: str) -> Dict[str, object]:
+    # msmtp delivers nothing locally, so a bare mailbox name like "root"
+    # would bounce: reports need a real address here.
+    if not valid_email(report_to):
+        raise ValueError("with msmtp, reports need a full email address (msmtp has no local delivery)")
+    password = password or stored_password(format_relayhost(host, port))
+    if not password:
+        raise ValueError("a password is required for a new SMTP account")
+    if not valid_sasl_password(password):
+        raise ValueError("the SMTP password may not contain line breaks")
+    write_text(MSMTP_PASSWORD_FILE, password + "\n", mode=MSMTP_PASSWORD_MODE)
+    write_text(MSMTPRC, build_msmtprc(host, port, security, username, from_address), mode=MSMTPRC_MODE)
+    _save_state("msmtp", host, port, security, username, from_address, report_to, report_mode)
+    await apply_report_settings(report_to, report_mode, from_address)
     return await status()
 
 
@@ -619,10 +744,14 @@ async def apply_report_settings(
     return state
 
 
-def test_command(from_address: str, recipient: str) -> list:
-    """Queue a test message through the whole local Postfix pipeline."""
+def test_command(from_address: str, recipient: str, transport: str = "postfix") -> list:
+    """Send a test message through the configured sendmail.
+
+    msmtp takes the envelope sender from its config (the relay account);
+    passing -f would override it with an address the relay may refuse.
+    """
     argv = ["sendmail", "-i"]
-    if from_address:
+    if from_address and transport != "msmtp":
         argv += ["-f", from_address]
     argv.append(recipient)
     return argv
