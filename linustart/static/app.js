@@ -209,9 +209,11 @@ async function loadOverview() {
       .map((iface) => `<li><code>${esc(iface.name)}</code> ${esc((iface.addresses || []).join(", ") || "no address")}</li>`)
       .join("");
     const route = net.runtime.default_route;
+    const route6 = net.runtime.default_route6;
     $("#overview-addresses").innerHTML = `
       <ul class="list">${rows || "<li class='muted'>No interfaces found</li>"}</ul>
-      <div class="muted">Default route: ${route ? `${esc(route.via || "")} via ${esc(route.dev || "")}` : "none"}</div>`;
+      <div class="muted">Default route: ${route ? `${esc(route.via || "")} via ${esc(route.dev || "")}` : "none"}
+        ${route6 ? ` · IPv6: ${esc(route6.via || "")} via ${esc(route6.dev || "")}` : ""}</div>`;
   } catch (err) {
     $("#overview-addresses").innerHTML = `<div class="muted">${esc(err.message)}</div>`;
   }
@@ -227,7 +229,7 @@ async function loadNetwork() {
     <tr>
       <td><code>${esc(iface.name)}</code></td>
       <td><span class="badge ${iface.state === "up" ? "ok" : "muted"}">${esc(iface.state)}</span></td>
-      <td>${esc((iface.addresses || []).join(", "))}</td>
+      <td>${esc([...(iface.addresses || []), ...(iface.addresses6 || [])].join(", "))}</td>
       <td class="muted">${esc(iface.mac || "")}</td>
     </tr>`).join("");
   $("#net-runtime-table").innerHTML = `
@@ -250,9 +252,14 @@ async function loadNetwork() {
          still applies to this interface. Saving this interface switches DHCP off in every
          file that has it.</p>`
       : "";
+    const v6 = iface.ipv6 || null;
+    const v6method = v6 ? v6.method : "";
+    const kind = iface.kind && iface.kind !== "ethernets" && iface.kind !== "ethernet"
+      ? ` <span class="badge muted">${esc(String(iface.kind).replace(/s$/, ""))}</span>` : "";
+    const inactive = iface.active === false ? ' <span class="badge warn">inactive</span>' : "";
     return `
     <div class="card">
-      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span></h2>
+      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}</h2>
       ${duplicated}
       ${dhcpElsewhere}
       <form class="form" data-iface="${esc(iface.name)}">
@@ -270,7 +277,22 @@ async function loadNetwork() {
           <input type="text" name="gateway" value="${esc(iface.gateway || "")}" placeholder="192.168.1.1">
         </label>
         <label>DNS servers (comma separated)
-          <input type="text" name="dns" value="${esc((iface.dns || []).join(", "))}" placeholder="1.1.1.1, 8.8.8.8">
+          <input type="text" name="dns" value="${esc((iface.dns || []).join(", "))}" placeholder="1.1.1.1, 2606:4700:4700::1111">
+        </label>
+        <label>IPv6
+          <select name="ipv6_method">
+            <option value="" selected>Leave unchanged${v6method ? ` (currently ${esc(v6method)})` : ""}</option>
+            <option value="none">Not configured</option>
+            <option value="auto">Automatic (SLAAC)</option>
+            <option value="dhcp">DHCPv6</option>
+            <option value="static">Static</option>
+          </select>
+        </label>
+        <label>IPv6 address (CIDR)
+          <input type="text" name="ipv6_address" value="${esc((v6 && v6.address) || "")}" placeholder="2001:db8::10/64">
+        </label>
+        <label>IPv6 gateway
+          <input type="text" name="ipv6_gateway" value="${esc((v6 && v6.gateway) || "")}" placeholder="fe80::1">
         </label>
         <button class="btn btn-primary" type="submit">Apply (with 90s Auto-Revert)</button>
       </form>
@@ -289,6 +311,11 @@ async function loadNetwork() {
         gateway: el.gateway.value.trim() || null,
         dns: el.dns.value.split(",").map((s) => s.trim()).filter(Boolean),
       };
+      if (el.ipv6_method.value) {
+        body.ipv6_method = el.ipv6_method.value;
+        body.ipv6_address = el.ipv6_address.value.trim() || null;
+        body.ipv6_gateway = el.ipv6_gateway.value.trim() || null;
+      }
       try {
         const result = await api(`/network/interfaces/${encodeURIComponent(name)}`, { method: "POST", body });
         toast(`Changes applied to ${name}`, "success");

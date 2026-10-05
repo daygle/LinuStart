@@ -60,6 +60,10 @@ class InterfaceBody(BaseModel):
     address: Optional[str] = None
     gateway: Optional[str] = None
     dns: List[str] = Field(default_factory=list)
+    # None leaves IPv6 exactly as it is
+    ipv6_method: Optional[str] = Field(default=None, pattern="^(none|auto|dhcp|static)$")
+    ipv6_address: Optional[str] = None
+    ipv6_gateway: Optional[str] = None
 
 
 class UpdatesBody(BaseModel):
@@ -350,8 +354,9 @@ def build_router(
         files = network_mod.managed_config_files(backend)
         snapshots = snapshot_files(files)
         try:
+            ipv6 = network_mod.validate_ipv6(body.ipv6_method, body.ipv6_address, body.ipv6_gateway)
             await network_mod.write_interface_config(
-                backend, name, body.method, body.address, body.gateway, body.dns
+                backend, name, body.method, body.address, body.gateway, body.dns, ipv6
             )
             commands = await network_mod.apply_backend(backend, name)
         except ValueError as exc:
@@ -374,7 +379,8 @@ def build_router(
         )
         audit.record(
             "network.configure",
-            f"{name}: {body.method} {body.address or ''} via {body.gateway or '-'}".strip(),
+            f"{name}: {body.method} {body.address or ''} via {body.gateway or '-'}".strip()
+            + (f"; ipv6 {body.ipv6_method} {body.ipv6_address or ''}".rstrip() if body.ipv6_method else ""),
         )
         return {"ok": True, "session": session.to_dict(), "applied": commands}
 

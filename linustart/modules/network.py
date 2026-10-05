@@ -65,6 +65,51 @@ def validate_dns(servers: Optional[Sequence[str]]) -> List[str]:
     return cleaned
 
 
+IPV6_METHODS = ("none", "auto", "dhcp", "static")
+
+
+def validate_ipv6(
+    method: Optional[str], address: Optional[str] = None, gateway: Optional[str] = None
+) -> Optional[Dict[str, Optional[str]]]:
+    """Normalize an IPv6 request; None means "leave IPv6 exactly as it is".
+
+    ``none`` = not configured by the panel's backend, ``auto`` = SLAAC
+    (router advertisements), ``dhcp`` = DHCPv6, ``static`` = fixed address.
+    """
+    if method is None or method == "":
+        return None
+    method = method.strip().lower()
+    if method not in IPV6_METHODS:
+        raise ValueError(f"ipv6 method must be one of: {', '.join(IPV6_METHODS)}")
+    result: Dict[str, Optional[str]] = {"method": method, "address": None, "gateway": None}
+    if method == "static":
+        if not address:
+            raise ValueError("a static IPv6 configuration needs an address")
+        try:
+            iface = ipaddress.ip_interface(address.strip())
+        except ValueError:
+            raise ValueError(f"not a valid IPv6 address: {address!r}") from None
+        if iface.version != 6:
+            raise ValueError(f"not an IPv6 address: {address!r}")
+        result["address"] = f"{iface.ip}/{iface.network.prefixlen}"
+        if gateway:
+            try:
+                gw = ipaddress.ip_address(gateway.strip())
+            except ValueError:
+                raise ValueError(f"not a valid IPv6 gateway: {gateway!r}") from None
+            if gw.version != 6:
+                raise ValueError(f"not an IPv6 gateway: {gateway!r}")
+            result["gateway"] = str(gw)
+    return result
+
+
+def _require_v4(address: Optional[str], gateway: Optional[str]) -> None:
+    if address and ipaddress.ip_interface(address.strip()).version != 4:
+        raise ValueError(f"the IPv4 address must be IPv4 (set IPv6 below): {address!r}")
+    if gateway and ipaddress.ip_address(gateway.strip()).version != 4:
+        raise ValueError(f"the IPv4 gateway must be IPv4: {gateway!r}")
+
+
 def split_cidr(cidr: str) -> Tuple[str, str]:
     """'10.0.0.5/24' -> ('10.0.0.5', '255.255.255.0')."""
     iface = ipaddress.ip_interface(cidr.strip())
@@ -132,12 +177,16 @@ def stanza_counts(text: str) -> Dict[str, int]:
     return counts
 
 
-def read_ifupdown_interface(text: str, name: str) -> Optional[Dict[str, object]]:
-    """Extract the managed settings of one interface stanza."""
+def read_ifupdown_interface(text: str, name: str, family_wanted: str = "inet") -> Optional[Dict[str, object]]:
+    """Extract the managed settings of one interface stanza.
+
+    For ``inet`` the result also carries ``ipv6`` (the ``inet6`` stanza's
+    method/address/gateway, or None when there is none).
+    """
     lines = text.splitlines()
     for key, (start, end) in _stanza_spans(lines).items():
         stanza_name, family = key.split(" ", 1)
-        if stanza_name != name or family != "inet":
+        if stanza_name != name or family != family_wanted:
             continue
         header = IFACE_HEADER_RE.match(lines[start])
         assert header is not None
@@ -180,6 +229,11 @@ def read_ifupdown_interface(text: str, name: str) -> Optional[Dict[str, object]]
             else:
                 info["address"] = raw_address
         info["dns"] = dns
+        if family_wanted == "inet":
+            v6 = read_ifupdown_interface(text, name, "inet6")
+            info["ipv6"] = (
+                {"method": v6["method"], "address": v6["address"], "gateway": v6["gateway"]} if v6 else None
+            )
         return info
     return None
 
@@ -193,23 +247,28 @@ def update_ifupdown_interface(
     dns: Optional[Sequence[str]] = None,
     *,
     ensure_auto: bool = True,
+    family: str = "inet",
 ) -> str:
     """Return new /etc/network/interfaces content for *name*.
 
     Everything outside the managed keys is preserved verbatim. With
     *ensure_auto* off no ``auto`` line is added - the caller knows another
-    sourced file already brings the interface up.
+    sourced file already brings the interface up. ``family="inet6"`` edits
+    the IPv6 stanza instead (methods static/dhcp/auto/manual).
     """
-    if method not in ("static", "dhcp", "manual"):
+    allowed = ("static", "dhcp", "manual") if family == "inet" else ("static", "dhcp", "auto", "manual")
+    if family not in ("inet", "inet6") or method not in allowed:
         raise ValueError(f"unsupported method: {method!r}")
     name = validate_interface_name(name)
     if method == "static":
         if not address:
             raise ValueError("a static interface needs an address")
         split_cidr(address)  # validate
-    if gateway:
+    if family == "inet":
+        _require_v4(address if method == "static" else None, gateway)
+    elif gateway:
         ipaddress.ip_address(gateway)
-    dns = validate_dns(dns)
+    dns = validate_dns(dns) if family == "inet" else []
 
     lines = text.splitlines()
     # Every stanza for this interface, not just the first: a hand-edited file
@@ -217,13 +276,13 @@ def update_ifupdown_interface(
     # and ifupdown brings the interface up both ways. Rewriting only the first
     # would leave DHCP running next to the address we just set.
     occurrences = [
-        (start, end) for key, start, end in _all_stanza_spans(lines) if key == f"{name} inet"
+        (start, end) for key, start, end in _all_stanza_spans(lines) if key == f"{name} {family}"
     ]
 
     if not occurrences:
         # Append a fresh stanza.
-        block: List[str] = ([f"auto {name}"] if ensure_auto else []) + [f"iface {name} inet {method}"]
-        block.extend(_render_options(method, address, gateway, dns))
+        block: List[str] = ([f"auto {name}"] if ensure_auto else []) + [f"iface {name} {family} {method}"]
+        block.extend(_render_options(method, address, gateway, dns, family=family))
         prefix = list(lines)
         if prefix and prefix[-1] != "":
             prefix.append("")
@@ -237,10 +296,10 @@ def update_ifupdown_interface(
     # the file's own indentation, which must stay indented: an unindented,
     # non-blank line is what ends a stanza for the parser above.
     body_indent = header.group("indent") or "    "
-    new_lines = [f"iface {name} inet {method}"]
+    new_lines = [f"iface {name} {family} {method}"]
     body = lines[header_index + 1 : end_index]
     kept = [line for line in body if _managed_key(line) is None]
-    options = _render_options(method, address, gateway, dns, indent=body_indent)
+    options = _render_options(method, address, gateway, dns, indent=body_indent, family=family)
     # Keep leading comments/blank lines from the body before managed options.
     leading: List[str] = []
     rest = list(kept)
@@ -278,12 +337,12 @@ def has_auto_line(text: str, name: str) -> bool:
     )
 
 
-def remove_ifupdown_interface(text: str, name: str) -> str:
-    """Drop every ``iface <name> inet`` stanza from *text*; nothing else changes."""
+def remove_ifupdown_interface(text: str, name: str, family: str = "inet") -> str:
+    """Drop every ``iface <name> <family>`` stanza from *text*; nothing else changes."""
     lines = text.splitlines()
     drop: Set[int] = set()
     for key, start, end in _all_stanza_spans(lines):
-        if key == f"{name} inet":
+        if key == f"{name} {family}":
             drop.update(range(start, end))
     if not drop:
         return text
@@ -299,6 +358,7 @@ def apply_ifupdown_across(
     address: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[Sequence[str]] = None,
+    ipv6: Optional[Mapping[str, Optional[str]]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Configure *name* across the interfaces file and everything it sources.
 
@@ -324,6 +384,19 @@ def apply_ifupdown_across(
     )
     for source in holders[1:]:
         updated[source] = remove_ifupdown_interface(documents[source], name)
+    if ipv6 is not None:
+        # The inet6 stanza lives next to the inet one; copies elsewhere would
+        # apply too, so they go.
+        for source in updated:
+            if source != target:
+                updated[source] = remove_ifupdown_interface(updated[source], name, "inet6")
+        if ipv6["method"] == "none":
+            updated[target] = remove_ifupdown_interface(updated[target], name, "inet6")
+        else:
+            updated[target] = update_ifupdown_interface(
+                updated[target], name, str(ipv6["method"]), ipv6.get("address"), ipv6.get("gateway"),
+                ensure_auto=False, family="inet6",
+            )
     changed = [source for source in updated if updated[source] != documents[source]]
     return updated, changed
 
@@ -344,9 +417,15 @@ def _render_options(
     gateway: Optional[str],
     dns: Sequence[str],
     indent: str = "    ",
+    family: str = "inet",
 ) -> List[str]:
     options: List[str] = []
-    if method == "static" and address:
+    if method == "static" and address and family == "inet6":
+        # ifupdown takes the prefix length on the address line for inet6
+        options.append(f"{indent}address {address}")
+        if gateway:
+            options.append(f"{indent}gateway {gateway}")
+    elif method == "static" and address:
         ip, netmask = split_cidr(address)
         options.append(f"{indent}address {ip}")
         options.append(f"{indent}netmask {netmask}")
@@ -361,29 +440,106 @@ def _render_options(
 # netplan - pure dict handling
 # --------------------------------------------------------------------------
 
+# Device sections whose members take addresses, routes and DHCP the same way.
+NETPLAN_SECTIONS = ("ethernets", "bonds", "bridges", "vlans", "wifis")
+NETPLAN_DHCP_KEYS = ("dhcp4", "dhcp6")
+V4_DEFAULTS = ("default", "0.0.0.0/0")
+V6_DEFAULTS = ("default", "::/0")
+
+
+def _addr_str(entry: object) -> str:
+    """netplan addresses are strings, or one-key maps with per-address options."""
+    if isinstance(entry, dict) and entry:
+        return str(next(iter(entry)))
+    return str(entry)
+
+
+def _addr_version(entry: object) -> Optional[int]:
+    try:
+        return ipaddress.ip_interface(_addr_str(entry)).version
+    except ValueError:
+        return None
+
+
+def _default_route_version(route: object) -> Optional[int]:
+    """4 or 6 for a default route (by its destination or gateway), else None."""
+    if not isinstance(route, dict):
+        return None
+    to = str(route.get("to", "")).lower()
+    if to not in V4_DEFAULTS and to not in V6_DEFAULTS:
+        return None
+    if to == "0.0.0.0/0":
+        return 4
+    if to == "::/0":
+        return 6
+    try:
+        return ipaddress.ip_address(str(route.get("via", ""))).version
+    except ValueError:
+        return None
+
+
+def netplan_devices(data: Mapping[str, object]):
+    """Yield ``(section, name, node)`` for every device in a netplan document."""
+    network = data.get("network") if isinstance(data, Mapping) else None
+    if not isinstance(network, Mapping):
+        return
+    for section in NETPLAN_SECTIONS:
+        devices = network.get(section)
+        if isinstance(devices, dict):
+            for name, node in devices.items():
+                yield section, str(name), node if isinstance(node, dict) else {}
+
+
+def netplan_node(data: Mapping[str, object], name: str) -> Tuple[Optional[str], Optional[Dict[str, object]]]:
+    for section, device, node in netplan_devices(data):
+        if device == name:
+            return section, node
+    return None, None
+
+
+def _netplan_ipv6_state(node: Mapping[str, object]) -> Dict[str, Optional[str]]:
+    addresses = [_addr_str(a) for a in node.get("addresses", []) or [] if _addr_version(a) == 6]
+    gateway = node.get("gateway6")
+    if gateway is None:
+        for route in node.get("routes", []) or []:
+            if _default_route_version(route) == 6:
+                gateway = route.get("via")  # type: ignore[union-attr]
+    if addresses:
+        method = "static"
+    elif node.get("dhcp6"):
+        method = "dhcp"
+    elif node.get("accept-ra") is False:
+        method = "none"
+    else:
+        method = "auto"  # networkd follows router advertisements by default
+    return {
+        "method": method,
+        "address": addresses[0] if addresses else None,
+        "gateway": str(gateway) if gateway else None,
+    }
+
+
 def read_netplan_interfaces(data: Dict[str, object]) -> List[Dict[str, object]]:
-    network = data.get("network") if isinstance(data, dict) else None
-    ethernets = network.get("ethernets") if isinstance(network, dict) else None
-    if not isinstance(ethernets, dict):
-        return []
     result: List[Dict[str, object]] = []
-    for name, node in sorted(ethernets.items()):
-        node = node if isinstance(node, dict) else {}
-        addresses = [str(a) for a in node.get("addresses", []) or []]
+    devices = sorted(netplan_devices(data), key=lambda item: (NETPLAN_SECTIONS.index(item[0]), item[1]))
+    for section, name, node in devices:
+        addresses = [_addr_str(a) for a in node.get("addresses", []) or [] if _addr_version(a) == 4]
         nameservers = node.get("nameservers") or {}
         dns = [str(a) for a in nameservers.get("addresses", [])] if isinstance(nameservers, dict) else []
         gateway = node.get("gateway4")
         if gateway is None:
             for route in node.get("routes", []) or []:
-                if isinstance(route, dict) and str(route.get("to", "")).lower() in ("default", "0.0.0.0/0"):
+                if _default_route_version(route) == 4:
                     gateway = route.get("via")
         result.append(
             {
                 "name": name,
+                "kind": section,
                 "method": "dhcp" if node.get("dhcp4") else ("static" if addresses else "manual"),
                 "address": addresses[0] if addresses else None,
                 "gateway": str(gateway) if gateway else None,
                 "dns": dns,
+                "ipv6": _netplan_ipv6_state(node),
                 "auto": True,
                 "managed": True,
             }
@@ -391,20 +547,12 @@ def read_netplan_interfaces(data: Dict[str, object]) -> List[Dict[str, object]]:
     return result
 
 
-NETPLAN_DHCP_KEYS = ("dhcp4", "dhcp6")
-
-
-def netplan_ethernets(data: Mapping[str, object]) -> Dict[str, object]:
-    """The 'network.ethernets' mapping of a netplan document ('' if absent)."""
-    network = data.get("network") if isinstance(data, Mapping) else None
-    ethernets = network.get("ethernets") if isinstance(network, Mapping) else None
-    return ethernets if isinstance(ethernets, dict) else {}
-
-
 def netplan_dhcp_sources(
-    documents: Mapping[str, Mapping[str, object]], name: str
+    documents: Mapping[str, Mapping[str, object]],
+    name: str,
+    keys: Sequence[str] = NETPLAN_DHCP_KEYS,
 ) -> List[str]:
-    """Every document that enables DHCP on *name*.
+    """Every document that enables DHCP (any of *keys*) on *name*.
 
     netplan merges all the files in /etc/netplan, so a `dhcp4: true` in one
     file still applies after a static address is written into another one.
@@ -413,26 +561,26 @@ def netplan_dhcp_sources(
     """
     sources: List[str] = []
     for source in sorted(documents):
-        node = netplan_ethernets(documents[source]).get(name)
-        if isinstance(node, dict) and any(node.get(key) for key in NETPLAN_DHCP_KEYS):
+        _section, node = netplan_node(documents[source], name)
+        if isinstance(node, dict) and any(node.get(key) for key in keys):
             sources.append(source)
     return sources
 
 
 def clear_netplan_dhcp(
-    data: Mapping[str, object], name: str
+    data: Mapping[str, object], name: str, keys: Sequence[str] = NETPLAN_DHCP_KEYS
 ) -> Tuple[Dict[str, object], bool]:
-    """A copy of *data* with DHCP switched off for *name*, plus whether it changed.
+    """A copy of *data* with DHCP (*keys*) switched off for *name*, plus whether it changed.
 
     Only the DHCP keys are touched: another file's addresses, routes and
     nameservers belong to whoever wrote them and must survive.
     """
-    node = netplan_ethernets(data).get(name)
-    if not isinstance(node, dict) or not any(key in node for key in NETPLAN_DHCP_KEYS):
+    section, node = netplan_node(data, name)
+    if section is None or not isinstance(node, dict) or not any(node.get(key) for key in keys):
         return dict(data), False
     updated = copy.deepcopy(dict(data))
-    ethernets = updated.setdefault("network", {}).setdefault("ethernets", {})  # type: ignore[union-attr]
-    ethernets[name] = {**node, **{key: False for key in NETPLAN_DHCP_KEYS if key in node}}
+    devices = updated["network"][section]  # type: ignore[index]
+    devices[name] = {**node, **{key: False for key in keys if key in node}}
     return updated, True
 
 
@@ -444,8 +592,9 @@ def apply_netplan_across(
     address: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[Sequence[str]] = None,
+    ipv6: Optional[Mapping[str, Optional[str]]] = None,
 ) -> Tuple[Dict[str, Dict[str, object]], List[str]]:
-    """Set *name* to *method* in *target* and clear DHCP from every other file.
+    """Set *name* to *method* in *target* and clear conflicting DHCP everywhere.
 
     Returns the updated documents and the sources that actually changed, so
     only those are rewritten - a netplan directory is full of files the panel
@@ -457,23 +606,26 @@ def apply_netplan_across(
         source: copy.deepcopy(data) for source, data in documents.items()
     }
     updated[target] = update_netplan_interface(
-        updated[target], name, method, address, gateway, dns
+        updated[target], name, method, address, gateway, dns, ipv6=ipv6
     )
     changed = [target]
-    if method == "dhcp":
-        # The user asked for DHCP: leave every other file's DHCP exactly as it
-        # is. Clearing it here would turn DHCP off in the file that had it on
-        # while switching it on in the one we are writing.
+    # Which DHCP flags must be off in every file. Asking for DHCP leaves the
+    # other files' DHCP exactly as it is (clearing it would turn DHCP off in
+    # the file that had it on). Without an explicit IPv6 choice a static
+    # address also ends DHCPv6, as it always has: a file configured with
+    # dhcp6 would otherwise keep its lease next to the address.
+    clear: List[str] = []
+    if method != "dhcp":
+        clear.append("dhcp4")
+    if (ipv6 is None and method != "dhcp") or (ipv6 is not None and ipv6.get("method") != "dhcp"):
+        clear.append("dhcp6")
+    if not clear:
         return updated, changed
-    # DHCP has to be off in every file, not just this one. The target is
-    # cleared here too because update_netplan_interface only ever touches
-    # dhcp4 - a file configured with dhcp6 would otherwise keep its lease.
-    cleared, _rewritten = clear_netplan_dhcp(updated[target], name)
-    updated[target] = cleared
-    for source in netplan_dhcp_sources(updated, name):
+    updated[target], _rewritten = clear_netplan_dhcp(updated[target], name, clear)
+    for source in netplan_dhcp_sources(updated, name, clear):
         if source == target:
             continue
-        updated[source], rewritten = clear_netplan_dhcp(updated[source], name)
+        updated[source], rewritten = clear_netplan_dhcp(updated[source], name, clear)
         if rewritten:
             changed.append(source)
     return updated, changed
@@ -486,8 +638,15 @@ def update_netplan_interface(
     address: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[Sequence[str]] = None,
+    *,
+    ipv6: Optional[Mapping[str, Optional[str]]] = None,
 ) -> Dict[str, object]:
-    """Return updated netplan data for one interface (pure, non-mutating)."""
+    """Return updated netplan data for one interface (pure, non-mutating).
+
+    The device is edited in whichever section holds it (a bond, a VLAN, ...);
+    a new one goes under ``ethernets``. IPv4 and IPv6 are handled per family,
+    so setting one never drops the other's addresses or default route.
+    """
     if yaml is None:
         raise RuntimeError("netplan support requires the PyYAML package")
     name = validate_interface_name(name)
@@ -497,36 +656,69 @@ def update_netplan_interface(
     if not isinstance(network, dict):
         raise ValueError("invalid netplan document: 'network' must be a mapping")
     network.setdefault("version", 2)
-    ethernets = network.setdefault("ethernets", {})
-    if not isinstance(ethernets, dict):
-        raise ValueError("invalid netplan document: 'ethernets' must be a mapping")
-    node = ethernets.get(name)
-    node = node if isinstance(node, dict) else {}
+    section, _existing = netplan_node(data, name)
+    section = section or "ethernets"
+    devices = network.setdefault(section, {})
+    if not isinstance(devices, dict):
+        raise ValueError(f"invalid netplan document: '{section}' must be a mapping")
+    node = devices.get(name)
+    node = copy.deepcopy(node) if isinstance(node, dict) else {}
 
-    if method == "dhcp":
-        node.pop("addresses", None)
-        node["dhcp4"] = True
-        node.pop("gateway4", None)
-        node.pop("routes", None)
-    elif method == "static":
+    addresses = list(node.get("addresses", []) or [])
+    routes = list(node.get("routes", []) or [])
+
+    if method not in ("dhcp", "static"):
+        raise ValueError(f"unsupported netplan method: {method!r}")
+    if method == "static":
         if not address:
             raise ValueError("a static interface needs an address")
         split_cidr(address)
-        node["dhcp4"] = False
-        node["addresses"] = [address]
-        node.pop("gateway4", None)
-        if gateway:
-            ipaddress.ip_address(gateway)
-            node["routes"] = [{"to": "default", "via": gateway}]
-        else:
-            node.pop("routes", None)
+    _require_v4(address if method == "static" else None, gateway)
+    addresses = [a for a in addresses if _addr_version(a) != 4]
+    routes = [r for r in routes if _default_route_version(r) != 4]
+    node.pop("gateway4", None)
+    if method == "dhcp":
+        node["dhcp4"] = True
     else:
-        raise ValueError(f"unsupported netplan method: {method!r}")
+        node["dhcp4"] = False
+        addresses.insert(0, address)
+        if gateway:
+            routes.append({"to": "default", "via": gateway})
+
+    if ipv6 is not None:
+        addresses = [a for a in addresses if _addr_version(a) != 6]
+        routes = [r for r in routes if _default_route_version(r) != 6]
+        node.pop("gateway6", None)
+        v6 = ipv6.get("method")
+        if v6 == "dhcp":
+            node["dhcp6"] = True
+            node.pop("accept-ra", None)
+        else:
+            if "dhcp6" in node or v6 != "auto":
+                node["dhcp6"] = False
+            if v6 == "auto":
+                node["accept-ra"] = True
+            else:
+                # static and none: no SLAAC addresses appearing next to them
+                node["accept-ra"] = False
+            if v6 == "static":
+                addresses.append(ipv6["address"])
+                if ipv6.get("gateway"):
+                    routes.append({"to": "::/0", "via": ipv6["gateway"]})
+
+    if addresses:
+        node["addresses"] = addresses
+    else:
+        node.pop("addresses", None)
+    if routes:
+        node["routes"] = routes
+    else:
+        node.pop("routes", None)
     if dns:
         node["nameservers"] = {"addresses": list(dns)}
     else:
         node.pop("nameservers", None)
-    ethernets[name] = node
+    devices[name] = node
     return data
 
 
@@ -596,6 +788,76 @@ def managed_config_files(backend: str) -> List:
     return []
 
 
+NM_TYPES = {
+    "ethernet": "ethernet", "802-3-ethernet": "ethernet",
+    "wifi": "wifi", "802-11-wireless": "wifi",
+    "bond": "bond", "bridge": "bridge", "vlan": "vlan",
+}
+NM_V6_TO_PANEL = {"auto": "auto", "dhcp": "dhcp", "manual": "static", "ignore": "none", "disabled": "none"}
+NM_V6_FROM_PANEL = {"auto": "auto", "dhcp": "dhcp", "static": "manual", "none": "ignore"}
+
+
+def nm_split(line: str) -> List[str]:
+    """Split one ``nmcli -t`` line on unescaped ':' and undo the escaping.
+
+    Terse output escapes ':' and '\\' inside values, which matters as soon
+    as a value is an IPv6 address (``2001\\:db8\\:\\:5/64``).
+    """
+    fields: List[str] = []
+    current: List[str] = []
+    chars = iter(line)
+    for char in chars:
+        if char == "\\":
+            current.append(next(chars, ""))
+        elif char == ":":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    fields.append("".join(current))
+    return fields
+
+
+def parse_nm_settings(text: str) -> Dict[str, str]:
+    """``nmcli -t con show <id>`` -> {property: value}."""
+    settings: Dict[str, str] = {}
+    for line in text.splitlines():
+        parts = nm_split(line)
+        if len(parts) >= 2:
+            settings[parts[0].strip()] = ":".join(parts[1:]).strip()
+    return settings
+
+
+def _nm_list(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip() and item.strip() != "--"]
+
+
+def nm_interface_info(con_name: str, device: str, kind: str, settings: Mapping[str, str]) -> Dict[str, object]:
+    addresses = _nm_list(settings.get("ipv4.addresses", ""))
+    dns = _nm_list(settings.get("ipv4.dns", "")) + _nm_list(settings.get("ipv6.dns", ""))
+    v6_addresses = _nm_list(settings.get("ipv6.addresses", ""))
+    v6_gateway = settings.get("ipv6.gateway", "")
+    gateway = settings.get("ipv4.gateway", "")
+    return {
+        # an inactive connection has no device yet; it names its interface
+        "name": device or settings.get("connection.interface-name", "") or con_name,
+        "connection": con_name,
+        "kind": kind,
+        "active": bool(device),
+        "method": "dhcp" if settings.get("ipv4.method") in ("auto", "shared") else "static",
+        "address": addresses[0] if addresses else None,
+        "gateway": gateway if gateway and gateway != "--" else None,
+        "dns": dns,
+        "ipv6": {
+            "method": NM_V6_TO_PANEL.get(settings.get("ipv6.method", "auto"), "auto"),
+            "address": v6_addresses[0] if v6_addresses else None,
+            "gateway": v6_gateway if v6_gateway and v6_gateway != "--" else None,
+        },
+        "auto": settings.get("connection.autoconnect", "yes") == "yes",
+        "managed": True,
+    }
+
+
 async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
     backend = backend or await detect_backend()
     if backend == "ifupdown":
@@ -640,33 +902,21 @@ async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
                 interfaces.append(info)
         return {"backend": backend, "interfaces": interfaces}
     if backend == "NetworkManager":
-        listing = await run(["nmcli", "-t", "-f", "NAME,DEVICE,TYPE", "con", "show", "--active"])
-        interfaces: List[Dict[str, object]] = []
+        # Every saved connection, not just the active ones: a connection that
+        # is down right now is still one the operator may need to fix.
+        listing = await run(["nmcli", "-t", "-f", "NAME,DEVICE,TYPE", "con", "show"])
+        rows = []
         for line in listing.stdout.splitlines():
-            parts = line.split(":")
-            if len(parts) < 3 or parts[2] not in ("ethernet", "wifi", "802-3-ethernet", "802-11-wireless"):
-                continue
-            con_name, device = parts[0], parts[1]
-            show = await run(["nmcli", "-t", "con", "show", con_name])
-            settings: Dict[str, str] = {}
-            for line2 in show.stdout.splitlines():
-                key, sep, value = line2.partition(":")
-                if sep:
-                    settings[key.strip()] = value.strip()
-            addresses = [a for a in settings.get("ipv4.addresses", "").split(",") if a]
-            dns = [d for d in settings.get("ipv4.dns", "").split(",") if d]
-            interfaces.append(
-                {
-                    "name": device,
-                    "connection": con_name,
-                    "method": "dhcp" if settings.get("ipv4.method") in ("auto", "shared") else "static",
-                    "address": addresses[0] if addresses else None,
-                    "gateway": settings.get("ipv4.gateway") or None,
-                    "dns": dns,
-                    "auto": True,
-                    "managed": True,
-                }
-            )
+            parts = nm_split(line)
+            if len(parts) >= 3 and parts[2] in NM_TYPES:
+                rows.append((parts[0], parts[1], NM_TYPES[parts[2]]))
+        shows = await asyncio.gather(*(run(["nmcli", "-t", "con", "show", con]) for con, _d, _k in rows))
+        interfaces: List[Dict[str, object]] = [
+            nm_interface_info(con, device, kind, parse_nm_settings(show.stdout))
+            for (con, device, kind), show in zip(rows, shows)
+        ]
+        # active connections first, then by name
+        interfaces.sort(key=lambda info: (not info["active"], str(info["name"])))
         return {"backend": backend, "interfaces": interfaces}
     raise ValueError(f"unknown backend: {backend!r}")
 
@@ -678,13 +928,16 @@ async def write_interface_config(
     address: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[Sequence[str]] = None,
+    ipv6: Optional[Mapping[str, Optional[str]]] = None,
 ) -> None:
+    """Write the configuration; *ipv6* (from :func:`validate_ipv6`) or None
+    to leave IPv6 exactly as it is."""
     name = validate_interface_name(name)
     dns = validate_dns(dns)
     if backend == "ifupdown":
         documents = {str(path): read_text(path) for path in ifupdown_files()}
         updated, changed = apply_ifupdown_across(
-            documents, str(INTERFACES_FILE), name, method, address, gateway, dns
+            documents, str(INTERFACES_FILE), name, method, address, gateway, dns, ipv6
         )
         for source in changed:
             write_text(Path(source), updated[source])
@@ -697,14 +950,14 @@ async def write_interface_config(
             raise RuntimeError("no netplan YAML files found in /etc/netplan")
         documents = {str(path): (yaml.safe_load(read_text(path)) or {}) for path in files}
         target = next(
-            (source for source in documents if name in netplan_ethernets(documents[source])),
+            (source for source in documents if netplan_node(documents[source], name)[0]),
             str(files[0]),
         )
         # netplan merges every file in this directory, so writing the address
         # into one of them is not enough: a 'dhcp4: true' in another file
         # still applies, and the interface comes up with both.
         updated, changed = apply_netplan_across(
-            documents, target, name, method, address, gateway, dns
+            documents, target, name, method, address, gateway, dns, ipv6
         )
         for source in changed:
             write_text(
@@ -713,20 +966,12 @@ async def write_interface_config(
             )
         return
     if backend == "NetworkManager":
-        config = await get_config(backend)
-        connection = None
-        for info in config["interfaces"]:  # type: ignore[index]
-            if info.get("name") == name:
-                connection = info.get("connection")
-                break
-        if not connection:
-            raise RuntimeError(f"no NetworkManager connection found for {name}")
+        connection = await nm_connection_for(name)
         if method == "static":
             if not address:
                 raise ValueError("a static interface needs an address")
             split_cidr(address)
-            if gateway:
-                ipaddress.ip_address(gateway)
+            _require_v4(address, gateway)
             argv = ["nmcli", "connection", "mod", str(connection),
                     "ipv4.method", "manual",
                     "ipv4.addresses", address,
@@ -738,10 +983,34 @@ async def write_interface_config(
                     "ipv4.method", "auto",
                     "ipv4.addresses", "",
                     "ipv4.gateway", ""]
-        argv += ["ipv4.dns", ",".join(dns)]
+        argv += ["ipv4.dns", ",".join(d for d in dns if ":" not in d)]
+        argv += nm_ipv6_args(ipv6, [d for d in dns if ":" in d])
         await run(argv, check=True)
         return
     raise ValueError(f"unknown backend: {backend!r}")
+
+
+def nm_ipv6_args(ipv6: Optional[Mapping[str, Optional[str]]], dns6: Sequence[str]) -> List[str]:
+    """nmcli properties for an IPv6 request (nothing when IPv6 is unchanged)."""
+    if ipv6 is None:
+        return ["ipv6.dns", ",".join(dns6)] if dns6 else []
+    method = str(ipv6["method"])
+    args = ["ipv6.method", NM_V6_FROM_PANEL[method]]
+    if method == "static":
+        args += ["ipv6.addresses", str(ipv6["address"]), "ipv6.gateway", ipv6.get("gateway") or ""]
+    else:
+        # manual addresses would otherwise linger as extras next to SLAAC/DHCPv6
+        args += ["ipv6.addresses", "", "ipv6.gateway", ""]
+    return args + ["ipv6.dns", ",".join(dns6)]
+
+
+async def nm_connection_for(name: str) -> str:
+    """The connection id behind interface *name* (active ones win)."""
+    config = await get_config("NetworkManager")
+    for info in config["interfaces"]:  # type: ignore[index]
+        if info.get("name") == name:
+            return str(info["connection"])
+    raise RuntimeError(f"no NetworkManager connection found for {name}")
 
 
 async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
@@ -751,7 +1020,13 @@ async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
     elif backend == "netplan":
         commands = [["netplan", "apply"]]
     elif backend == "NetworkManager":
-        commands = [["nmcli", "connection", "up", name]] if name else [["nmcli", "connection", "up", "--all"]]
+        # `connection up` takes a connection id, not an interface name; the
+        # two only coincide when the connection happens to be named after it.
+        commands = (
+            [["nmcli", "connection", "up", "id", await nm_connection_for(name)]]
+            if name
+            else [["nmcli", "networking", "on"]]
+        )
     else:
         raise ValueError(f"unknown backend: {backend!r}")
     ran: List[str] = []
@@ -770,14 +1045,19 @@ async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
 
 async def runtime_status() -> Dict[str, object]:
     """Live interface state straight from the kernel."""
-    addr, route = await asyncio.gather(
-        run(["ip", "-j", "addr", "show"]), run(["ip", "-j", "route", "show"])
+    addr, route, route6 = await asyncio.gather(
+        run(["ip", "-j", "addr", "show"]),
+        run(["ip", "-j", "route", "show"]),
+        run(["ip", "-j", "-6", "route", "show", "default"]),
     )
-    try:
-        addresses = json.loads(addr.stdout) if addr.ok and addr.stdout.strip() else []
-        routes = json.loads(route.stdout) if route.ok and route.stdout.strip() else []
-    except ValueError:
-        addresses, routes = [], []
+
+    def parsed(result) -> list:
+        try:
+            return json.loads(result.stdout) if result.ok and result.stdout.strip() else []
+        except ValueError:
+            return []
+
+    addresses, routes, routes6 = parsed(addr), parsed(route), parsed(route6)
     interfaces = []
     for item in addresses:
         interfaces.append(
@@ -791,15 +1071,21 @@ async def runtime_status() -> Dict[str, object]:
                     for a in item.get("addr_info", [])
                     if a.get("family") == "inet"
                 ],
+                # link-local fe80:: addresses exist on every interface; leave them out
+                "addresses6": [
+                    f"{a.get('local')}/{a.get('prefixlen')}"
+                    for a in item.get("addr_info", [])
+                    if a.get("family") == "inet6" and a.get("scope") != "link"
+                ],
             }
         )
-    default_route = next((r for r in routes if r.get("dst") == "default"), None)
+
+    def route_summary(candidates: list) -> Optional[Dict[str, object]]:
+        found = next((r for r in candidates if r.get("dst") == "default"), None)
+        return {"via": found.get("gateway"), "dev": found.get("dev")} if found else None
+
     return {
         "interfaces": interfaces,
-        "default_route": {
-            "via": default_route.get("gateway"),
-            "dev": default_route.get("dev"),
-        }
-        if default_route
-        else None,
+        "default_route": route_summary(routes),
+        "default_route6": route_summary(routes6),
     }
