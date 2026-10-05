@@ -167,6 +167,7 @@ function setView(name) {
   $(`#view-${name}`).classList.remove("hidden");
   $("#view-title").textContent = TITLES[name] || name;
   clearInterval(state.jobsTimer);
+  stopLogFollow();
   loadView();
 }
 
@@ -1713,22 +1714,72 @@ async function loadLogsView() {
   await loadJournal();
 }
 
-async function loadJournal() {
+const LOG_KEEP_LINES = 5000;
+
+function logParams() {
   const source = $("#log-source").value || "journal";
   const lines = $("#log-lines").value;
+  if (source === "journal") {
+    const unit = encodeURIComponent($("#log-unit").value.trim());
+    const priority = encodeURIComponent($("#log-priority").value);
+    return { source, path: `/logs/journal?lines=${lines}&unit=${unit}&priority=${priority}` };
+  }
+  const name = source.slice("file:".length);
+  return { source, path: `/logs/files/${encodeURIComponent(name)}?lines=${lines}` };
+}
+
+async function loadJournal() {
+  stopLogFollow();
   try {
-    let data;
-    if (source === "journal") {
-      const unit = encodeURIComponent($("#log-unit").value.trim());
-      const priority = encodeURIComponent($("#log-priority").value);
-      data = await api(`/logs/journal?lines=${lines}&unit=${unit}&priority=${priority}`);
-    } else {
-      const name = source.slice("file:".length);
-      data = await api(`/logs/files/${encodeURIComponent(name)}?lines=${lines}`);
-    }
+    const { path } = logParams();
+    const data = await api(path);
+    state.logCursor = data.cursor || "";
+    state.logOffset = data.offset;
     $("#log-output").textContent = (data.lines || []).join("\n") || "No entries.";
+    const out = $("#log-output");
+    out.scrollTop = out.scrollHeight;
+    if ($("#log-follow").checked) startLogFollow();
   } catch (err) { toast(err.message, "error"); }
 }
+
+// Following asks only for what is new: entries after the journal cursor, or
+// bytes after the last offset of a file.
+function startLogFollow() {
+  stopLogFollow();
+  state.logTimer = setInterval(followTick, 3000);
+}
+
+function stopLogFollow() {
+  clearInterval(state.logTimer);
+  state.logTimer = null;
+}
+
+async function followTick() {
+  const { source, path } = logParams();
+  const extra = source === "journal"
+    ? (state.logCursor ? `&after_cursor=${encodeURIComponent(state.logCursor)}` : "")
+    : (state.logOffset !== undefined && state.logOffset !== null ? `&offset=${state.logOffset}` : "");
+  try {
+    const data = await api(path + extra);
+    if (source === "journal") state.logCursor = data.cursor || state.logCursor;
+    else state.logOffset = data.offset;
+    const fresh = data.lines || [];
+    if (!fresh.length) return;
+    const out = $("#log-output");
+    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+    const existing = out.textContent === "No entries." ? [] : out.textContent.split("\n");
+    out.textContent = existing.concat(fresh).slice(-LOG_KEEP_LINES).join("\n");
+    if (atBottom) out.scrollTop = out.scrollHeight;
+  } catch (err) {
+    stopLogFollow();
+    $("#log-follow").checked = false;
+    toast(err.message, "error");
+  }
+}
+
+$("#log-follow").addEventListener("change", (event) => {
+  if (event.target.checked) startLogFollow(); else stopLogFollow();
+});
 
 $("#log-form").addEventListener("submit", (event) => {
   event.preventDefault();

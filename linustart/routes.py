@@ -1036,9 +1036,10 @@ def build_router(
         lines: int = Query(200, ge=10, le=2000),
         unit: str = Query(""),
         priority: str = Query(""),
+        after_cursor: str = Query(""),
     ) -> Dict[str, object]:
         try:
-            return await logs_mod.journal(lines, unit, priority)
+            return await logs_mod.journal(lines, unit, priority, after_cursor)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1047,9 +1048,13 @@ def build_router(
         return logs_mod.list_log_files()
 
     @router.get("/logs/files/{name}", dependencies=guard)
-    async def logs_file(name: str, lines: int = Query(200, ge=10, le=2000)) -> Dict[str, object]:
+    async def logs_file(
+        name: str,
+        lines: int = Query(200, ge=10, le=2000),
+        offset: Optional[int] = Query(None, ge=0),
+    ) -> Dict[str, object]:
         try:
-            return logs_mod.read_log_file(name, lines)
+            return logs_mod.read_log_file(name, lines, offset)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
