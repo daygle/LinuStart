@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..paths import INTERFACES_FILE, INTERFACES_D_DIR, NETPLAN_DIR
 from ..util import read_text, run, write_text
@@ -52,25 +52,47 @@ def _managed_key(line: str) -> Optional[str]:
     return key if key in MANAGED_KEYS else None
 
 
-def _stanza_spans(lines: Sequence[str]) -> Dict[str, Tuple[int, int]]:
-    """Map 'name family' -> (header_index, end_index_exclusive)."""
-    spans: Dict[str, Tuple[int, int]] = {}
+def _all_stanza_spans(lines: Sequence[str]) -> List[Tuple[str, int, int]]:
+    """Every 'iface' stanza in file order as ('name family', start, end_exclusive)."""
+    spans: List[Tuple[str, int, int]] = []
     current: Optional[Tuple[str, int]] = None
     for index, line in enumerate(lines):
         header = IFACE_HEADER_RE.match(line)
         if header:
             if current is not None:
-                spans.setdefault(current[0], (current[1], index))
+                spans.append((current[0], current[1], index))
             current = (f"{header.group('name')} {header.group('family')}", index)
             continue
         if current is not None:
             stripped = line.strip()
             if stripped and not line.startswith((" ", "\t")) and not stripped.startswith("#"):
-                spans.setdefault(current[0], (current[1], index))
+                spans.append((current[0], current[1], index))
                 current = None
     if current is not None:
-        spans.setdefault(current[0], (current[1], len(lines)))
+        spans.append((current[0], current[1], len(lines)))
     return spans
+
+
+def _stanza_spans(lines: Sequence[str]) -> Dict[str, Tuple[int, int]]:
+    """Map 'name family' -> (header_index, end_index_exclusive), first wins."""
+    spans: Dict[str, Tuple[int, int]] = {}
+    for key, start, end in _all_stanza_spans(lines):
+        spans.setdefault(key, (start, end))
+    return spans
+
+
+def stanza_counts(text: str) -> Dict[str, int]:
+    """How many stanzas each 'name family' has - repeats included.
+
+    ifupdown applies every stanza that names an interface, so two stanzas for
+    one interface means both configurations take effect. That is how an
+    interface ends up with a DHCP lease and a static address at the same time,
+    and it is invisible unless something counts them.
+    """
+    counts: Dict[str, int] = {}
+    for key, _start, _end in _all_stanza_spans(text.splitlines()):
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def read_ifupdown_interface(text: str, name: str) -> Optional[Dict[str, object]]:
@@ -148,16 +170,15 @@ def update_ifupdown_interface(
     dns = [server for server in (dns or []) if server]
 
     lines = text.splitlines()
-    spans = _stanza_spans(lines)
-    header_index: Optional[int] = None
-    end_index: Optional[int] = None
-    for key, (start, end) in spans.items():
-        stanza_name, family = key.split(" ", 1)
-        if stanza_name == name and family == "inet":
-            header_index, end_index = start, end
-            break
+    # Every stanza for this interface, not just the first: a hand-edited file
+    # can easily carry an 'iface eth0 inet dhcp' block next to the static one,
+    # and ifupdown brings the interface up both ways. Rewriting only the first
+    # would leave DHCP running next to the address we just set.
+    occurrences = [
+        (start, end) for key, start, end in _all_stanza_spans(lines) if key == f"{name} inet"
+    ]
 
-    if header_index is None or end_index is None:
+    if not occurrences:
         # Append a fresh stanza.
         block: List[str] = [f"auto {name}", f"iface {name} inet {method}"]
         block.extend(_render_options(method, address, gateway, dns))
@@ -166,13 +187,18 @@ def update_ifupdown_interface(
             prefix.append("")
         return "\n".join(prefix + block) + "\n"
 
+    header_index, end_index = occurrences[0]
     header = IFACE_HEADER_RE.match(lines[header_index])
     assert header is not None
-    indent = header.group("indent") or "    "
-    new_lines = [f"{indent}iface {name} inet {method}"]
+    # The 'iface' header is written flush left, the way ifupdown itself writes
+    # stanzas and the only form we can rely on being read back. The body keeps
+    # the file's own indentation, which must stay indented: an unindented,
+    # non-blank line is what ends a stanza for the parser above.
+    body_indent = header.group("indent") or "    "
+    new_lines = [f"iface {name} inet {method}"]
     body = lines[header_index + 1 : end_index]
     kept = [line for line in body if _managed_key(line) is None]
-    options = _render_options(method, address, gateway, dns, indent=indent)
+    options = _render_options(method, address, gateway, dns, indent=body_indent)
     # Keep leading comments/blank lines from the body before managed options.
     leading: List[str] = []
     rest = list(kept)
@@ -182,8 +208,13 @@ def update_ifupdown_interface(
     new_lines.extend(options)
     new_lines.extend(rest)
 
-    before = lines[:header_index]
-    after = lines[end_index:]
+    # Drop the other stanzas for this interface - they are the ones that would
+    # keep DHCP (or a stale address) configured alongside the managed one.
+    duplicates: Set[int] = set()
+    for start, end in occurrences[1:]:
+        duplicates.update(range(start, end))
+    before = [lines[index] for index in range(header_index) if index not in duplicates]
+    after = [lines[index] for index in range(end_index, len(lines)) if index not in duplicates]
     # Make sure 'auto <name>' exists somewhere before the stanza.
     has_auto = any(
         name in (m.group("names") or "").split()
@@ -330,11 +361,13 @@ async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
         for extra in sorted(INTERFACES_D_DIR.glob("*.cfg")) if INTERFACES_D_DIR.is_dir() else []:
             text += "\n" + read_text(extra)
         names = re.findall(r"^\s*iface\s+(\S+)\s+inet\s+\S+", text, re.M)
+        counts = stanza_counts(text)
         interfaces = []
         for name in dict.fromkeys(names):
             info = read_ifupdown_interface(text, name)
             # Only surface interfaces we can actually manage.
             if info and info.get("method") in ("static", "dhcp", "manual"):
+                info["stanza_count"] = counts.get(f"{name} inet", 0)
                 interfaces.append(info)
         return {"backend": backend, "interfaces": interfaces, "source": str(INTERFACES_FILE)}
     if backend == "netplan":

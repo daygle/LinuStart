@@ -235,9 +235,17 @@ async function loadNetwork() {
 
   const cards = (data.config.interfaces || []).map((iface) => {
     const method = iface.method || "dhcp";
+    const stanzas = Number(iface.stanza_count || 1);
+    const duplicated = stanzas > 1
+      ? `<p class="muted"><span class="badge warn">${stanzas} stanzas</span> this interface is
+         configured ${stanzas} times in /etc/network/interfaces. ifupdown applies all of them,
+         so a leftover DHCP block here still runs alongside the settings below - saving this
+         interface collapses them into one.</p>`
+      : "";
     return `
     <div class="card">
       <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span></h2>
+      ${duplicated}
       <form class="form" data-iface="${esc(iface.name)}">
         <label>Mode
           <select name="method">
