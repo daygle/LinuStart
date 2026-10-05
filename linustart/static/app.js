@@ -1433,7 +1433,11 @@ async function loadAudit() {
 
 async function loadFirewall() {
   const data = await api("/firewall");
-  $("#fw-backend").textContent = `backend: ${data.backend}`;
+  const firewalld = data.backend === "firewalld";
+  $("#fw-backend").textContent = `backend: ${data.backend}${firewalld && data.zone ? ` (zone ${data.zone})` : ""}`;
+  // firewalld zones only filter incoming traffic
+  $("#fw-outgoing").disabled = firewalld;
+  $('#fw-direction option[value="out"]').disabled = firewalld;
   const status = $("#fw-status");
   status.textContent = data.enabled ? "enabled" : "disabled";
   status.className = `badge ${data.enabled ? "ok" : "warn"}`;
@@ -1441,14 +1445,16 @@ async function loadFirewall() {
   $("#fw-outgoing").value = data.default_outgoing || "allow";
   $("#fw-enabled").checked = !!data.enabled;
   const rows = (data.rules || []).map((rule, index) => {
-    const target = rule.to
+    let target = rule.to
       ? `<code>${esc(rule.to)}</code>`
       : `<code>${esc((rule.protocol === "any" ? "all" : rule.protocol) + (rule.port ? `/${rule.port}` : ""))}</code>`;
+    if (rule.action === "custom") target = `<code>${esc(rule.raw || "")}</code>`;
+    else if (rule.label) target += ` <span class="muted">${esc(rule.label)}</span>`;
     const side = rule.direction === "out" ? "to" : "from";
     const address = rule.to ? rule.from : rule.address;
     return `<tr>
       <td><span class="badge">${rule.direction === "out" ? "out" : "in"}</span></td>
-      <td><span class="badge ${rule.action === "allow" ? "ok" : "danger"}">${esc(rule.action)}</span></td>
+      <td><span class="badge ${rule.action === "allow" ? "ok" : rule.action === "custom" ? "muted" : "danger"}">${esc(rule.action)}</span></td>
       <td>${target}</td>
       <td class="muted">${side} ${esc(address || "any")}${rule.ipv6 ? " (v6)" : ""}</td>
       <td><button class="btn btn-small btn-danger" data-fw-remove="${index}">Remove</button></td>

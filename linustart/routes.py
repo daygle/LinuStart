@@ -790,13 +790,22 @@ def build_router(
             "address": "any",
         }
 
-    def session_kwargs(backend: str) -> Dict[str, object]:
+    def session_kwargs(backend: str, was_running: Optional[bool] = None) -> Dict[str, object]:
+        reapply: Dict[str, Optional[str]] = {"kind": "firewall", "backend": backend}
+        if was_running is not None:
+            # firewalld: reverting also restores whether the daemon ran
+            reapply["running"] = "yes" if was_running else "no"
         return {
             "kind": "firewall",
             "label": f"firewall ({backend})",
             "timeout": 90,
-            "reapply": {"kind": "firewall", "backend": backend},
+            "reapply": reapply,
         }
+
+    def revert_firewall(backend: str, was_running: Optional[bool] = None):
+        return functools.partial(
+            firewall_mod.reapply, backend, None if was_running is None else ("yes" if was_running else "no")
+        )
 
     @router.get("/firewall", dependencies=guard)
     async def firewall_status() -> Dict[str, object]:
@@ -812,8 +821,30 @@ def build_router(
         snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
         ssh_added = False
         applied: List[str] = []
+        was_running = bool(state["enabled"]) if backend == "firewalld" else None
         try:
-            if backend == "ufw":
+            if backend == "firewalld":
+                if body.default_outgoing and default_outgoing != "allow":
+                    raise ValueError("firewalld zones do not filter outgoing traffic; it stays allowed")
+                args: List[str] = []
+                if body.default_incoming:
+                    args.append(f"--set-target={firewall_mod.FIREWALLD_POLICY_TARGET[default_incoming]}")
+                if enabled and default_incoming == "deny" and not any(
+                    firewall_mod.rule_covers_port(rule, str(state["ssh_port"])) for rule in state["rules"]
+                ):
+                    args += firewall_mod.firewalld_add_args(ssh_allow_rule())
+                    ssh_added = True
+                if body.enabled is not None and bool(body.enabled) != bool(state["enabled"]):
+                    if body.enabled:
+                        # start it first, so the permanent changes are reloaded into it
+                        applied.append(await firewall_mod.firewalld_set_running(True))
+                        applied += await firewall_mod.firewalld_apply(args)
+                    else:
+                        applied += await firewall_mod.firewalld_apply(args)
+                        applied.append(await firewall_mod.firewalld_set_running(False))
+                else:
+                    applied += await firewall_mod.firewalld_apply(args)
+            elif backend == "ufw":
                 commands: List[List[str]] = []
                 if body.default_incoming:
                     commands.append(["ufw", "default", default_incoming, "incoming"])
@@ -848,9 +879,9 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("firewall.configure", str(exc), ok=False)
-            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
+            await restore_and_reapply(snapshots, revert_firewall(backend, was_running), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
-        session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
+        session = sessions.create(snapshots=snapshots, **session_kwargs(backend, was_running))  # type: ignore[arg-type]
         audit.record(
             "firewall.configure",
             f"enabled={enabled} default_incoming={default_incoming} default_outgoing={default_outgoing}",
@@ -878,11 +909,13 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         backend = await firewall_mod.detect_backend()
         state = await firewall_mod.status()
-        if backend != "ufw" and not bool(state["enabled"]):
+        if backend == "nftables" and not bool(state["enabled"]):
             raise HTTPException(status_code=400, detail="enable the firewall before editing rules")
         snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
         try:
-            if backend == "ufw":
+            if backend == "firewalld":
+                applied = await firewall_mod.firewalld_apply(firewall_mod.firewalld_add_args(rule))
+            elif backend == "ufw":
                 argv = firewall_mod.ufw_add_argv(rule)
                 await firewall_mod.ufw_apply(argv)
                 applied = [" ".join(argv)]
@@ -899,7 +932,7 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("firewall.rule.add", str(exc), ok=False)
-            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
+            await restore_and_reapply(snapshots, revert_firewall(backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
         audit.record("firewall.rule.add", firewall_mod.rule_label(rule))
@@ -915,7 +948,9 @@ def build_router(
         removed = rules.pop(index)
         snapshots = snapshot_files(firewall_mod.managed_config_files(backend))
         try:
-            if backend == "ufw":
+            if backend == "firewalld":
+                applied = await firewall_mod.firewalld_apply(firewall_mod.firewalld_remove_args(removed))
+            elif backend == "ufw":
                 argv = firewall_mod.ufw_delete_argv(removed)
                 await firewall_mod.ufw_apply(argv)
                 applied = [" ".join(argv)]
@@ -932,10 +967,17 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("firewall.rule.remove", str(exc), ok=False)
-            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
+            await restore_and_reapply(snapshots, revert_firewall(backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
-        label = firewall_mod.rule_label(removed) if "action" in removed else str(removed.get("to", index))
+        if removed.get("source") in ("service", "port"):
+            label = f"{removed['source']} {removed.get('name', '')}"
+        elif removed.get("raw"):
+            label = str(removed["raw"])
+        elif "action" in removed and "protocol" in removed:
+            label = firewall_mod.rule_label(removed)
+        else:
+            label = str(removed.get("to", index))
         audit.record("firewall.rule.remove", label)
         return {"ok": True, "session": session.to_dict(), "applied": applied}
 

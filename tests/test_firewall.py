@@ -196,3 +196,72 @@ def test_nft_load_script_replaces_only_the_panel_table():
     script = nft_load_script(block)
     assert script.startswith("table inet linustart\ndelete table inet linustart\n")
     assert managed_block_text("no block here") == ""
+
+
+# --------------------------------------------------------------------------
+# firewalld
+# --------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from linustart.modules import firewall as fw  # noqa: E402
+
+
+def test_firewalld_ports_parse_into_rules():
+    rules = fw.parse_firewalld_ports("22/tcp 8000-8100/udp 9/sctp junk")
+    assert [(r["protocol"], r["port"], r["source"], r["name"]) for r in rules] == [
+        ("tcp", "22", "port", "22/tcp"), ("udp", "8000:8100", "port", "8000-8100/udp"),
+    ]
+    assert fw.rule_covers_port(rules[0], "22")
+
+
+def test_firewalld_rich_rules_round_trip():
+    rule = normalize_rule({"action": "deny", "direction": "in", "protocol": "tcp",
+                           "port": "22", "address": "10.0.0.0/8"})
+    (line,) = fw.rich_rules_for(rule)
+    assert line == 'rule family="ipv4" source address="10.0.0.0/8" port port="22" protocol="tcp" drop'
+    parsed = fw.parse_rich_rule(line)
+    assert {k: parsed[k] for k in ("action", "protocol", "port", "address")} == {
+        "action": "deny", "protocol": "tcp", "port": "22", "address": "10.0.0.0/8"}
+    v6 = normalize_rule({"action": "allow", "direction": "in", "protocol": "udp", "port": "",
+                         "address": "2001:db8::/32"})
+    assert fw.rich_rules_for(v6) == ['rule family="ipv6" source address="2001:db8::/32" protocol value="udp" accept']
+
+
+def test_firewalld_unparseable_rich_rules_stay_raw_and_removable():
+    raw = 'rule family="ipv4" forward-port port="80" protocol="tcp" to-port="8080"'
+    parsed = fw.parse_rich_rule(raw)
+    assert parsed["action"] == "custom" and parsed["raw"] == raw
+    assert fw.firewalld_remove_args(parsed) == [f"--remove-rich-rule={raw}"]
+
+
+def test_firewalld_add_args_prefer_plain_ports():
+    simple = normalize_rule({"action": "allow", "direction": "in", "protocol": "tcp", "port": "80,443"})
+    assert fw.firewalld_add_args(simple) == ["--add-port=80/tcp", "--add-port=443/tcp"]
+    ranged = normalize_rule({"action": "allow", "direction": "in", "protocol": "tcp",
+                             "port": "8000:8100", "address": "10.0.0.0/8"})
+    assert fw.firewalld_add_args(ranged) == [
+        '--add-rich-rule=rule family="ipv4" source address="10.0.0.0/8" port port="8000-8100" protocol="tcp" accept']
+
+
+def test_firewalld_refuses_what_zones_cannot_do():
+    with pytest.raises(ValueError):
+        fw.rich_rules_for(normalize_rule({"action": "deny", "direction": "out", "protocol": "tcp", "port": "25"}))
+    with pytest.raises(ValueError):
+        fw.rich_rules_for(normalize_rule({"action": "allow", "direction": "in"}))
+
+
+def test_firewalld_remove_args_by_source():
+    assert fw.firewalld_remove_args({"source": "service", "name": "ssh"}) == ["--remove-service=ssh"]
+    assert fw.firewalld_remove_args({"source": "port", "name": "80/tcp"}) == ["--remove-port=80/tcp"]
+
+
+def test_firewalld_default_zone_and_managed_files(tmp_path, monkeypatch):
+    assert fw.firewalld_default_zone("# c\nDefaultZone=internal\n") == "internal"
+    assert fw.firewalld_default_zone("") == "public"
+    (tmp_path / "zones").mkdir()
+    (tmp_path / "zones" / "trusted.xml").write_text("<zone/>")
+    monkeypatch.setattr(fw, "FIREWALLD_DIR", tmp_path)
+    files = fw.managed_config_files("firewalld")
+    # the default zone's file is included even before it exists, so a revert removes it
+    assert files == [tmp_path / "zones" / "trusted.xml", tmp_path / "zones" / "public.xml"]

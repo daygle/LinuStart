@@ -29,7 +29,7 @@ from .util import now_iso, restore_files
 
 # Re-applying is described by data, not a closure, so it survives a restart:
 # {"kind": "network", "backend": ..., "name": ...}, {"kind": "ssh"},
-# {"kind": "firewall", "backend": ...}.
+# {"kind": "firewall", "backend": ..., "running": "yes"|"no"|None}.
 ReapplySpec = Dict[str, Optional[str]]
 
 
@@ -48,7 +48,7 @@ async def _reapply_ssh(_spec: Mapping[str, Optional[str]]) -> None:
 async def _reapply_firewall(spec: Mapping[str, Optional[str]]) -> None:
     from .modules import firewall
 
-    await firewall.reapply(str(spec["backend"]))
+    await firewall.reapply(str(spec["backend"]), spec.get("running"))
 
 
 REAPPLIERS: Dict[str, Callable[[Mapping[str, Optional[str]]], Awaitable[None]]] = {
