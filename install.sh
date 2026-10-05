@@ -71,6 +71,13 @@ is_loopback() {
     esac
 }
 
+if [[ $EUID -ne 0 ]]; then
+    echo "This installer must run as root (try: sudo ./install.sh)" >&2
+    exit 1
+fi
+
+# Checked for root above: uninstalling stops and removes a systemd unit, so
+# without this it failed later with a raw systemctl permission error.
 if [[ "$UNINSTALL" -eq 1 ]]; then
     systemctl disable --now linustart.service 2>/dev/null || true
     rm -f "$SERVICE_FILE"
@@ -79,11 +86,6 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "LinuStart removed. Configuration in $CONFIG_DIR and state in $STATE_DIR were kept."
     echo "Remove them manually if you want a clean slate."
     exit 0
-fi
-
-if [[ $EUID -ne 0 ]]; then
-    echo "This installer must run as root (try: sudo ./install.sh)" >&2
-    exit 1
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
