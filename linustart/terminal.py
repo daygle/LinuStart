@@ -47,6 +47,26 @@ MAX_SESSIONS = 8
 # the most recent ones are kept so the list cannot grow without bound.
 MAX_CLOSED_KEPT = 50
 CHUNK = 8192
+# Session recordings: the newest are kept, and one session stops recording
+# past a size cap (a `cat /dev/urandom` must not fill the disk).
+LOGS_KEPT = 200
+MAX_LOG_BYTES = 50 * 1024 * 1024
+
+
+def prune_logs(keep: int = LOGS_KEPT) -> None:
+    """Remove the oldest session recordings beyond *keep*."""
+    try:
+        logs = sorted(
+            (entry for entry in os.scandir(TERMINAL_LOG_DIR) if entry.is_file() and entry.name.endswith(".log")),
+            key=lambda entry: entry.stat().st_mtime,
+        )
+    except FileNotFoundError:
+        return
+    for entry in logs[: max(0, len(logs) - keep)]:
+        try:
+            os.unlink(entry.path)
+        except OSError:
+            pass
 
 
 def pick_shell() -> str:
@@ -106,6 +126,7 @@ class TerminalSession:
     output: "asyncio.Queue[Optional[str]]" = field(default_factory=asyncio.Queue)
     decoder: object = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")("replace"))
     log_handle: Optional[object] = field(default=None, repr=False)
+    log_bytes: int = 0
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -165,6 +186,7 @@ class TerminalManager:
 
         session_id = uuid.uuid4().hex[:12]
         TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        prune_logs(LOGS_KEPT - 1)  # room for this one
         log_path = TERMINAL_LOG_DIR / f"{session_id}.log"
         # Kept open for the life of the session: reopening the file for every
         # chunk of output costs a syscall round trip per keystroke echo.
@@ -197,10 +219,17 @@ class TerminalManager:
         for sid in closed[: max(0, len(closed) - MAX_CLOSED_KEPT)]:
             del self.sessions[sid]
 
-    def _log(self, session: TerminalSession, text: str) -> None:
+    def _log(self, session: TerminalSession, text: str, *, force: bool = False) -> None:
         handle = session.log_handle
         if handle is None:
             return
+        if not force and session.log_bytes >= MAX_LOG_BYTES:
+            return
+        if not force and session.log_bytes + len(text) >= MAX_LOG_BYTES:
+            text = f"\n# recording stopped: session output passed {MAX_LOG_BYTES // (1024 * 1024)} MiB\n"
+            session.log_bytes = MAX_LOG_BYTES
+        else:
+            session.log_bytes += len(text)
         try:
             handle.write(text)  # type: ignore[union-attr]
             handle.flush()  # type: ignore[union-attr]
@@ -288,7 +317,7 @@ class TerminalManager:
                 except asyncio.TimeoutError:
                     session.proc.kill()
                     await session.proc.wait()
-            self._log(session, f"\n# session {session.id} closed {session.closed_at} ({reason})\n")
+            self._log(session, f"\n# session {session.id} closed {session.closed_at} ({reason})\n", force=True)
             try:
                 session.log_handle.close()  # type: ignore[union-attr]
             except (AttributeError, OSError):

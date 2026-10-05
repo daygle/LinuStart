@@ -49,6 +49,7 @@ DOWNLOAD_TIMEOUT = 120
 API_TIMEOUT = 15
 GIT_TIMEOUT = 5
 SUMS_ASSET = "SHA256SUMS"
+APP_BACKUPS_KEPT = 5
 # Where release downloads may come from: the API, and the asset hosts that
 # browser_download_url redirects through.
 DOWNLOAD_PREFIXES = ("https://api.github.com/", "https://github.com/")
@@ -436,6 +437,12 @@ def backup_tree(app_dir: Path, backup_dir: Path) -> Path:
     target = backup_dir / f"linustart-app-{stamp}.tar.gz"
     with tarfile.open(target, "w:gz") as tar:
         tar.add(str(app_dir), arcname="app")
+    # Rollback only ever uses the newest one; a few are kept for safety.
+    for old in sorted(backup_dir.glob("linustart-app-*.tar.gz"))[:-APP_BACKUPS_KEPT]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
     return target
 
 

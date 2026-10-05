@@ -194,10 +194,17 @@ first, so the panel can't cut off its own access.
 
 **File writes.** Every rewritten file is first copied to
 `/var/lib/linustart/backups/` with a timestamp, and writes are atomic
-(tempfile + rename), so a crash can't leave a half-written config.
+(tempfile + rename), so a crash can't leave a half-written config. The
+newest 20 backups of each file are kept, and the file's mode and owner are
+preserved.
 
 **Audit log.** Every action is appended to `/var/lib/linustart/audit.log`
-and shown in the UI.
+and shown in the UI. It rotates at 5 MiB, keeping five older files
+(`audit.log.1` … `audit.log.5`).
+
+**Retention.** The newest 5 application backups (self-update rollback points)
+and the newest 200 terminal recordings are kept; a single terminal session
+stops recording after 50 MiB of output and notes that in its log.
 
 ## Architecture
 

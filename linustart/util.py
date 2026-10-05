@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -100,9 +101,37 @@ def backup(path: Path) -> None:
     if not os.path.exists(real):
         return
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    name = f"{stamp}-{real.lstrip(os.sep).replace(os.sep, '__')}"
-    shutil.copy2(real, BACKUP_DIR / name)
+    # Microseconds keep two backups made within one second apart; with
+    # second resolution the second copy overwrote the first.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
+    flat = real.lstrip(os.sep).replace(os.sep, "__")
+    shutil.copy2(real, BACKUP_DIR / f"{stamp}-{flat}")
+    prune_backups(flat)
+
+
+# Backups kept per original file; the oldest beyond this are removed so a
+# file edited daily does not grow the backup directory forever.
+BACKUPS_PER_FILE = 20
+
+
+def prune_backups(flat: str, keep: Optional[int] = None) -> None:
+    """Keep the newest *keep* backups of one file (names sort by timestamp)."""
+    keep = BACKUPS_PER_FILE if keep is None else keep
+    # "<stamp>-<flat>", stamp with or without microseconds: an exact match,
+    # never another file whose flattened name merely ends the same way
+    pattern = re.compile(r"^\d{8}T\d{6}(?:\.\d{6})?-" + re.escape(flat) + "$")
+    try:
+        names = sorted(
+            entry.name for entry in os.scandir(BACKUP_DIR)
+            if entry.is_file() and pattern.match(entry.name)
+        )
+    except FileNotFoundError:
+        return
+    for name in names[: max(0, len(names) - keep)]:
+        try:
+            os.unlink(BACKUP_DIR / name)
+        except OSError:
+            pass
 
 
 DEFAULT_FILE_MODE = 0o644
