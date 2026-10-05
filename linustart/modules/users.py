@@ -236,6 +236,36 @@ def remove_authorized_key(content: str, index: int) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def update_authorized_key(content: str, index: int, key_line: str) -> str:
+    """Replace the key on *index* in place, leaving the file order untouched.
+
+    The replacement is validated exactly as an added key is, and it may not
+    collide with a key on some other line: the entry being edited is the one
+    place that key material is allowed to appear.
+    """
+    stripped = key_line.strip()
+    match = _key_match(stripped)
+    if not match or not valid_authorized_key(stripped):
+        raise ValueError("that does not look like an OpenSSH public key")
+    lines = content.splitlines()
+    if index < 0 or index >= len(lines):
+        raise ValueError(f"no key at position {index}")
+    target = lines[index].strip()
+    # list_keys only ever hands out the index of a real key, so anything else
+    # is a caller reaching past the listing. Replacing a comment would drop it.
+    if not target or target.startswith("#") or not _key_match(target):
+        raise ValueError(f"no key at position {index}")
+    data = match.group("data")
+    for other_index, line in enumerate(lines):
+        if other_index == index:
+            continue
+        other = _key_match(line.strip())
+        if other and other.group("data") == data:
+            raise ValueError("that key is already installed")
+    lines[index] = stripped
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 # --------------------------------------------------------------------------
 # Async account operations
 # --------------------------------------------------------------------------
@@ -426,6 +456,17 @@ async def remove_key(name: str, index: int) -> List[Dict[str, object]]:
         except OSError:
             pass
     else:
+        write_text(path, updated)
+        _secure_key_file(path, entry)
+    return list_keys(name)
+
+
+async def update_key(name: str, index: int, key_line: str) -> List[Dict[str, object]]:
+    entry = _passwd_entry(name)
+    path = _keys_path(name)
+    content = read_text(path)
+    updated = update_authorized_key(content, index, key_line)
+    if updated != content:
         write_text(path, updated)
         _secure_key_file(path, entry)
     return list_keys(name)

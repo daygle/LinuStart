@@ -797,6 +797,16 @@ def build_router(
         audit.record("user.key.remove", f"removed SSH key {index} for {name}")
         return {"keys": keys}
 
+    @router.put("/users/{name}/keys/{index}", dependencies=guard)
+    async def users_update_key(name: str, index: int, body: KeyBody) -> Dict[str, object]:
+        try:
+            keys = await users_mod.update_key(name, index, body.key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # The key material itself never reaches the audit log.
+        audit.record("user.key.update", f"updated SSH key {index} for {name}")
+        return {"keys": keys}
+
     # ---- groups ------------------------------------------------------------
     async def group_action(action: str, detail: str, call) -> Dict[str, object]:
         try:

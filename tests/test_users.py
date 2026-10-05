@@ -15,6 +15,7 @@ from linustart.modules.users import (  # noqa: E402
     parse_passwd,
     parse_shadow,
     remove_authorized_key,
+    update_authorized_key,
     valid_authorized_key,
     valid_password,
     valid_username,
@@ -210,6 +211,58 @@ def test_remove_authorized_key():
         pass
     else:
         raise AssertionError("expected ValueError for an out-of-range index")
+
+
+def test_update_authorized_key_replaces_in_place():
+    # index 1 is bob's key; the surrounding comment and blank line survive.
+    result = update_authorized_key(KEYS, 1, f"ssh-ed25519 {BLOB3} carol@desktop")
+    assert result.startswith("# managed by hand\n")
+    assert parse_authorized_keys(result)[0]["comment"] == "carol@desktop"
+    # alice's key is still there, still on the same line
+    assert parse_authorized_keys(result)[1]["comment"] == "alice@desktop second comment"
+    assert parse_authorized_keys(result)[1]["index"] == 3
+
+
+def test_update_authorized_key_allows_its_own_material():
+    # Re-saving a key unchanged must not trip the duplicate check.
+    same = f"ssh-ed25519 {BLOB1} bob@laptop"
+    assert update_authorized_key(KEYS, 1, same) == KEYS
+
+
+def test_update_authorized_key_refuses_a_duplicate_elsewhere():
+    try:
+        update_authorized_key(KEYS, 1, f"ssh-rsa {BLOB2} alice@desktop")
+    except ValueError as exc:
+        assert "already installed" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when the key already exists")
+
+
+def test_update_authorized_key_refuses_a_comment_line():
+    # list_keys only hands out real key indices; replacing the header comment
+    # would silently drop it, so it is an error rather than a quiet deletion.
+    try:
+        update_authorized_key(KEYS, 0, f"ssh-ed25519 {BLOB3} carol@desktop")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when the line is a comment")
+
+
+def test_update_authorized_key_validates_and_bounds_checks():
+    for bad_index in [-1, 99]:
+        try:
+            update_authorized_key(KEYS, bad_index, f"ssh-ed25519 {BLOB3} carol@desktop")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for index {bad_index}")
+    try:
+        update_authorized_key(KEYS, 1, "rm -rf /")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for a non-key replacement")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ body {
   box-shadow: var(--shadow);
 }
 .card h2 { margin: 0 0 14px; font-size: 15px; }
+.key-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .card h2 + h2, .card h2.spaced { margin-top: 22px; }
 .danger-card { border-color: var(--danger); }
 .danger-card h2 { color: var(--danger); }

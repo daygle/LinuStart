@@ -762,10 +762,13 @@
           <h2>SSH Keys</h2>
           <table class="table" id="user-keys-table"></table>
           <form id="user-key-form" class="form">
-            <label>Add public key
+            <label><span id="user-key-label">Add public key</span>
               <textarea id="edit-key" rows="3" placeholder="ssh-ed25519 AAAA... me@laptop"></textarea>
             </label>
-            <button class="btn" type="submit">Add Key</button>
+            <div class="form-row">
+              <button class="btn" id="user-key-submit" type="submit">Add Key</button>
+              <button class="btn hidden" id="user-key-cancel" type="button">Cancel Edit</button>
+            </div>
           </form>
           <h2 class="spaced">Sudo Rule</h2>
           <label class="switch-row">
