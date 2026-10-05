@@ -16,6 +16,8 @@ from ..paths import VAR_LOG_DIR
 from ..util import run
 
 LOG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Unit names also carry '@' (getty@tty1.service) and '\x2d'-style escapes.
+UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@\\-]*$")
 PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
 MAX_TAIL_BYTES = 256 * 1024
 MIN_LINES, MAX_LINES = 10, 2000
@@ -49,7 +51,7 @@ def journal_command(
     argv = ["journalctl", "-n", str(clamp_lines(lines)), "--no-pager", "-o", "short-iso"]
     unit = (unit or "").strip()
     if unit:
-        if not LOG_NAME_RE.match(unit) or "/" in unit:
+        if not UNIT_NAME_RE.match(unit):
             raise ValueError(f"not a valid unit name: {unit!r}")
         argv += ["-u", unit]
     priority = (priority or "").strip().lower()
@@ -103,8 +105,9 @@ def log_file_entry(path: Path) -> Optional[Dict[str, object]]:
 # --------------------------------------------------------------------------
 
 async def journal(lines: object = 200, unit: str = "", priority: str = "") -> Dict[str, object]:
-    result = await run(journal_command(lines, unit, priority))
-    return {"lines": result.stdout.splitlines(), "command": journal_command(lines, unit, priority)}
+    argv = journal_command(lines, unit, priority)
+    result = await run(argv)
+    return {"lines": result.stdout.splitlines(), "command": argv}
 
 
 def list_log_files() -> Dict[str, object]:

@@ -50,6 +50,9 @@ SCHEDULE_FIELDS = (
     (0, 7, DOW_NAMES),
 )
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# cron (via run-parts naming rules) silently ignores /etc/cron.d files whose
+# names contain anything else - a dot, say - so new files must match this.
+CRON_D_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_COMMAND = 2000
 # Shown in place of an exception when one file cannot be listed. The raw
 # OSError text can name paths and permissions the API caller has no business
@@ -302,7 +305,6 @@ def render_like(original: str, schedule: str, command: str, user: str = "", enab
     stripped = (original or "").strip()
     if stripped.startswith("#"):
         stripped = stripped.lstrip("#").strip()
-    tokens = stripped.split()
     # one separator per gap between tokens, in order
     gaps = re.findall(r"\s+", stripped)
 
@@ -487,6 +489,15 @@ async def add_entry(
 ) -> Dict[str, object]:
     cron_file = load(logical)
     with_user = cron_file.kind != "user"
+    if (
+        cron_file.kind == "cron.d"
+        and not cron_file.path.exists()
+        and not CRON_D_NAME_RE.match(cron_file.path.name)
+    ):
+        raise ValueError(
+            f"cron ignores /etc/cron.d files named {cron_file.path.name!r}; "
+            "use letters, digits, '-' and '_' only"
+        )
     if not with_user and not cron_file.owner:
         raise ValueError("cannot create a crontab without a user")
     text = append_entry(

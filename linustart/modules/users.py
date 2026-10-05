@@ -13,7 +13,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 from ..paths import GROUP_FILE, PASSWD_FILE, SHADOW_FILE, SHELLS_FILE
 from ..util import read_text, run, write_text
@@ -76,6 +76,12 @@ def valid_password(password: str) -> bool:
         and "\n" not in password
         and "\r" not in password
     )
+
+
+def valid_full_name(value: str) -> bool:
+    """The GECOS field lives inside /etc/passwd: ':' would split the record
+    and a line break would start a new one."""
+    return len(value) <= 256 and not any(char in value for char in ":\r\n\x00")
 
 
 def _key_match(line: str) -> Optional[re.Match]:
@@ -251,8 +257,24 @@ def _shells() -> List[str]:
 
 
 def _keys_path(name: str) -> Path:
+    """authorized_keys for *name*, refusing anything the user could redirect.
+
+    The panel writes this file as root and then chowns it and ``~/.ssh`` to
+    the user. A home directory belongs to its user, so ``~/.ssh`` could be a
+    symlink to ``/root/.ssh``; following it would hand the user root's keys
+    directory. Symlinks on the way are refused, and the result has to stay
+    inside the home directory.
+    """
     entry = _passwd_entry(name)
-    return Path(str(entry["home"])) / ".ssh" / "authorized_keys"
+    home = Path(str(entry["home"]))
+    ssh_dir = home / ".ssh"
+    path = ssh_dir / "authorized_keys"
+    if ssh_dir.is_symlink() or path.is_symlink():
+        raise ValueError(f"refusing to follow a symlink in {name}'s ~/.ssh")
+    real_home = os.path.realpath(home)
+    if not os.path.realpath(path).startswith(os.path.join(real_home, "")):
+        raise ValueError(f"{name}'s authorized_keys resolves outside the home directory")
+    return path
 
 
 async def list_users() -> Dict[str, object]:
@@ -289,7 +311,11 @@ async def user_detail(name: str) -> Dict[str, object]:
 
 
 def list_keys(name: str) -> List[Dict[str, object]]:
-    path = _keys_path(name)
+    _passwd_entry(name)  # an unknown user is still an error
+    try:
+        path = _keys_path(name)
+    except ValueError:
+        return []  # a redirected ~/.ssh is never read through
     try:
         content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -317,6 +343,8 @@ async def create_user(
         raise ValueError(f"passwords must be at least {MIN_PASSWORD_LENGTH} characters and free of ':'")
     if shell not in _shells():
         raise ValueError(f"not a valid login shell: {shell}")
+    if not valid_full_name(full_name):
+        raise ValueError("the full name may not contain ':' or line breaks")
     await run(
         ["useradd", "-m", "-s", shell, "-c", full_name.strip() or name, name],
         check=True,
@@ -345,8 +373,10 @@ async def update_user(
     sudo: Optional[bool] = None,
     locked: Optional[bool] = None,
 ) -> Dict[str, object]:
-    entry = _passwd_entry(name)
+    _passwd_entry(name)
     if full_name is not None:
+        if not valid_full_name(full_name):
+            raise ValueError("the full name may not contain ':' or line breaks")
         await run(["usermod", "-c", full_name.strip() or name, name], check=True)
     if shell is not None:
         if shell not in _shells():
@@ -404,11 +434,13 @@ async def remove_key(name: str, index: int) -> List[Dict[str, object]]:
 def _secure_key_file(path: Path, entry: Dict[str, object]) -> None:
     """Lock down ~/.ssh the way sshd requires."""
     ssh_dir = path.parent
+    if ssh_dir.is_symlink() or path.is_symlink():
+        return  # swapped for a link after the write; never chmod/chown through it
     try:
         os.chmod(ssh_dir, 0o700)
         os.chmod(path, 0o600)
-        os.chown(ssh_dir, int(entry["uid"]), int(entry["gid"]))  # type: ignore[arg-type]
-        os.chown(path, int(entry["uid"]), int(entry["gid"]))  # type: ignore[arg-type]
+        os.lchown(ssh_dir, int(entry["uid"]), int(entry["gid"]))  # type: ignore[arg-type]
+        os.lchown(path, int(entry["uid"]), int(entry["gid"]))  # type: ignore[arg-type]
     except (OSError, ValueError):
         # Non-root dev sandboxes can't chown; permissions still applied.
         pass

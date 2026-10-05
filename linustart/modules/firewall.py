@@ -39,11 +39,15 @@ PORT_SPEC_RE = re.compile(r"^\d{1,5}(:\d{1,5})?(,\d{1,5}(:\d{1,5})?)*$")
 NFT_POLICY = {"allow": "accept", "deny": "drop"}
 PANEL_POLICY = {"accept": "allow", "drop": "deny"}
 UFW_PORT_RE = re.compile(r"^(?P<port>[\d,:]+)/(?P<proto>[a-z0-9]+)$", re.IGNORECASE)
+# Lines written by nft_rule_line. The family prefix is optional when reading
+# so blocks written by older panel versions still import.
 NFT_RULE_RE = re.compile(
-    r"^(?:(?P<side>saddr|daddr)\s+(?P<address>\S+)\s+)?"
-    r"(?:(?P<proto>tcp|udp)\s+dport\s+(?P<port>\S+)\s+)?"
+    r"^(?:(?:ip6?\s+)?(?P<side>saddr|daddr)\s+(?P<address>\S+)\s+)?"
+    r"(?:(?P<proto>tcp|udp)\s+dport\s+(?P<port>\{[^}]*\}|\S+)\s+"
+    r"|meta\s+l4proto\s+(?P<l4proto>tcp|udp)\s+)?"
     r"(?P<verdict>accept|drop)$"
 )
+NFT_TABLE = "inet linustart"
 
 
 # --------------------------------------------------------------------------
@@ -259,14 +263,34 @@ def ufw_delete_argv(row: Mapping[str, object]) -> List[str]:
 # nftables managed block
 # --------------------------------------------------------------------------
 
+def nft_port_spec(spec: str) -> str:
+    """Panel port syntax -> nft: '8000:8100' -> '8000-8100', '80,443' -> '{ 80, 443 }'."""
+    tokens = [token.strip().replace(":", "-") for token in spec.split(",") if token.strip()]
+    return tokens[0] if len(tokens) == 1 else "{ " + ", ".join(tokens) + " }"
+
+
+def panel_port_spec(spec: str) -> str:
+    """Inverse of :func:`nft_port_spec`."""
+    tokens = [token.strip().replace("-", ":") for token in spec.strip("{} ").split(",")]
+    return ",".join(token for token in tokens if token)
+
+
 def nft_rule_line(rule: Mapping[str, str]) -> str:
-    """Canonical ``nft`` line for a rule inside the managed input/output chain."""
+    """Canonical ``nft`` line for a rule inside the managed input/output chain.
+
+    Address matches need their family (``ip saddr`` / ``ip6 saddr``) in an
+    inet table, and a protocol without a port still has to match the
+    protocol - dropping it would turn "allow tcp" into "allow everything".
+    """
     parts: List[str] = []
     if rule["address"] != "any":
         side = "saddr" if rule["direction"] == "in" else "daddr"
-        parts += [side, rule["address"]]
+        family = "ip6" if ":" in rule["address"] else "ip"
+        parts += [family, side, rule["address"]]
     if rule["port"]:
-        parts += [rule["protocol"], "dport", rule["port"]]
+        parts += [rule["protocol"], "dport", nft_port_spec(rule["port"])]
+    elif rule["protocol"] != "any":
+        parts += ["meta", "l4proto", rule["protocol"]]
     parts.append("drop" if rule["action"] == "deny" else "accept")
     return " ".join(parts)
 
@@ -283,8 +307,8 @@ def nft_line_to_rule(line: str, direction: str) -> Optional[Dict[str, str]]:
     return {
         "action": "deny" if match.group("verdict") == "drop" else "allow",
         "direction": direction,
-        "protocol": match.group("proto") or "any",
-        "port": match.group("port") or "",
+        "protocol": match.group("proto") or match.group("l4proto") or "any",
+        "port": panel_port_spec(match.group("port")) if match.group("port") else "",
         "address": match.group("address") or "any",
     }
 
@@ -302,19 +326,41 @@ def _managed_block(default_incoming: str, default_outgoing: str, rules: Sequence
         f"\t\ttype filter hook input priority 0; policy {NFT_POLICY.get(default_incoming, default_incoming)};",
         "\t\tct state established,related accept",
         '\t\tiif "lo" accept',
-        (in_lines + "\n") if in_lines else "",
+        in_lines,
         "\t}",
         "\tchain forward {",
         "\t\ttype filter hook forward priority 0; policy drop;",
         "\t}",
         "\tchain output {",
         f"\t\ttype filter hook output priority 0; policy {NFT_POLICY.get(default_outgoing, default_outgoing)};",
-        (out_lines + "\n") if out_lines else "",
+        out_lines,
         "\t}",
         "}",
         MANAGED_END,
     ]
     return "\n".join(line for line in block if line != "") + "\n"
+
+
+def managed_block_text(text: str) -> str:
+    """Just the managed block of an nftables.conf ('' when there is none)."""
+    begin = text.find(MANAGED_BEGIN)
+    end = text.find(MANAGED_END)
+    if begin == -1 or end == -1 or end < begin:
+        return ""
+    return text[begin:end + len(MANAGED_END)] + "\n"
+
+
+def nft_load_script(block: str) -> str:
+    """An nft script that replaces the panel's table in one transaction.
+
+    Loading ``table inet linustart { ... }`` on top of an existing table adds
+    to it - every apply would duplicate the rules, and a removed rule would
+    stay loaded. Declaring the table (a no-op when it exists), deleting it and
+    redefining it in one ``nft -f`` run swaps it atomically. Only the managed
+    block is loaded: re-running the whole file would also re-run whatever
+    else it holds (``flush ruleset`` wipes Docker's and fail2ban's rules).
+    """
+    return f"table {NFT_TABLE}\ndelete table {NFT_TABLE}\n{block}"
 
 
 def build_nftables_conf(
@@ -415,7 +461,7 @@ async def status() -> Dict[str, object]:
         data["installed"] = True
     else:
         data = parse_nftables_managed(read_text(NFTABLES_CONF))
-        probe = await run(["nft", "list", "table", "inet", "linustart"])
+        probe = await run(["nft", "list", "table", *NFT_TABLE.split()])
         data["enabled"] = data["enabled"] and probe.ok
         data["installed"] = shutil.which("nft") is not None
     data["backend"] = backend
@@ -440,17 +486,18 @@ async def nftables_apply(
     candidate = build_nftables_conf(
         read_text(NFTABLES_CONF), default_incoming, default_outgoing, rules, enabled
     )
+    script = nft_load_script(managed_block_text(candidate)) if enabled else ""
     if enabled:
-        check = await run(["nft", "-c", "-f", "-"], input_text=candidate)
+        check = await run(["nft", "-c", "-f", "-"], input_text=script)
         if not check.ok:
             raise ValueError(f"nftables rejected the ruleset: {(check.stderr or check.stdout).strip()}")
     write_text(NFTABLES_CONF, candidate)
     if enabled:
-        applied = await run(["nft", "-f", "-"], input_text=candidate)
+        applied = await run(["nft", "-f", "-"], input_text=script)
         if not applied.ok:
             raise RuntimeError(f"loading the nftables ruleset failed: {(applied.stderr or applied.stdout).strip()}")
     else:
-        await run(["nft", "delete", "table", "inet", "linustart"])
+        await run(["nft", "delete", "table", *NFT_TABLE.split()])
 
 
 async def reapply(backend: str) -> None:
@@ -460,10 +507,10 @@ async def reapply(backend: str) -> None:
         if not result.ok:
             raise RuntimeError(f"ufw reload failed: {(result.stderr or result.stdout).strip()}")
     else:
-        text = read_text(NFTABLES_CONF)
-        if MANAGED_BEGIN in text:
-            result = await run(["nft", "-f", "-"], input_text=text)
+        block = managed_block_text(read_text(NFTABLES_CONF))
+        if block:
+            result = await run(["nft", "-f", "-"], input_text=nft_load_script(block))
             if not result.ok:
                 raise RuntimeError(f"nftables reload failed: {(result.stderr or result.stdout).strip()}")
         else:
-            await run(["nft", "delete", "table", "inet", "linustart"])
+            await run(["nft", "delete", "table", *NFT_TABLE.split()])

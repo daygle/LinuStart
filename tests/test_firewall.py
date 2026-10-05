@@ -7,6 +7,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from linustart.modules.firewall import (  # noqa: E402
     build_nftables_conf,
+    managed_block_text,
+    nft_line_to_rule,
+    nft_load_script,
     nft_rule_line,
     normalize_rule,
     parse_nftables_managed,
@@ -136,7 +139,8 @@ def test_nftables_imports_foreign_file():
 
 def test_nft_rule_line_shapes():
     assert nft_rule_line(RULES[0]) == "tcp dport 22 accept"
-    assert nft_rule_line(RULES[1]) == "saddr 10.0.0.0/8 udp dport 53 drop"
+    # inet tables need the family on address matches
+    assert nft_rule_line(RULES[1]) == "ip saddr 10.0.0.0/8 udp dport 53 drop"
 
 
 def test_rule_covers_port():
@@ -157,3 +161,38 @@ if __name__ == "__main__":
             func()
             print(f"ok: {name}")
     print("all firewall tests passed")
+
+
+def test_nft_rule_line_uses_nft_port_and_family_syntax():
+    rule = {"action": "allow", "direction": "in", "protocol": "tcp", "port": "80,443", "address": "any"}
+    assert nft_rule_line(rule) == "tcp dport { 80, 443 } accept"
+    rule = {"action": "allow", "direction": "in", "protocol": "tcp", "port": "8000:8100", "address": "2001:db8::/32"}
+    assert nft_rule_line(rule) == "ip6 saddr 2001:db8::/32 tcp dport 8000-8100 accept"
+
+
+def test_nft_protocol_only_rule_is_not_accept_all():
+    rule = {"action": "allow", "direction": "in", "protocol": "udp", "port": "", "address": "any"}
+    assert nft_rule_line(rule) == "meta l4proto udp accept"
+    assert nft_line_to_rule("meta l4proto udp accept", "in") == rule
+
+
+def test_nft_round_trip_of_lists_ranges_and_v6():
+    rules = [
+        {"action": "allow", "direction": "in", "protocol": "tcp", "port": "80,443,8000:8100", "address": "any"},
+        {"action": "deny", "direction": "out", "protocol": "udp", "port": "", "address": "2001:db8::1"},
+    ]
+    text = build_nftables_conf("", "deny", "allow", rules)
+    assert parse_nftables_managed(text)["rules"] == rules
+
+
+def test_nft_reads_lines_from_older_versions():
+    assert nft_line_to_rule("saddr 10.0.0.0/8 udp dport 53 drop", "in")["address"] == "10.0.0.0/8"
+
+
+def test_nft_load_script_replaces_only_the_panel_table():
+    text = build_nftables_conf("#!/usr/sbin/nft -f\nflush ruleset\ntable inet other { }\n", "deny", "allow", RULES)
+    block = managed_block_text(text)
+    assert "flush ruleset" not in block and "inet other" not in block
+    script = nft_load_script(block)
+    assert script.startswith("table inet linustart\ndelete table inet linustart\n")
+    assert managed_block_text("no block here") == ""

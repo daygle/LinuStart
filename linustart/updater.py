@@ -315,9 +315,28 @@ def download(url: str, dest: Path) -> None:
         raise RuntimeError(f"download failed: {exc.reason}")
 
 
+def validate_member_types(members: Sequence[tarfile.TarInfo]) -> None:
+    """Refuse members that could write outside the tree when extracted.
+
+    Names alone are not enough: a symlink member pointing at /etc followed by
+    a regular file "through" it writes anywhere. Interpreters without the
+    extraction filter (the fallback below) get no other protection, so links
+    that leave the tree and device/fifo nodes are refused outright.
+    """
+    for member in members:
+        if member.isdev() or member.isfifo():
+            raise ValueError(f"refusing to extract special file: {member.name}")
+        if member.issym() or member.islnk():
+            target = PurePosixPath(member.linkname)
+            if target.is_absolute() or ".." in target.parts:
+                raise ValueError(f"refusing to extract link leaving the tree: {member.name}")
+
+
 def extract_tree(archive: Path, dest: Path) -> Path:
     with tarfile.open(archive, "r:gz") as tar:
-        top = validate_members([member.name for member in tar.getmembers()])
+        members = tar.getmembers()
+        top = validate_members([member.name for member in members])
+        validate_member_types(members)
         try:
             # Python 3.12+ can filter members; 3.14 rejects archives that do
             # not opt in, and the DeprecationWarning is noise in job logs.

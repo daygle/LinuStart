@@ -24,7 +24,6 @@ from ..paths import (
     MAIL_STATE_FILE,
     MSMTPRC,
     POSTFIX_MAIN_CF,
-    POSTFIX_SASL_DB,
     POSTFIX_SASL_PASSWD,
     POSTFIX_SENDER_CANONICAL,
     ROOT,
@@ -34,7 +33,9 @@ from ..util import read_text, run, write_text
 
 from .hostname import valid_hostname
 
-EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+# The local part may not start with '-': recipients are passed to sendmail
+# as arguments, and a leading dash would be read as an option.
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 # Local mailbox names ("root", "postmaster") are valid unattended-upgrades
 # recipients - the report is delivered on the box itself.
 LOCAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}$")
@@ -287,6 +288,17 @@ def valid_port(port: int) -> bool:
     return isinstance(port, int) and 1 <= port <= 65535
 
 
+def valid_sasl_username(username: str) -> bool:
+    """sasl_passwd holds `location user:password` - the user may not contain
+    whitespace (it would end the key/value split) or ':' (it would end the
+    user), and nothing may contain a line break (it would start a new entry)."""
+    return bool(username) and not any(char.isspace() or char == ":" for char in username)
+
+
+def valid_sasl_password(password: str) -> bool:
+    return not any(char in password for char in "\r\n\x00")
+
+
 # --------------------------------------------------------------------------
 # Envelope sender (MAIL FROM)
 # --------------------------------------------------------------------------
@@ -382,6 +394,10 @@ def format_relayhost(host: str, port: int) -> str:
 
 def sasl_line(location: str, username: str, password: str) -> str:
     """One sasl_passwd entry: `location user:password`."""
+    if not valid_sasl_username(username):
+        raise ValueError("the SMTP username may not contain spaces or ':'")
+    if not valid_sasl_password(password):
+        raise ValueError("the SMTP password may not contain line breaks")
     return f"{location} {username}:{password}"
 
 
@@ -516,6 +532,10 @@ async def apply(
         raise ValueError(f"invalid port: {port!r}")
     if not username:
         raise ValueError("an SMTP username is required")
+    if not valid_sasl_username(username):
+        raise ValueError("the SMTP username may not contain spaces or ':'")
+    if password and not valid_sasl_password(password):
+        raise ValueError("the SMTP password may not contain line breaks")
     if not valid_email(from_address):
         raise ValueError(f"invalid from address: {from_address!r}")
     if report_mode not in REPORT_MODES:
@@ -535,8 +555,9 @@ async def apply(
         if not password:
             raise
         line = merge_sasl_line(existing, location, username, password)
-    write_text(POSTFIX_SASL_PASSWD, line)
-    os.chmod(POSTFIX_SASL_PASSWD, SASL_PASSWD_MODE)
+    # The mode is set before the file is renamed into place, so the password
+    # is never readable by anyone but root, not even for a moment.
+    write_text(POSTFIX_SASL_PASSWD, line, mode=SASL_PASSWD_MODE)
     await run(["postmap", "hash:/etc/postfix/sasl_passwd"], check=True)
 
     write_text(POSTFIX_SENDER_CANONICAL, sender_canonical_table(from_address, username))

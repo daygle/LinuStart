@@ -6,8 +6,10 @@ Pure helpers operate on strings and dicts so they can be tested without root.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import ipaddress
+import json
 import re
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -21,6 +23,10 @@ except ImportError:  # pragma: no cover - exercised on minimal installs
     yaml = None  # type: ignore[assignment]
 
 MANAGED_KEYS = ("address", "netmask", "gateway", "dns-nameservers")
+# Kernel interface names: at most 15 bytes (IFNAMSIZ - 1), no whitespace or
+# '/'. The name is written into config files and passed to ifup/nmcli, so a
+# newline or a leading '-' must never get through.
+IFACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,14}$")
 IFACE_HEADER_RE = re.compile(r"^(?P<indent>\s*)iface\s+(?P<name>\S+)\s+(?P<family>\S+)\s+(?P<method>\S+)\s*$")
 AUTO_RE = re.compile(r"^\s*auto\s+(?P<names>.+?)\s*$")
 
@@ -28,6 +34,32 @@ AUTO_RE = re.compile(r"^\s*auto\s+(?P<names>.+?)\s*$")
 # --------------------------------------------------------------------------
 # Address helpers
 # --------------------------------------------------------------------------
+
+def validate_interface_name(name: str) -> str:
+    name = (name or "").strip()
+    if not IFACE_NAME_RE.match(name):
+        raise ValueError(f"not a valid interface name: {name!r}")
+    return name
+
+
+def validate_dns(servers: Optional[Sequence[str]]) -> List[str]:
+    """Every DNS server must be a literal IP address.
+
+    The list lands verbatim on a ``dns-nameservers`` line (ifupdown) or in
+    nmcli arguments, so anything else - a hostname, a stray newline - is
+    refused instead of being written into the configuration.
+    """
+    cleaned: List[str] = []
+    for server in servers or []:
+        server = str(server).strip()
+        if not server:
+            continue
+        try:
+            cleaned.append(str(ipaddress.ip_address(server)))
+        except ValueError:
+            raise ValueError(f"not a valid DNS server address: {server!r}") from None
+    return cleaned
+
 
 def split_cidr(cidr: str) -> Tuple[str, str]:
     """'10.0.0.5/24' -> ('10.0.0.5', '255.255.255.0')."""
@@ -162,13 +194,14 @@ def update_ifupdown_interface(
     """
     if method not in ("static", "dhcp", "manual"):
         raise ValueError(f"unsupported method: {method!r}")
+    name = validate_interface_name(name)
     if method == "static":
         if not address:
             raise ValueError("a static interface needs an address")
         split_cidr(address)  # validate
     if gateway:
         ipaddress.ip_address(gateway)
-    dns = [server for server in (dns or []) if server]
+    dns = validate_dns(dns)
 
     lines = text.splitlines()
     # Every stanza for this interface, not just the first: a hand-edited file
@@ -380,6 +413,8 @@ def update_netplan_interface(
     """Return updated netplan data for one interface (pure, non-mutating)."""
     if yaml is None:
         raise RuntimeError("netplan support requires the PyYAML package")
+    name = validate_interface_name(name)
+    dns = validate_dns(dns)
     data = copy.deepcopy(data)
     network = data.setdefault("network", {})
     if not isinstance(network, dict):
@@ -515,6 +550,8 @@ async def write_interface_config(
     gateway: Optional[str] = None,
     dns: Optional[Sequence[str]] = None,
 ) -> None:
+    name = validate_interface_name(name)
+    dns = validate_dns(dns)
     if backend == "ifupdown":
         text = read_text(INTERFACES_FILE)
         updated = update_ifupdown_interface(text, name, method, address, gateway, dns)
@@ -552,14 +589,24 @@ async def write_interface_config(
                 break
         if not connection:
             raise RuntimeError(f"no NetworkManager connection found for {name}")
-        argv = ["nmcli", "connection", "mod", str(connection), "ipv4.method",
-                "manual" if method == "static" else "auto"]
-        if method == "static" and address:
-            argv += ["ipv4.addresses", address]
+        if method == "static":
+            if not address:
+                raise ValueError("a static interface needs an address")
+            split_cidr(address)
             if gateway:
-                argv += ["ipv4.gateway", gateway]
-            if dns:
-                argv += ["ipv4.dns", ",".join(dns)]
+                ipaddress.ip_address(gateway)
+            argv = ["nmcli", "connection", "mod", str(connection),
+                    "ipv4.method", "manual",
+                    "ipv4.addresses", address,
+                    "ipv4.gateway", gateway or ""]
+        else:
+            # With ipv4.method auto NetworkManager keeps any ipv4.addresses as
+            # extra static addresses, so switching to DHCP has to clear them.
+            argv = ["nmcli", "connection", "mod", str(connection),
+                    "ipv4.method", "auto",
+                    "ipv4.addresses", "",
+                    "ipv4.gateway", ""]
+        argv += ["ipv4.dns", ",".join(dns)]
         await run(argv, check=True)
         return
     raise ValueError(f"unknown backend: {backend!r}")
@@ -591,11 +638,10 @@ async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
 
 async def runtime_status() -> Dict[str, object]:
     """Live interface state straight from the kernel."""
-    addr = await run(["ip", "-j", "addr", "show"])
-    route = await run(["ip", "-j", "route", "show"])
+    addr, route = await asyncio.gather(
+        run(["ip", "-j", "addr", "show"]), run(["ip", "-j", "route", "show"])
+    )
     try:
-        import json
-
         addresses = json.loads(addr.stdout) if addr.ok and addr.stdout.strip() else []
         routes = json.loads(route.stdout) if route.ok and route.stdout.strip() else []
     except ValueError:

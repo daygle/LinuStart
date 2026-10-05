@@ -8,7 +8,7 @@ panel's own process is refused.
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, List
 
 from ..util import run
 

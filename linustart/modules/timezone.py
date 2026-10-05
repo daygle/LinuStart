@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import re
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 from ..paths import ZONEINFO_DIR
 from ..util import run
@@ -15,11 +17,22 @@ TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 def list_timezones() -> List[str]:
-    """All valid tzdata names under /usr/share/zoneinfo."""
-    zones: List[str] = []
+    """All valid tzdata names under /usr/share/zoneinfo.
+
+    Walking the tree touches ~1800 files, and it ran on every page load and
+    every timezone change; the result only changes when tzdata is upgraded,
+    so it is cached per directory and modification time.
+    """
     base = ZONEINFO_DIR
     if not base.is_dir():
-        return zones
+        return []
+    return list(_scan_timezones(str(base), base.stat().st_mtime))
+
+
+@functools.lru_cache(maxsize=4)
+def _scan_timezones(base_dir: str, _mtime: float) -> Tuple[str, ...]:
+    base = Path(base_dir)
+    zones: List[str] = []
     for path in base.rglob("*"):
         if not path.is_file():
             continue
@@ -32,7 +45,7 @@ def list_timezones() -> List[str]:
         if not re.match(r"^[A-Za-z0-9_+/-]+$", rel):
             continue
         zones.append(rel)
-    return sorted(set(zones))
+    return tuple(sorted(set(zones)))
 
 
 def valid_timezone(name: str, zones: List[str]) -> bool:

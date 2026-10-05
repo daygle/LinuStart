@@ -87,7 +87,7 @@ def overview() -> Dict[str, object]:
     return {
         "hostname": platform.node(),
         "os_name": release.get("PRETTY_NAME") or release.get("NAME") or platform.system(),
-        "distro": distro_info(),
+        "distro": distro_info(release),
         "kernel": platform.release(),
         "arch": platform.machine(),
         "python": platform.python_version(),
