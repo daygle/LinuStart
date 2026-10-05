@@ -11,13 +11,16 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from linustart import audit, sessions as sessions_mod  # noqa: E402
+from linustart import audit, sessions as sessions_mod, util  # noqa: E402
 from linustart.sessions import SessionManager  # noqa: E402
 
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(audit, "AUDIT_LOG", tmp_path / "audit.log")
+    # restoring a snapshot backs the current file up first; keep that in the
+    # sandbox (the real /var/lib/linustart is not writable for CI's user)
+    monkeypatch.setattr(util, "BACKUP_DIR", tmp_path / "backups")
     reapplied = []
 
     async def fake(spec):
