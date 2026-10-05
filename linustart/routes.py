@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, W
 from pydantic import BaseModel, Field
 
 from . import audit
+from . import metrics as metrics_mod
 from . import updater as updater_mod
 from .jobs import JobManager
 from .modules import disk as disk_mod
@@ -168,6 +169,17 @@ class OverrideBody(BaseModel):
     content: str = ""
 
 
+class AlertsBody(BaseModel):
+    enabled: bool = False
+    cpu: float = 90
+    mem: float = 90
+    disk: float = 90
+    load_per_cpu: float = 2.0
+    sustain_minutes: float = 5
+    cooldown_minutes: float = 360
+    recipient: str = ""
+
+
 class DiskScanBody(BaseModel):
     path: str
 
@@ -238,6 +250,7 @@ def build_router(
     jobs: JobManager,
     sessions: SessionManager,
     terminals: TerminalManager,
+    recorder: Optional[metrics_mod.MetricsRecorder] = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -1531,6 +1544,41 @@ def build_router(
         )
         audit.record("update.rollback", "rollback to the most recent application backup")
         return job.to_dict()
+
+    # ---- metrics and alerts ----------------------------------------------
+    def alerts_view(config: Dict[str, object]) -> Dict[str, object]:
+        active = [k for k, on in recorder.active.items() if on] if recorder else []
+        return {"config": config, "active": active,
+                "thresholds": recorder.thresholds(config) if recorder else {}}
+
+    @router.get("/metrics", dependencies=guard)
+    async def metrics_history() -> Dict[str, object]:
+        return {
+            "samples": list(recorder.samples) if recorder else [],
+            "interval": recorder.interval if recorder else metrics_mod.INTERVAL,
+            "cpus": recorder.cpus if recorder else 1,
+            "alerts": alerts_view(metrics_mod.load_alert_config()),
+            "recipient": await metrics_mod.alert_recipient(metrics_mod.load_alert_config()),
+        }
+
+    @router.post("/metrics/alerts", dependencies=guard)
+    async def metrics_alerts(body: AlertsBody) -> Dict[str, object]:
+        try:
+            config = metrics_mod.save_alert_config(body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        audit.record("alerts.configure", "resource alerts " + ("enabled" if config["enabled"] else "disabled"))
+        return alerts_view(config)
+
+    @router.post("/metrics/alerts/test", dependencies=guard)
+    async def metrics_alerts_test() -> Dict[str, object]:
+        sent = await metrics_mod.send_alert({"kind": "test", "metric": "test"})
+        if not sent:
+            raise HTTPException(
+                status_code=400,
+                detail="the test alert could not be sent - set a recipient and check the Email page",
+            )
+        return {"ok": True}
 
     # ---- audit -----------------------------------------------------------
     @router.get("/audit", dependencies=guard)

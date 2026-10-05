@@ -167,6 +167,7 @@ function setView(name) {
   $(`#view-${name}`).classList.remove("hidden");
   $("#view-title").textContent = TITLES[name] || name;
   clearInterval(state.jobsTimer);
+  clearInterval(state.metricsTimer);
   stopLogFollow();
   loadView();
 }
@@ -218,7 +219,246 @@ async function loadOverview() {
   } catch (err) {
     $("#overview-addresses").innerHTML = `<div class="muted">${esc(err.message)}</div>`;
   }
+  await loadMetrics();
+  clearInterval(state.metricsTimer);
+  state.metricsTimer = setInterval(() => { if (state.view === "overview") loadMetrics(); }, 60000);
 }
+
+/* ---------------------------------------------------------------- metrics */
+
+// Small multiples: one single-series chart per metric (different units, so
+// never a shared or second axis). Line 2px in the accent, a 10% area wash,
+// hairline grid, the latest value labelled at the line's end, the alert
+// limit as a quiet reference line, and a crosshair tooltip on hover/focus.
+const METRIC_CHARTS = [
+  { key: "cpu", title: "CPU", unit: "%", max: 100 },
+  { key: "mem", title: "Memory", unit: "%", max: 100 },
+  { key: "disk", title: "Disk /", unit: "%", max: 100 },
+  { key: "load", title: "Load average (1 min)", unit: "", max: null },
+];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs || {}).forEach(([k, v]) => el.setAttribute(k, String(v)));
+  if (parent) parent.appendChild(el);
+  return el;
+}
+
+function niceMax(value) {
+  if (!(value > 0)) return 1;
+  const step = Math.pow(10, Math.floor(Math.log10(value)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * step >= value) return m * step;
+  return 10 * step;
+}
+
+function fmtMetric(value, unit) {
+  if (value === null || value === undefined) return "-";
+  return unit === "%" ? `${Number(value).toFixed(1)}%` : Number(value).toFixed(2);
+}
+
+function fmtClock(t) {
+  return new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderMetricChart(box, spec, samples, limit, interval) {
+  box.textContent = "";
+  const title = document.createElement("h3");
+  title.textContent = spec.title;
+  box.appendChild(title);
+  const points = samples.filter((s) => typeof s[spec.key] === "number");
+  const width = Math.max(200, Math.round(box.getBoundingClientRect().width) || 300);
+  const height = 130;
+  const m = { left: 30, right: 52, top: 10, bottom: 18 };
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
+    "aria-label": `${spec.title} over the last 24 hours` }, box);
+  if (!points.length) {
+    const t = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "tick" }, svg);
+    t.textContent = "Collecting - the first points appear within a minute";
+    return;
+  }
+  const t1 = points[points.length - 1].t;
+  const t0 = Math.min(points[0].t, t1 - 3600);
+  const peak = Math.max(...points.map((p) => p[spec.key]), limit || 0);
+  const yMax = spec.max || niceMax(peak * 1.1);
+  const x = (t) => m.left + ((t - t0) / Math.max(1, t1 - t0)) * (width - m.left - m.right);
+  const y = (v) => m.top + (1 - Math.min(v, yMax) / yMax) * (height - m.top - m.bottom);
+  const grid = getComputedStyle(document.documentElement);
+  const border = grid.getPropertyValue("--border").trim() || "#e2e8f0";
+  const accent = grid.getPropertyValue("--accent").trim() || "#2563eb";
+  const muted = grid.getPropertyValue("--muted").trim() || "#64748b";
+  const panel = grid.getPropertyValue("--panel").trim() || "#ffffff";
+  [0, yMax / 2, yMax].forEach((v) => {
+    svgEl("line", { x1: m.left, x2: width - m.right, y1: y(v), y2: y(v), stroke: border, "stroke-width": 1 }, svg);
+    const label = svgEl("text", { x: m.left - 6, y: y(v) + 3, "text-anchor": "end", class: "tick" }, svg);
+    label.textContent = spec.unit === "%" ? `${v}` : `${+v.toFixed(2)}`;
+  });
+  [[t0, "start"], [t1, "end"]].forEach(([t, anchor]) => {
+    const label = svgEl("text", { x: x(t), y: height - 4, "text-anchor": anchor, class: "tick" }, svg);
+    label.textContent = fmtClock(t);
+  });
+  if (limit && limit <= yMax) {
+    svgEl("line", { x1: m.left, x2: width - m.right, y1: y(limit), y2: y(limit), stroke: muted, "stroke-width": 1 }, svg);
+    const ref = svgEl("text", { x: m.left + 4, y: y(limit) - 4, class: "ref-label" }, svg);
+    ref.textContent = `alert ${fmtMetric(limit, spec.unit)}`;
+  }
+  // a gap of more than two intervals (panel stopped) breaks the line
+  const segments = [];
+  points.forEach((p, i) => {
+    if (!i || p.t - points[i - 1].t > interval * 2.5) segments.push([]);
+    segments[segments.length - 1].push(p);
+  });
+  segments.forEach((seg) => {
+    const line = seg.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p[spec.key]).toFixed(1)}`).join("");
+    if (seg.length > 1) {
+      const base = y(0).toFixed(1);
+      svgEl("path", { d: `${line}L${x(seg[seg.length - 1].t).toFixed(1)},${base}L${x(seg[0].t).toFixed(1)},${base}Z`,
+        fill: accent, "fill-opacity": 0.1 }, svg);
+    }
+    svgEl("path", { d: line, fill: "none", stroke: accent, "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  });
+  const last = points[points.length - 1];
+  svgEl("circle", { cx: x(last.t), cy: y(last[spec.key]), r: 4, fill: accent, stroke: panel, "stroke-width": 2 }, svg);
+  const end = svgEl("text", { x: x(last.t) + 8, y: y(last[spec.key]) + 4, class: "end-label" }, svg);
+  end.textContent = fmtMetric(last[spec.key], spec.unit);
+
+  // crosshair + tooltip; the whole plot is the hit target
+  const cross = svgEl("line", { y1: m.top, y2: height - m.bottom, stroke: muted, "stroke-width": 1, visibility: "hidden" }, svg);
+  const dot = svgEl("circle", { r: 4, fill: accent, stroke: panel, "stroke-width": 2, visibility: "hidden" }, svg);
+  const tip = document.createElement("div");
+  tip.className = "chart-tip hidden";
+  const tipValue = document.createElement("strong");
+  const tipTime = document.createElement("span");
+  tip.append(tipValue, tipTime);
+  box.appendChild(tip);
+  let focusIndex = points.length - 1;
+  const show = (index) => {
+    const p = points[Math.max(0, Math.min(points.length - 1, index))];
+    focusIndex = points.indexOf(p);
+    const px = x(p.t);
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", px); dot.setAttribute("cy", y(p[spec.key])); dot.setAttribute("visibility", "visible");
+    tipValue.textContent = fmtMetric(p[spec.key], spec.unit);
+    tipTime.textContent = fmtClock(p.t);
+    tip.classList.remove("hidden");
+    const scale = svg.getBoundingClientRect().width / width || 1;
+    const left = Math.min(px * scale + 10, svg.getBoundingClientRect().width - tip.offsetWidth - 4);
+    tip.style.left = `${Math.max(0, left)}px`;
+    tip.style.top = `${title.offsetHeight + 4}px`;
+  };
+  const hide = () => {
+    cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden");
+    tip.classList.add("hidden");
+  };
+  const hit = svgEl("rect", { x: m.left, y: 0, width: width - m.left - m.right, height, fill: "transparent" }, svg);
+  hit.addEventListener("pointermove", (event) => {
+    const rect = svg.getBoundingClientRect();
+    const t = t0 + ((event.clientX - rect.left) * (width / rect.width) - m.left) / (width - m.left - m.right) * (t1 - t0);
+    let best = 0;
+    points.forEach((p, i) => { if (Math.abs(p.t - t) < Math.abs(points[best].t - t)) best = i; });
+    show(best);
+  });
+  hit.addEventListener("pointerleave", hide);
+  svg.addEventListener("focus", () => show(focusIndex));
+  svg.addEventListener("blur", hide);
+  svg.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft") { show(focusIndex - 1); event.preventDefault(); }
+    if (event.key === "ArrowRight") { show(focusIndex + 1); event.preventDefault(); }
+  });
+}
+
+function renderMetricTable(samples) {
+  // one row per 10 minutes keeps the table readable; values match the charts
+  const rows = samples.filter((s, i) => i === samples.length - 1 || s.t % 600 < 60).reverse().map((s) => `
+    <tr><td>${esc(new Date(s.t * 1000).toLocaleString())}</td>
+      ${METRIC_CHARTS.map((c) => `<td class="num">${esc(fmtMetric(s[c.key], c.unit))}</td>`).join("")}</tr>`).join("");
+  $("#metrics-table").innerHTML = `
+    <thead><tr><th>Time</th>${METRIC_CHARTS.map((c) => `<th>${esc(c.title)}</th>`).join("")}</tr></thead>
+    <tbody>${rows || "<tr><td colspan='5' class='muted'>No samples yet</td></tr>"}</tbody>`;
+}
+
+function renderAlerts(alerts, recipient) {
+  const cfg = alerts.config || {};
+  $("#alert-enabled").checked = !!cfg.enabled;
+  $("#alert-cpu").value = cfg.cpu;
+  $("#alert-mem").value = cfg.mem;
+  $("#alert-disk").value = cfg.disk;
+  $("#alert-load").value = cfg.load_per_cpu;
+  $("#alert-sustain").value = cfg.sustain_minutes;
+  $("#alert-cooldown").value = cfg.cooldown_minutes;
+  $("#alert-recipient").value = cfg.recipient || "";
+  $("#alert-recipient").placeholder = recipient && !cfg.recipient
+    ? `${recipient} (from the Email page)` : "ops@example.com or root";
+  const status = $("#alerts-status");
+  const active = alerts.active || [];
+  if (!cfg.enabled) { status.className = "badge muted"; status.textContent = "off"; }
+  else if (active.length) {
+    status.className = "badge warn";
+    status.textContent = `⚠ alerting: ${active.map((k) => (METRIC_CHARTS.find((c) => c.key === k) || {}).title || k).join(", ")}`;
+  } else { status.className = "badge ok"; status.textContent = "✓ on, all within limits"; }
+}
+
+async function loadMetrics() {
+  try {
+    const data = await api("/metrics");
+    state.metricsData = data;
+    renderMetrics(data);
+  } catch (err) { $("#metrics-note").textContent = err.message; }
+}
+
+function renderMetrics(data) {
+  const samples = data.samples || [];
+  const thresholds = (data.alerts && data.alerts.thresholds) || {};
+  const enabled = data.alerts && data.alerts.config && data.alerts.config.enabled;
+  const container = $("#metrics-charts");
+  container.textContent = "";
+  // lay every box out first, then measure: a box measured before its
+  // siblings exist gets the whole row's width and renders at the wrong scale
+  const boxes = METRIC_CHARTS.map(() => {
+    const box = document.createElement("div");
+    box.className = "chart";
+    container.appendChild(box);
+    return box;
+  });
+  METRIC_CHARTS.forEach((spec, i) => {
+    renderMetricChart(boxes[i], spec, samples, enabled ? thresholds[spec.key] : null, data.interval || 60);
+  });
+  $("#metrics-note").textContent = `sampled every ${data.interval || 60}s · ${data.cpus} CPU(s)`;
+  renderMetricTable(samples);
+  renderAlerts(data.alerts || {}, data.recipient);
+}
+
+window.addEventListener("resize", () => {
+  clearTimeout(state.metricsResize);
+  state.metricsResize = setTimeout(() => { if (state.view === "overview" && state.metricsData) renderMetrics(state.metricsData); }, 200);
+});
+
+$("#alerts-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = {
+    enabled: $("#alert-enabled").checked,
+    cpu: Number($("#alert-cpu").value),
+    mem: Number($("#alert-mem").value),
+    disk: Number($("#alert-disk").value),
+    load_per_cpu: Number($("#alert-load").value),
+    sustain_minutes: Number($("#alert-sustain").value),
+    cooldown_minutes: Number($("#alert-cooldown").value),
+    recipient: $("#alert-recipient").value.trim(),
+  };
+  try {
+    await api("/metrics/alerts", { method: "POST", body });
+    toast("Alert settings saved", "success");
+    loadMetrics();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+$("#alert-test").addEventListener("click", async () => {
+  try {
+    await api("/metrics/alerts/test", { method: "POST" });
+    toast("Test alert sent", "success");
+  } catch (err) { toast(err.message, "error"); }
+});
 
 /* ---------------------------------------------------------------- network */
 

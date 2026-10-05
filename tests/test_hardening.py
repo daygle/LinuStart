@@ -301,6 +301,10 @@ def client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(audit, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(sessions_mod, "PENDING_REVERTS_FILE", tmp_path / "pending-reverts.json")
+    from linustart import metrics as metrics_mod
+
+    monkeypatch.setattr(metrics_mod, "METRICS_FILE", tmp_path / "metrics.json")
+    monkeypatch.setattr(metrics_mod, "ALERTS_FILE", tmp_path / "alerts.json")
     app = create_app(Settings(token="s3cret-token"))
     with TestClient(app) as test_client:
         yield test_client
@@ -513,6 +517,9 @@ def test_terminal_closes_idle_sessions(tmp_path, monkeypatch):
 
     monkeypatch.setattr(audit, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(sessions_mod, "PENDING_REVERTS_FILE", tmp_path / "pending.json")
+    from linustart import metrics as metrics_mod
+
+    monkeypatch.setattr(metrics_mod, "METRICS_FILE", tmp_path / "metrics.json")
     monkeypatch.setattr(terminal, "TERMINAL_LOG_DIR", tmp_path / "term")
     app = create_app(Settings(token=None, terminal_idle_minutes=0.02))  # ~1.2 s
     with TestClient(app) as test_client:
