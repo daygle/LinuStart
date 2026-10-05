@@ -4,7 +4,8 @@
 # Debian family, detected via /etc/os-release).
 #
 # Usage:
-#   ./install.sh                     # install (or upgrade in place), reachable on the LAN
+#   ./install.sh                     # install the latest release (or upgrade in place)
+#   ./install.sh --source            # install this checkout instead of the latest release
 #   ./install.sh --loopback          # bind 127.0.0.1 only (access over an SSH tunnel)
 #   ./install.sh --host 0.0.0.0 --port 8765
 #   ./install.sh --uninstall         # remove the service and files
@@ -29,14 +30,22 @@ HOST_SET=0
 PORT_SET=0
 UNINSTALL=0
 RESTART_NEEDED=0
+# An install is a released version: cloning main gives you a tree ahead of
+# every tag, so the newest release is what gets installed unless --source
+# says otherwise. The panel then reports a version that matches the release
+# it came from and its own "check for updates" has something to compare.
+FROM_SOURCE=0
+REPO="${LINUSTART_REPO:-daygle/LinuStart}"
+TAG_PATTERN='^v?[0-9]+(\.[0-9]+){0,3}([-.][0-9A-Za-z.]+)?$'
 
 usage() {
-    sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --uninstall) UNINSTALL=1 ;;
+        --source)    FROM_SOURCE=1 ;;
         --loopback)  HOST="127.0.0.1"; HOST_SET=1 ;;
         --host)      HOST="${2:-}"; HOST_SET=1; shift ;;
         --port)      PORT="${2:-}"; PORT_SET=1; shift ;;
@@ -133,8 +142,67 @@ apt-get install -y -qq python3 python3-venv python3-pip iproute2 unattended-upgr
 echo "==> Installing LinuStart into $APP_DIR"
 mkdir -p "$APP_DIR" "$CONFIG_DIR" "$STATE_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-rsync -a --delete --exclude venv --exclude __pycache__ "$SCRIPT_DIR"/ "$SRC_DIR"/ 2>/dev/null \
-    || (rm -rf "$SRC_DIR" && mkdir -p "$SRC_DIR" && cp -r "$SCRIPT_DIR"/. "$SRC_DIR"/)
+
+# Resolve, download and unpack the newest published release; echo
+# "<tag>|<directory>". Every non-zero return means "fall back to the
+# checkout", so an offline install never fails just because GitHub is down.
+#
+# The tag comes from the GitHub API but the download URL is built here from
+# REPO and that tag, and the tag is checked against TAG_PATTERN first, so the
+# only untrusted text that reaches the shell is a validated version string.
+fetch_release_info() {
+    local tag archive top work
+    command -v curl >/dev/null 2>&1 || return 1
+    tag="$(curl -fsSL --max-time 20 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: LinuStart-Installer' \
+        "https://api.github.com/repos/$REPO/releases/latest" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin).get("tag_name", ""))' 2>/dev/null)" || return 1
+    [[ "$tag" =~ $TAG_PATTERN ]] || return 1
+    work="$(mktemp -d)"
+    archive="$work/release.tar.gz"
+    curl -fsSL --max-time 180 -H 'User-Agent: LinuStart-Installer' \
+        "https://api.github.com/repos/$REPO/tarball/$tag" -o "$archive" || { rm -rf "$work"; return 1; }
+    # GNU tar refuses absolute paths and '..' members, so unpacking is safe.
+    tar -xzf "$archive" -C "$work" || { rm -rf "$work"; return 1; }
+    top="$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    if [[ -z "$top" || ! -f "$top/linustart/__init__.py" || ! -f "$top/pyproject.toml" ]]; then
+        rm -rf "$work"
+        return 1
+    fi
+    RELEASE_WORK="$work"
+    printf '%s|%s|%s\n' "$tag" "$top" "$work"
+}
+
+SOURCE_TREE="$SCRIPT_DIR"
+RELEASE_TAG=""
+RELEASE_WORK=""
+if [[ "$FROM_SOURCE" -eq 0 ]]; then
+    echo "    Looking for the latest $REPO release..."
+    if RELEASE_INFO="$(fetch_release_info)"; then
+        RELEASE_TAG="${RELEASE_INFO%%|*}"
+        RELEASE_REST="${RELEASE_INFO#*|}"
+        SOURCE_TREE="${RELEASE_REST%%|*}"
+        RELEASE_WORK="${RELEASE_REST#*|}"
+        echo "    Installing release $RELEASE_TAG"
+    else
+        echo "    Could not fetch a release, installing this checkout instead." >&2
+    fi
+else
+    echo "    --source: installing this checkout as-is"
+fi
+
+# .git is never copied: an installed tree is a release, not a working tree,
+# and the panel refuses to self-update a directory that still looks like one.
+rsync -a --delete --exclude venv --exclude __pycache__ --exclude .git "$SOURCE_TREE"/ "$SRC_DIR"/ 2>/dev/null \
+    || (rm -rf "$SRC_DIR" && mkdir -p "$SRC_DIR" && cp -r "$SOURCE_TREE"/. "$SRC_DIR"/)
+rm -rf "$SRC_DIR/.git"
+if [[ -n "$RELEASE_WORK" ]]; then
+    rm -rf "$RELEASE_WORK"
+fi
+
+INSTALLED_VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$SRC_DIR/linustart/__init__.py" | head -n1)"
+echo "    Installed version ${INSTALLED_VERSION:-unknown}${RELEASE_TAG:+ (release $RELEASE_TAG)}"
 
 if [[ ! -d "$VENV_DIR" ]]; then
     python3 -m venv "$VENV_DIR"

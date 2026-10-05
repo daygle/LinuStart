@@ -56,7 +56,7 @@ The installer:
 1. verifies the system is in the Debian family (`/etc/os-release`),
 2. checks for other mail transfer agents (`msmtp-mta`, `ssmtp`, `exim4`, …) and reports them - they are left working; the Email page switches delivery to Postfix and removes them afterwards,
 3. installs `python3` + venv, `iproute2` and `unattended-upgrades`,
-4. installs the app into `/opt/linustart`,
+4. fetches the **newest published release** from GitHub and installs it into `/opt/linustart` - an install is a released version, so the panel's own "check for updates" always has a real release to compare against. If GitHub is unreachable it installs the checkout it was run from instead and says so; `./install.sh --source` skips the release lookup deliberately (developers), and `LINUSTART_REPO=owner/name` points it at a fork,
 5. creates `/etc/linustart/config.json` with a generated access token and the
    listen address (every interface, so the panel is reachable on the LAN),
 6. offers to open the port in `ufw` (or prints the `firewalld` equivalent),
@@ -72,7 +72,8 @@ ssh -L 8765:127.0.0.1:8765 user@your-server
 # browser: http://127.0.0.1:8765   (paste the token printed by the installer)
 ```
 
-Install flags: `--loopback` binds `127.0.0.1` only, `--host ADDR` and
+Install flags: `--source` installs the checkout instead of the newest release,
+`--loopback` binds `127.0.0.1` only, `--host ADDR` and
 `--port N` set the listen address, and `./install.sh --uninstall` removes the
 service again.
 
@@ -86,6 +87,17 @@ version is just tagging a release:
 git tag v0.2.0 && git push --tags
 # then create a GitHub release from the tag
 ```
+
+**What version am I running?** The panel never guesses. An installed copy
+reports the release it came from; a **git checkout** reports what git says,
+e.g. `1.0.0-3-g0cdaeb8`, with the commit and how many commits past the tag it
+is - visible in the Updates panel, in `/api/health` and in `linustart --version`.
+Cloning `main` therefore never hides the fact that you are running unreleased
+code. For the same reason **bump `__version__` in `linustart/__init__.py` only
+together with the tag**: a version ahead of the newest release would leave
+nothing for the updater to offer, and the suite fails if that ever happens.
+Source checkouts are also never self-updated from the GUI - the panel refuses
+to overwrite a working tree, and tells you to use `git pull` instead.
 
 Each update first archives the running application to
 `/var/lib/linustart/backups/`; if the new version fails to verify, the old one

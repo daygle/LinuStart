@@ -9,21 +9,28 @@ from linustart.updater import (  # noqa: E402
     _replace,
     apply_command,
     build_api_url,
+    is_managed_install,
     is_newer,
+    is_source_checkout,
     normalize_version,
+    parse_describe,
     parse_release,
     replace_tree,
     restart_command,
     rollback_command,
+    running_version,
     staging_dir,
     validate_members,
     validate_repo,
     validate_tag,
+    version_details,
+    version_key,
 )
 
 import errno  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 
 RELEASE = {
@@ -193,6 +200,78 @@ def test_version_is_the_single_source_of_truth():
     # the updater compares the installed version against the tag
     assert normalize_version("v" + linustart.__version__) == linustart.__version__
     assert validate_tag("v" + linustart.__version__)
+
+
+# --- what the panel reports it is running ----------------------------------
+
+def test_parse_describe():
+    assert parse_describe("v1.0.0-3-g0cdaeb8\n") == ("1.0.0", 3, "0cdaeb8")
+    assert parse_describe("v1.2.0-0-gabcdef1234567890") == ("1.2.0", 0, "abcdef1234567890")
+    # no tag, no git, a shallow clone: we must not guess how far ahead we are
+    for junk in ["", "   ", "fatal: No names found\n", "v1.0.0\n", "1.0.0-3-gnothex\n"]:
+        assert parse_describe(junk) is None, junk
+
+
+def test_version_details_matches_the_source_it_runs_from():
+    import linustart
+
+    details = version_details()
+    if is_source_checkout():
+        assert details["source"] == "git"
+        assert details["version"] == f"{details['base']}-{details['ahead']}-g{details['commit']}"
+        assert details["ahead"] >= 0
+    else:
+        # A release tarball has no repository to ask.
+        assert details["source"] == "declared"
+        assert details["version"] == linustart.__version__
+    assert running_version() == details["version"]
+    assert version_key(details["base"])  # comparable against a release tag
+
+
+def test_declared_version_is_never_ahead_of_the_newest_tag():
+    """A version past every tag would hide in-panel updates for good.
+
+    /update/check compares the newest release against what is installed; if
+    the declared version runs ahead of the last release there is nothing left
+    to offer, and the panel says 'up to date' while running unreleased code.
+    Bump the version on main only together with cutting the tag.
+    """
+    import linustart
+
+    try:
+        tags = subprocess.run(
+            ["git", "tag", "--list"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return  # no git here (the standalone runner, a tarball export)
+    if tags.returncode != 0 or not tags.stdout.strip():
+        return  # not a checkout, or no release has been tagged yet
+    newest = max((t.strip() for t in tags.stdout.splitlines() if t.strip()), key=version_key)
+    assert not is_newer(linustart.__version__, newest), (
+        f"__version__ {linustart.__version__} is ahead of the newest tag {newest}: "
+        "tag the release (or revert the bump) or the GUI will never offer an update"
+    )
+
+
+def test_a_checkout_is_not_a_managed_install():
+    """In-panel updates must never overwrite somebody's working tree."""
+    with tempfile.TemporaryDirectory() as tmp:
+        app_dir = pathlib.Path(tmp)
+        (app_dir / "pyproject.toml").write_text("", encoding="utf-8")
+        (app_dir / "linustart").mkdir()
+        previous = os.environ.get("LINUSTART_APP_DIR")
+        os.environ["LINUSTART_APP_DIR"] = str(app_dir)
+        try:
+            assert is_managed_install()  # an install.sh layout: updatable
+            assert not is_source_checkout()
+            (app_dir / ".git").mkdir()  # now it is somebody's clone
+            assert is_source_checkout()
+            assert not is_managed_install()
+        finally:
+            if previous is None:
+                os.environ.pop("LINUSTART_APP_DIR", None)
+            else:
+                os.environ["LINUSTART_APP_DIR"] = previous
 
 
 if __name__ == "__main__":

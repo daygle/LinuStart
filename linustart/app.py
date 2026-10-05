@@ -8,17 +8,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, audit
+from . import audit
 from .jobs import JobManager
 from .routes import SessionManager, build_router
 from .settings import Settings
 from .terminal import TerminalManager
+from .updater import running_version, version_details
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 
 def create_app(settings: Settings) -> FastAPI:
-    app = FastAPI(title="LinuStart", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
+    version = running_version()
+    app = FastAPI(title="LinuStart", version=version, docs_url="/api/docs", openapi_url="/api/openapi.json")
     jobs = JobManager()
     sessions = SessionManager()
     terminals = TerminalManager()
@@ -38,7 +40,15 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"status": "ok", "version": __version__}
+        # 'commit' only appears on a git checkout; a release tarball has no
+        # repository to ask, so the declared version is all we can report.
+        details = version_details()
+        return {
+            "status": "ok",
+            "version": details["version"],
+            "version_source": details["source"],
+            "commit": details["commit"],
+        }
 
     app.include_router(build_router(settings, jobs, sessions, terminals), prefix="/api")
 
@@ -51,6 +61,6 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.on_event("startup")
     async def startup() -> None:
-        audit.record("app.start", f"LinuStart {__version__} started")
+        audit.record("app.start", f"LinuStart {version} started")
 
     return app

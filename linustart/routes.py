@@ -12,7 +12,7 @@ from typing import Awaitable, Callable, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from . import __version__, audit
+from . import audit
 from . import updater as updater_mod
 from .jobs import JobManager
 from .modules import disk as disk_mod
@@ -1294,13 +1294,18 @@ def build_router(
     # ---- self-update ------------------------------------------------------
     @router.get("/update/check", dependencies=guard)
     async def update_check() -> Dict[str, object]:
+        details = updater_mod.version_details()
         try:
             release = await asyncio.to_thread(updater_mod.latest_release, settings.update_repo)
         except updater_mod.NoReleases:
             # A fixed reason, not the exception text: the response body is
             # served to the browser and must not echo raw error detail.
             return {
-                "current": __version__,
+                "current": details["version"],
+                "current_base": details["base"],
+                "commit": details["commit"],
+                "ahead": details["ahead"],
+                "version_source": details["source"],
                 "latest": None,
                 "tag": "",
                 "newer_available": False,
@@ -1315,10 +1320,17 @@ def build_router(
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         return {
-            "current": __version__,
+            "current": details["version"],
+            "current_base": details["base"],
+            "commit": details["commit"],
+            "ahead": details["ahead"],
+            "version_source": details["source"],
             "latest": updater_mod.normalize_version(release["tag"]),
             "tag": release["tag"],
-            "newer_available": updater_mod.is_newer(release["tag"], __version__),
+            # Compared against the tag this build descends from, never against
+            # '1.0.0-3-g0cdaeb8' - that would rank a checkout below v1.0.0 and
+            # offer to "update" a tree that already contains the release.
+            "newer_available": updater_mod.is_newer(release["tag"], str(details["base"])),
             "no_releases": False,
             "release_url": release["url"],
             "published_at": release["published_at"],
@@ -1337,7 +1349,11 @@ def build_router(
         if not updater_mod.is_managed_install():
             raise HTTPException(
                 status_code=400,
-                detail="this does not look like an install.sh install; use git pull in a source checkout",
+                detail=(
+                    "this does not look like an install.sh install; use git pull in a source checkout"
+                    if updater_mod.is_source_checkout()
+                    else "this does not look like an install.sh install"
+                ),
             )
         job = await jobs.start(
             "update.install",

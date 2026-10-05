@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import __version__
 from .app import create_app
 from .settings import load_settings
+from .updater import running_version
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,7 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable token authentication (only use on localhost or behind a proxy)",
     )
-    parser.add_argument("--version", action="version", version=f"linustart {__version__}")
+    # Reports what is really running - '1.0.0-3-g0cdaeb8' on a main checkout,
+    # not just the version declared in the source.
+    parser.add_argument("--version", action="version", version=f"linustart {running_version()}")
     return parser
 
 

@@ -1159,9 +1159,16 @@ async function checkUpdate() {
     const data = await api("/update/check");
     state.updateChecked = true;
     state.updateTag = data.tag || "";
+    // A checkout reports the tag it descends from plus its own commits, so
+    // never claim it is up to date on the strength of the declared version.
+    const fromGit = data.version_source === "git";
+    const commitNote = fromGit && data.ahead
+      ? `<br><span class="muted">Commit <code>${esc(data.commit || "")}</code>, ${data.ahead} commit${data.ahead === 1 ? "" : "s"} past <code>${esc(data.current_base || "")}</code>.</span>`
+      : "";
     if (data.no_releases) {
       info.innerHTML =
         `Installed: <code>${esc(data.current)}</code> <span class="badge muted">no releases yet</span>` +
+        commitNote +
         `<br><span class="muted">${esc(data.detail || "")} - publish a GitHub release (e.g. v0.2.0) to enable in-panel updates.</span>`;
       $("#update-install").disabled = true;
       return;
@@ -1171,6 +1178,7 @@ async function checkUpdate() {
       (data.newer_available
         ? '<span class="badge warn">update available</span>'
         : '<span class="badge ok">up to date</span>') +
+      commitNote +
       (data.update_supported
         ? ""
         : '<br><span class="muted">Source checkout - updates apply to install.sh installs; use git pull here.</span>');

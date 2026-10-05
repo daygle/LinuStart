@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import functools
 import json
 import os
 import re
@@ -45,6 +46,7 @@ TAG_RE = re.compile(r"^v?\d{1,4}(\.\d{1,4}){0,3}([-.][0-9A-Za-z.]+)?$")
 USER_AGENT = "LinuStart-Updater"
 DOWNLOAD_TIMEOUT = 120
 API_TIMEOUT = 15
+GIT_TIMEOUT = 5
 
 
 class NoReleases(RuntimeError):
@@ -76,6 +78,23 @@ def version_key(version: str) -> Tuple[Tuple[Tuple[int, int, str], ...], Tuple[i
 
 def is_newer(latest: str, current: str) -> bool:
     return version_key(latest) > version_key(current)
+
+
+DESCRIBE_RE = re.compile(r"^(?P<tag>.+)-(?P<distance>\d+)-g(?P<commit>[0-9a-fA-F]{7,40})$")
+
+
+def parse_describe(output: str) -> Optional[Tuple[str, int, str]]:
+    """``git describe --tags --long`` output -> (tag, commits ahead, commit).
+
+    ``None`` when the output is not a describe line - no tag yet, no git, or a
+    shallow clone. Nothing is guessed in that case: a checkout we cannot
+    describe is reported as the declared version rather than as up to date.
+    """
+    lines = (output or "").strip().splitlines()
+    match = DESCRIBE_RE.match(lines[0].strip()) if lines else None
+    if not match:
+        return None
+    return normalize_version(match.group("tag")), int(match.group("distance")), match.group("commit")
 
 
 def validate_repo(repo: str) -> str:
@@ -149,10 +168,88 @@ def app_source_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def is_source_checkout(app_dir: Optional[Path] = None) -> bool:
+    """True when the tree is a git working tree (a clone) rather than an install.
+
+    A checkout is maintained with ``git pull``; replacing it with a release
+    tarball would discard whatever is in the working tree, so in-panel updates
+    never apply to one.
+    """
+    return (app_dir or app_source_dir()).joinpath(".git").exists()
+
+
 def is_managed_install() -> bool:
     """True when the tree looks like an install.sh layout (or an override)."""
     app_dir = app_source_dir()
+    if is_source_checkout(app_dir):
+        return False
     return (app_dir / "pyproject.toml").is_file() and (app_dir / "linustart").is_dir()
+
+
+def describe_checkout(app_dir: Optional[Path] = None) -> Optional[Tuple[str, int, str]]:
+    """What git says this checkout is running; None anywhere else.
+
+    Only ever run inside a working tree we recognise, so a panel that happens
+    to sit inside somebody else's repository cannot report that repository's
+    version as its own.
+    """
+    target = app_dir or app_source_dir()
+    if not is_source_checkout(target):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--long"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_describe(result.stdout) if result.returncode == 0 else None
+
+
+@functools.lru_cache(maxsize=1)
+def version_details() -> Dict[str, object]:
+    """The version this panel is really running.
+
+    ``__version__`` is the declared release version, but anyone who cloned
+    ``main`` runs whatever that branch holds - today that is three commits
+    past v1.0.0 - and reporting the declared version would tell them they are
+    up to date when they are not. A working tree therefore reports
+    ``1.0.0-3-g0cdaeb8``, and releases are compared against ``base`` (the tag
+    it descends from) so a checkout is never mistaken for being older than the
+    release it already contains.
+
+    Cached: the tree under a running panel does not change without a restart.
+    """
+    described = describe_checkout()
+    if described:
+        tag, distance, commit = described
+        return {
+            "version": f"{tag}-{distance}-g{commit}",
+            "base": tag,
+            "commit": commit,
+            "ahead": distance,
+            "source": "git",
+        }
+    return {
+        "version": __version__,
+        "base": __version__,
+        "commit": "",
+        "ahead": None,
+        "source": "declared",
+    }
+
+
+def running_version() -> str:
+    """The version the panel reports for itself (see :func:`version_details`).
+
+    Not to be confused with :func:`installed_version` below, which runs a
+    fresh interpreter to verify a release after an update.
+    """
+    return str(version_details()["version"])
 
 
 def apply_command(repo: str, tag: str = "") -> List[str]:
