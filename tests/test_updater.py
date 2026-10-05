@@ -9,6 +9,7 @@ from linustart.updater import (  # noqa: E402
     _replace,
     apply_command,
     build_api_url,
+    describe_checkout,
     is_managed_install,
     is_newer,
     is_source_checkout,
@@ -213,17 +214,29 @@ def test_parse_describe():
 
 
 def test_version_details_matches_the_source_it_runs_from():
+    """Git data when git can describe the tree, the declared version when not.
+
+    Branch on what describe_checkout() actually returns, not on whether a
+    .git directory exists: a shallow or tagless clone has one but cannot be
+    described, and must not claim to be reporting git data.
+    """
     import linustart
 
+    described = describe_checkout()
     details = version_details()
-    if is_source_checkout():
+    if described:
+        tag, distance, commit = described
         assert details["source"] == "git"
-        assert details["version"] == f"{details['base']}-{details['ahead']}-g{details['commit']}"
-        assert details["ahead"] >= 0
+        assert details["base"] == tag
+        assert details["version"] == f"{tag}-{distance}-g{commit}"
+        assert details["ahead"] == distance
     else:
-        # A release tarball has no repository to ask.
+        # A release tarball has no repository to ask, and neither has a
+        # shallow checkout with no tag - report the declared version rather
+        # than guessing how far ahead of a tag anything is.
         assert details["source"] == "declared"
         assert details["version"] == linustart.__version__
+        assert details["ahead"] is None
     assert running_version() == details["version"]
     assert version_key(details["base"])  # comparable against a release tag
 

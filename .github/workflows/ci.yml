@@ -22,7 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # Full history *and* tags: the suite checks that __version__ never runs
+      # ahead of the newest tag, and that guard reads `git tag --list`. The
+      # default shallow checkout has no tags, so the guard would silently
+      # pass on every run and prove nothing. This repo is small; fetch it all.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.14
         uses: actions/setup-python@v5
