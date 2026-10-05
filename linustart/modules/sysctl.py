@@ -22,7 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
 from ..paths import PROC_SYS, ROOT, SYSCTL_CONF, SYSCTL_D
-from ..util import read_text, restore_files, run, write_text
+from ..util import backup, read_text, restore_files, run, write_text
 
 DEFAULT_FILE = "99-linustart.conf"
 MAX_VALUE = 200
@@ -329,13 +329,13 @@ def apply_problems(output: str) -> List[str]:
     ]
 
 
-async def _apply_checked() -> str:
+async def apply_checked(reverting: bool = False) -> str:
+    """Apply every sysctl file and raise if the kernel rejected a setting."""
     output = await apply_system()
     problems = apply_problems(output)
     if problems:
-        raise RuntimeError(
-            f"the kernel rejected these settings and they were reverted: {problems[0]}"
-        )
+        suffix = " and they were reverted" if reverting else ""
+        raise RuntimeError(f"the kernel rejected these settings{suffix}: {problems[0]}")
     return output
 
 
@@ -345,7 +345,7 @@ async def _save_and_apply(paths: Dict[Path, str]) -> str:
     for path, text in paths.items():
         write_text(path, text)
     try:
-        return await _apply_checked()
+        return await apply_checked(reverting=True)
     except Exception:
         restore_files(snapshots)
         await apply_system()
@@ -383,9 +383,10 @@ async def delete_file(logical: str) -> Dict[str, object]:
     if path == SYSCTL_CONF:
         raise ValueError("refusing to delete /etc/sysctl.conf; delete the settings instead")
     original = read_text(path)
+    backup(path)
     path.unlink(missing_ok=True)
     try:
-        await _apply_checked()
+        await apply_checked(reverting=True)
     except Exception:
         write_text(path, original)
         await apply_system()

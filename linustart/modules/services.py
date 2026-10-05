@@ -8,8 +8,9 @@ while inspection uses quick synchronous reads.
 
 from __future__ import annotations
 
+import asyncio
 import re
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List
 
 from ..util import run
 
@@ -54,7 +55,7 @@ def parse_unit_list(text: str) -> List[Dict[str, str]]:
         if len(parts) < 4:
             continue
         unit, load, active, sub = parts[:4]
-        if not unit.endswith((".service", ".timer", ".socket", ".mount", ".target")):
+        if not unit.endswith(SUFFIXES):
             continue
         units.append(
             {
@@ -111,11 +112,9 @@ def filter_units(units: List[Dict[str, str]], needle: str) -> List[Dict[str, str
 # --------------------------------------------------------------------------
 
 async def list_services(needle: str = "") -> Dict[str, object]:
-    listed = await run(
-        ["systemctl", "list-units", "--all", "--type=service", "--plain", "--no-pager", "--no-legend"]
-    )
-    files = await run(
-        ["systemctl", "list-unit-files", "--type=service", "--plain", "--no-pager", "--no-legend"]
+    listed, files = await asyncio.gather(
+        run(["systemctl", "list-units", "--all", "--type=service", "--plain", "--no-pager", "--no-legend"]),
+        run(["systemctl", "list-unit-files", "--type=service", "--plain", "--no-pager", "--no-legend"]),
     )
     states = parse_unit_files(files.stdout)
     units = parse_unit_list(listed.stdout)

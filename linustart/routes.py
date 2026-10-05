@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hmac
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -317,14 +319,38 @@ def build_router(
 ) -> APIRouter:
     router = APIRouter()
 
+    def token_ok(candidate: Optional[str]) -> bool:
+        """Constant-time token comparison, so response timing leaks nothing."""
+        if not settings.auth_enabled:
+            return True
+        return hmac.compare_digest(
+            (candidate or "").encode("utf-8"), str(settings.token).encode("utf-8")
+        )
+
     async def require_auth(authorization: Optional[str] = Header(None)) -> None:
         if not settings.auth_enabled:
             return
-        expected = f"Bearer {settings.token}"
-        if authorization != expected:
+        scheme, _, token = (authorization or "").partition(" ")
+        if scheme != "Bearer" or not token_ok(token):
             raise HTTPException(status_code=401, detail="invalid or missing token")
 
     guard = [Depends(require_auth)]
+
+    async def restore_and_reapply(
+        snapshots: Dict[str, str], reapply: Callable[[], Awaitable[object]], kind: str
+    ) -> None:
+        """Undo a failed apply: restore the files, then load them again.
+
+        Restoring files alone is not enough when the failure came after the
+        live state was already changed (a firewall command or an interface
+        restart); the restored files have to be applied for the old state to
+        actually come back.
+        """
+        restore_files(snapshots)
+        try:
+            await reapply()
+        except Exception as exc:  # noqa: BLE001 - the original error is what the caller reports
+            audit.record(f"{kind}.revert", f"re-applying the previous configuration failed: {exc}", ok=False)
 
     # ---- system ----------------------------------------------------------
     @router.get("/system/overview", dependencies=guard)
@@ -403,7 +429,11 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             audit.record("network.configure", f"{name}: {exc}", ok=False)
-            restore_files(snapshots)
+            # The apply may have half-happened (ifdown ran, ifup failed): put
+            # the old files back *and* bring the interface up on them again.
+            await restore_and_reapply(
+                snapshots, functools.partial(network_mod.apply_backend, backend, name), "network"
+            )
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(
             "network",
@@ -875,8 +905,8 @@ def build_router(
             restore_files(snapshots)
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
-            restore_files(snapshots)
             audit.record("firewall.configure", str(exc), ok=False)
+            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
         audit.record(
@@ -926,8 +956,8 @@ def build_router(
             restore_files(snapshots)
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
-            restore_files(snapshots)
             audit.record("firewall.rule.add", str(exc), ok=False)
+            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
         audit.record("firewall.rule.add", firewall_mod.rule_label(rule))
@@ -959,8 +989,8 @@ def build_router(
             restore_files(snapshots)
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
-            restore_files(snapshots)
             audit.record("firewall.rule.remove", str(exc), ok=False)
+            await restore_and_reapply(snapshots, functools.partial(firewall_mod.reapply, backend), "firewall")
             raise HTTPException(status_code=500, detail=str(exc))
         session = sessions.create(snapshots=snapshots, **session_kwargs(backend))  # type: ignore[arg-type]
         label = firewall_mod.rule_label(removed) if "action" in removed else str(removed.get("to", index))
@@ -1230,7 +1260,7 @@ def build_router(
     @router.post("/sysctl/apply", dependencies=guard)
     async def sysctl_apply() -> Dict[str, object]:
         try:
-            output = await sysctl_mod._apply_checked()
+            output = await sysctl_mod.apply_checked()
         except RuntimeError as exc:
             audit.record("sysctl.apply", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -1242,18 +1272,48 @@ def build_router(
     async def terminal_sessions() -> Dict[str, object]:
         return {"sessions": terminals.list()}
 
+    def same_origin(websocket: WebSocket) -> bool:
+        """Browsers send Origin on every WebSocket handshake but never apply
+        the same-origin policy to it, so any page could otherwise open a root
+        shell on a panel running without a token (cross-site WebSocket
+        hijacking). Non-browser clients send no Origin and are let through.
+        X-Forwarded-Host counts too, for reverse proxies that rewrite Host;
+        a page cannot set that header on a WebSocket handshake.
+        """
+        origin = websocket.headers.get("origin")
+        if not origin:
+            return True
+        allowed = {
+            value.strip().lower()
+            for header in ("host", "x-forwarded-host")
+            for value in websocket.headers.get(header, "").split(",")
+            if value.strip()
+        }
+        return urlsplit(origin).netloc.lower() in allowed
+
     @router.websocket("/terminal/ws")
     async def terminal_ws(
         websocket: WebSocket,
-        token: str = Query(""),
         user: str = Query(""),
         cols: int = Query(100),
         rows: int = Query(30),
     ) -> None:
-        if settings.auth_enabled and token != settings.token:
-            await websocket.close(code=4401)
+        if not same_origin(websocket):
+            await websocket.close(code=4403)
             return
         await websocket.accept()
+        if settings.auth_enabled:
+            # The token arrives as the first message rather than in the URL:
+            # query strings end up in access logs and browser history.
+            try:
+                hello = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+            except (asyncio.TimeoutError, WebSocketDisconnect, ValueError, RuntimeError):
+                hello = {}
+            if not isinstance(hello, dict) or hello.get("type") != "auth" or not token_ok(
+                str(hello.get("token", ""))
+            ):
+                await websocket.close(code=4401)
+                return
         try:
             session = await terminals.create(user or None, cols, rows)
         except (ValueError, RuntimeError) as exc:
@@ -1263,17 +1323,22 @@ def build_router(
         audit.record("terminal.open", f"session {session.id} opened as {session.user}")
 
         async def pump() -> None:
-            while True:
-                chunk = await session.output.get()
-                if chunk is None:
-                    break
-                await websocket.send_json({"type": "output", "data": chunk})
-            await websocket.send_json({"type": "closed", "detail": "shell exited"})
+            try:
+                while True:
+                    chunk = await session.output.get()
+                    if chunk is None:
+                        break
+                    await websocket.send_json({"type": "output", "data": chunk})
+                await websocket.send_json({"type": "closed", "detail": "shell exited"})
+            except (WebSocketDisconnect, RuntimeError, OSError):
+                pass  # the browser went away; the receive loop cleans up
 
         pump_task = asyncio.create_task(pump())
         try:
             while True:
                 message = await websocket.receive_json()
+                if not isinstance(message, dict):
+                    continue
                 kind = message.get("type")
                 if kind == "input":
                     terminals.write(session.id, str(message.get("data", "")))
@@ -1281,7 +1346,7 @@ def build_router(
                     terminals.resize(session.id, message.get("cols"), message.get("rows"))
                 elif kind == "close":
                     break
-        except (WebSocketDisconnect, RuntimeError, ValueError):
+        except (WebSocketDisconnect, RuntimeError, ValueError, OSError):
             pass
         finally:
             pump_task.cancel()

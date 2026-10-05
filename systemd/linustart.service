@@ -12,11 +12,16 @@ Environment=PYTHONUNBUFFERED=1
 
 # --- hardening (the panel still needs root to manage the system) ---
 PrivateTmp=true
-ProtectHome=true
+# /home must stay visible: the Users page creates and removes home
+# directories (useradd -m, userdel -r) and manages ~/.ssh/authorized_keys.
+ProtectHome=false
 ProtectSystem=false
 NoNewPrivileges=false
-ReadWritePaths=/etc /var/lib/linustart /var/log/unattended-upgrades
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_TIME CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_SYS_MODULE
+# CAP_KILL: signalling other users' processes from the Processes page.
+# CAP_AUDIT_WRITE: useradd/chpasswd/PAM write audit records.
+# CAP_SETFCAP/CAP_FSETID: dpkg maintainer scripts set file capabilities and
+# set-id bits (iputils-ping, sudo) while packages install or upgrade.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_TIME CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID CAP_SETFCAP CAP_SYS_MODULE CAP_KILL CAP_AUDIT_WRITE
 SystemCallFilter=@system-service @network-io @file-system
 
 [Install]

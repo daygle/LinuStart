@@ -11,6 +11,13 @@ from typing import Dict, List, Mapping, Optional, Sequence
 from .util import now_iso
 
 MAX_LOG_LINES = 5000
+# Finished jobs are kept for the Jobs view; older ones are dropped so a panel
+# that runs for months does not hold every apt log it ever produced.
+MAX_FINISHED_JOBS = 100
+# asyncio's default line limit is 64 KiB; a longer line (a progress bar that
+# never prints a newline) would raise out of readline and leave the job
+# "running" forever.
+STREAM_LIMIT = 1024 * 1024
 
 STATUS_RUNNING = "running"
 STATUS_SUCCEEDED = "succeeded"
@@ -73,6 +80,7 @@ class JobManager:
             description=description,
             argv=list(argv),
         )
+        self._prune()
         self.jobs[job.id] = job
         self._order.append(job.id)
         asyncio.get_running_loop().create_task(self._runner(job, dict(env or {}), stdin_text))
@@ -87,6 +95,7 @@ class JobManager:
                 stderr=asyncio.subprocess.STDOUT,
                 stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
                 env=merged,
+                limit=STREAM_LIMIT,
             )
         except OSError as exc:
             job.lines.append(f"failed to start: {exc}")
@@ -104,13 +113,18 @@ class JobManager:
                 pass
             proc.stdin.close()
         while True:
-            line = await proc.stdout.readline()
+            try:
+                line = await proc.stdout.readline()
+            except ValueError:
+                # Over the stream limit: take what is buffered as one line.
+                line = await proc.stdout.read(STREAM_LIMIT)
             if not line:
                 break
             job.lines.append(line.decode("utf-8", errors="replace").rstrip("\n"))
             if len(job.lines) > MAX_LOG_LINES:
                 del job.lines[: len(job.lines) - MAX_LOG_LINES]
         job.returncode = await proc.wait()
+        job._proc = None
         job.finished_at = now_iso()
         if job.cancel_requested:
             job.status = STATUS_CANCELLED
@@ -118,6 +132,13 @@ class JobManager:
             job.status = STATUS_SUCCEEDED
         else:
             job.status = STATUS_FAILED
+
+    def _prune(self) -> None:
+        finished = [jid for jid in self._order if self.jobs[jid].status != STATUS_RUNNING]
+        for jid in finished[: max(0, len(finished) - MAX_FINISHED_JOBS)]:
+            del self.jobs[jid]
+        if len(self._order) != len(self.jobs):
+            self._order = [jid for jid in self._order if jid in self.jobs]
 
     def get(self, job_id: str) -> Optional[Job]:
         return self.jobs.get(job_id)
@@ -134,6 +155,3 @@ class JobManager:
         if proc is not None and proc.returncode is None:
             proc.terminate()
         return job
-
-    def any_running(self) -> bool:
-        return any(job.status == STATUS_RUNNING for job in self.jobs.values())

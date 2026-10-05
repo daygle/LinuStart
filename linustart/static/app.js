@@ -101,7 +101,8 @@ $("#token-form").addEventListener("submit", async (event) => {
   const token = $("#token-input").value.trim();
   state.token = token;
   try {
-    await api("/health");
+    // /health is public, so it would accept any token; ask something guarded.
+    await api("/system/overview");
     localStorage.setItem("linustart_token", token);
     hideTokenModal();
     toast("Connected", "success");
@@ -238,7 +239,7 @@ async function loadNetwork() {
     const stanzas = Number(iface.stanza_count || 1);
     const duplicated = stanzas > 1
       ? `<p class="muted"><span class="badge warn">${stanzas} stanzas</span> this interface is
-         configured ${stanzas} times in /etc/network/interfaces. ifupdown applies all of them,
+         configured ${stanzas} times across /etc/network/interfaces and the files it sources. ifupdown applies all of them,
          so a leftover DHCP block here still runs alongside the settings below - saving this
          interface collapses them into one.</p>`
       : "";
@@ -1843,8 +1844,9 @@ function termConnect() {
   if (term.ws) return;
   const user = $("#term-user").value;
   const protocol = location.protocol === "https:" ? "wss" : "ws";
+  // The token goes in the first message, not the URL: query strings land in
+  // server access logs.
   const params = new URLSearchParams({
-    token: state.token,
     user,
     cols: String(term.cols),
     rows: String(term.rows),
@@ -1855,6 +1857,7 @@ function termConnect() {
   term.ws = ws;
   $("#term-status").textContent = "Connecting…";
   ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "auth", token: state.token }));
     $("#term-status").textContent = `Connected as ${user || "root"} (session recorded)`;
     $("#term-screen").focus();
   };
@@ -1864,8 +1867,9 @@ function termConnect() {
     else if (message.type === "closed") { $("#term-status").textContent = "Session closed"; term.ws = null; }
     else if (message.type === "error") { toast(message.detail, "error"); termDisconnect(); }
   };
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     term.ws = null;
+    if (event.code === 4401) toast("Terminal authentication failed - check the access token", "error");
     if ($("#term-status").textContent !== "Session closed") $("#term-status").textContent = "Disconnected";
   };
 }

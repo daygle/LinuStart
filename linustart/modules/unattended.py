@@ -63,6 +63,19 @@ def valid_block_entry(entry: str) -> bool:
     return not any(char in entry for char in '";\\\n\r')
 
 
+def _strip_comment(line: str) -> str:
+    """Drop a ``//`` (or leading ``#``) comment, ignoring ``//`` inside quotes."""
+    if line.lstrip().startswith("#"):
+        return ""
+    in_quote = False
+    for index, char in enumerate(line):
+        if char == '"':
+            in_quote = not in_quote
+        elif not in_quote and line.startswith("//", index):
+            return line[:index]
+    return line
+
+
 def _block_lines(lines: Sequence[str], key: str) -> Optional[Tuple[int, int]]:
     """Inclusive line span of a list block, or None.
 
@@ -75,7 +88,7 @@ def _block_lines(lines: Sequence[str], key: str) -> Optional[Tuple[int, int]]:
             continue
         in_quote = False
         for index in range(start, len(lines)):
-            for char in lines[index]:
+            for char in _strip_comment(lines[index]):
                 if char == '"':
                     in_quote = not in_quote
                 elif not in_quote and char == "}":
@@ -84,35 +97,35 @@ def _block_lines(lines: Sequence[str], key: str) -> Optional[Tuple[int, int]]:
 
 
 def parse_block_list(text: str, key: str) -> List[str]:
-    """Collect the quoted entries of a list block (empty list when absent)."""
+    """Collect the quoted entries of a list block (empty list when absent).
+
+    Comments are skipped: Debian's stock file ships its blacklist and extra
+    origins commented out (``//  "linux-";``), and reading those as live
+    entries would show them as active - and enable them on the next save.
+    """
+    lines = [_strip_comment(line) for line in text.splitlines()]
+    span = _block_lines(lines, key)
+    if span is None:
+        return []
+    start, end = span
     entries: List[str] = []
-    in_block = False
-    for line in text.splitlines():
-        if not in_block:
-            marker = line.find(key)
-            if marker == -1:
-                continue
-            in_block = True
-            line = line[marker + len(key):]
+    for index in range(start, end + 1):
+        line = lines[index]
+        if index == start:
+            line = line[line.index("{") + 1:]
         current: List[str] = []
         in_quote = False
-        closed = False
         for char in line:
             if char == '"':
                 if in_quote:
                     entries.append("".join(current))
                     current = []
-                    in_quote = False
-                else:
-                    in_quote = True
+                in_quote = not in_quote
                 continue
             if in_quote:
                 current.append(char)
             elif char == "}":
-                closed = True
-                break
-        if closed:
-            break
+                return entries
     return entries
 
 

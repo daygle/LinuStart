@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -20,7 +22,19 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 def create_app(settings: Settings) -> FastAPI:
     version = running_version()
-    app = FastAPI(title="LinuStart", version=version, docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        audit.record("app.start", f"LinuStart {version} started")
+        yield
+
+    app = FastAPI(
+        title="LinuStart",
+        version=version,
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        lifespan=lifespan,
+    )
     jobs = JobManager()
     sessions = SessionManager()
     terminals = TerminalManager()
@@ -58,9 +72,5 @@ def create_app(settings: Settings) -> FastAPI:
         @app.get("/", include_in_schema=False)
         async def index() -> FileResponse:
             return FileResponse(str(STATIC_DIR / "index.html"))
-
-    @app.on_event("startup")
-    async def startup() -> None:
-        audit.record("app.start", f"LinuStart {version} started")
 
     return app

@@ -8,7 +8,8 @@ action.
 
 The wire protocol is JSON in both directions:
 
-* client → ``{"type": "input", "data": "..."}`` / ``{"type": "resize", ...}``
+* client → ``{"type": "auth", "token": "..."}`` first (when a token is set),
+  then ``{"type": "input", "data": "..."}`` / ``{"type": "resize", ...}``
 * server → ``{"type": "output", "data": "..."}`` / ``{"type": "closed", ...}``
 
 Only the standard library is used (``pty``, ``os``, ``asyncio``) - no new
@@ -23,7 +24,6 @@ import os
 import shutil
 import signal
 import struct
-import time
 import uuid
 
 try:
@@ -43,9 +43,10 @@ from .paths import PASSWD_FILE, SHELLS_FILE, TERMINAL_LOG_DIR
 from .util import now_iso, read_text
 
 MAX_SESSIONS = 8
-IDLE_LIMIT = 3600
+# Closed sessions stay listed (with their log name) for the operator; only
+# the most recent ones are kept so the list cannot grow without bound.
+MAX_CLOSED_KEPT = 50
 CHUNK = 8192
-EXIT_NOTICE = "\r\n[linustart: session closed]\r\n"
 
 
 def pick_shell() -> str:
@@ -99,11 +100,12 @@ class TerminalSession:
     master_fd: int
     log_path: str
     created_at: str = field(default_factory=now_iso)
-    started_monotonic: float = field(default_factory=time.monotonic)
     closed: bool = False
+    eof: bool = False
     closed_at: Optional[str] = None
     output: "asyncio.Queue[Optional[str]]" = field(default_factory=asyncio.Queue)
     decoder: object = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")("replace"))
+    log_handle: Optional[object] = field(default=None, repr=False)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -164,11 +166,14 @@ class TerminalManager:
         session_id = uuid.uuid4().hex[:12]
         TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = TERMINAL_LOG_DIR / f"{session_id}.log"
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"# session {session_id} user={target or 'root'} opened {now_iso()} "
-                f"cols={cols_n} rows={rows_n} argv={' '.join(argv)}\n"
-            )
+        # Kept open for the life of the session: reopening the file for every
+        # chunk of output costs a syscall round trip per keystroke echo.
+        log_handle = log_path.open("a", encoding="utf-8")
+        log_handle.write(
+            f"# session {session_id} user={target or 'root'} opened {now_iso()} "
+            f"cols={cols_n} rows={rows_n} argv={' '.join(argv)}\n"
+        )
+        log_handle.flush()
 
         session = TerminalSession(
             id=session_id,
@@ -180,43 +185,76 @@ class TerminalManager:
             master_fd=master_fd,
             log_path=str(log_path),
             output=asyncio.Queue(),
+            log_handle=log_handle,
         )
+        self._prune_closed()
         self.sessions[session_id] = session
         asyncio.get_running_loop().add_reader(master_fd, self._on_readable, session)
         return session
 
+    def _prune_closed(self) -> None:
+        closed = [sid for sid, s in self.sessions.items() if s.closed]
+        for sid in closed[: max(0, len(closed) - MAX_CLOSED_KEPT)]:
+            del self.sessions[sid]
+
+    def _log(self, session: TerminalSession, text: str) -> None:
+        handle = session.log_handle
+        if handle is None:
+            return
+        try:
+            handle.write(text)  # type: ignore[union-attr]
+            handle.flush()  # type: ignore[union-attr]
+        except (OSError, ValueError):
+            pass
+
     def _on_readable(self, session: TerminalSession) -> None:
-        if session.closed:
+        if session.closed or session.eof:
             return
         try:
             data = os.read(session.master_fd, CHUNK)
         except OSError:
             data = b""
         if not data:
-            self._pump_closed(session, "shell exited")
+            self._pump_closed(session)
             return
         text = session.decoder.decode(data)  # type: ignore[union-attr]
-        try:
-            with open(session.log_path, "a", encoding="utf-8") as handle:
-                handle.write(text)
-        except OSError:
-            pass
+        self._log(session, text)
         session.output.put_nowait(text)
 
-    def _pump_closed(self, session: TerminalSession, reason: str) -> None:
-        if session.closed:
+    def _pump_closed(self, session: TerminalSession) -> None:
+        """The shell is gone: stop watching the fd and tell the pump once.
+
+        A PTY master whose child exited stays readable (every read fails with
+        EIO), so the reader must be removed here - otherwise the event loop
+        calls back in a tight loop, burning a CPU and queueing a sentinel on
+        every pass until the browser happens to disconnect.
+        """
+        if session.closed or session.eof:
             return
+        session.eof = True
+        try:
+            asyncio.get_running_loop().remove_reader(session.master_fd)
+        except (RuntimeError, ValueError):
+            pass
         session.output.put_nowait(None)
-        session.output.put_nowait(reason)
 
     def write(self, session_id: str, data: str) -> None:
         session = self._get(session_id)
-        if session.closed:
+        if session.closed or session.eof:
             raise ValueError("session is closed")
-        os.write(session.master_fd, data.encode("utf-8"))
+        payload = data.encode("utf-8")
+        try:
+            # os.write may take only part of a large paste; finish the job.
+            while payload:
+                written = os.write(session.master_fd, payload)
+                payload = payload[written:]
+        except OSError as exc:
+            raise ValueError(f"the shell is no longer accepting input: {exc}")
 
     def resize(self, session_id: str, cols: object, rows: object) -> None:
         session = self._get(session_id)
+        if session.closed:
+            raise ValueError("session is closed")
         session.cols = clamp_size(cols, 20, 500, session.cols)
         session.rows = clamp_size(rows, 5, 200, session.rows)
         fcntl.ioctl(
@@ -237,10 +275,6 @@ class TerminalManager:
             except (RuntimeError, ValueError):
                 pass
             try:
-                os.write(session.master_fd, EXIT_NOTICE.encode("utf-8"))
-            except OSError:
-                pass
-            try:
                 os.close(session.master_fd)
             except OSError:
                 pass
@@ -254,11 +288,12 @@ class TerminalManager:
                 except asyncio.TimeoutError:
                     session.proc.kill()
                     await session.proc.wait()
+            self._log(session, f"\n# session {session.id} closed {session.closed_at} ({reason})\n")
             try:
-                with open(session.log_path, "a", encoding="utf-8") as handle:
-                    handle.write(f"# session {session.id} closed {session.closed_at} ({reason})\n")
-            except OSError:
+                session.log_handle.close()  # type: ignore[union-attr]
+            except (AttributeError, OSError):
                 pass
+            session.log_handle = None
         return session.to_dict()
 
     def _get(self, session_id: str) -> TerminalSession:

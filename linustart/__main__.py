@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -41,15 +42,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         token=args.token,
         no_auth=args.no_auth,
     )
-    if settings.host not in ("127.0.0.1", "localhost", "::1") and not settings.auth_enabled:
+    loopback = settings.host in ("127.0.0.1", "localhost", "::1")
+    if not loopback and not settings.auth_enabled:
+        # --no-auth is the documented override (e.g. behind an authenticating
+        # proxy); without it a tokenless public bind is refused.
+        if not args.no_auth:
+            print(
+                "refusing to bind to a non-loopback address without authentication;\n"
+                "set auth_token in the config file, pass --token, or use --no-auth to override.",
+                file=sys.stderr,
+            )
+            return 2
         print(
-            "refusing to bind to a non-loopback address without authentication;\n"
-            "set auth_token in the config file, pass --token, or use --no-auth to override.",
+            f"warning: authentication is disabled and the panel listens on {settings.host}; "
+            "anyone who can reach it gets root.",
             file=sys.stderr,
         )
-        return 2
-
-    import os
 
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         print(
