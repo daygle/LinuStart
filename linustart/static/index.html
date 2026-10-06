@@ -107,6 +107,7 @@
             <div id="net-resolver" class="muted">Loading…</div>
           </div>
         </div>
+        <div id="net-findings"></div>
         <h2 class="section-title">Configured Interfaces</h2>
         <div class="cards" id="net-config-cards"></div>
       </section>
@@ -116,6 +117,7 @@
         <div class="cards">
           <div class="card">
             <h2>Hostname</h2>
+            <p id="hostname-cloud-note" class="muted hidden"></p>
             <form id="hostname-form" class="form">
               <label>Hostname
                 <input type="text" id="hostname-input" placeholder="my-server" autocomplete="off">
@@ -282,8 +284,9 @@
             <button class="btn btn-primary" type="button" id="sysctl-add">Add Setting</button>
           </div>
         </div>
+        <div id="sysctl-findings"></div>
         <div id="sysctl-files"></div>
-        <p class="muted">Every change is written to the file, applied with <code>sysctl --system</code>, and rolled back automatically if the kernel rejects it. The runtime column shows what the kernel is using right now, read from <code>/proc/sys</code>. Files are applied in order, so <code>/etc/sysctl.conf</code> wins over the drop-ins in <code>/etc/sysctl.d/</code>.</p>
+        <p class="muted">Every change is written to the file, applied with <code>sysctl --system</code>, and rolled back automatically if the kernel rejects it. The runtime column shows what the kernel is using right now, read from <code>/proc/sys</code>. At boot the files in <code>/etc/sysctl.d/</code> and the system directories (<code>/run</code>, <code>/usr/lib/sysctl.d</code>) are applied in name order, the last one setting a parameter wins (marked "overridden by" elsewhere), and <code>/etc/sysctl.conf</code> is applied only where a <code>99-sysctl.conf</code> link points to it.</p>
       </section>
 
       <!-- EMAIL -->
@@ -301,6 +304,7 @@
         <div class="cards">
           <div class="card">
             <h2>Mail Delivery (SMTP relay)</h2>
+            <p id="mail-server-banner" class="muted hidden"></p>
             <p id="mail-msmtp-hint" class="muted hidden"></p>
             <form id="mail-form" class="form">
               <label>Delivery
@@ -346,7 +350,7 @@
           </div>
           <div class="card">
             <h2>Test Delivery</h2>
-            <p class="muted">Queues a message through the whole local Postfix pipeline and out via your relay.</p>
+            <p class="muted">Sends a message through this server's sendmail (Postfix or msmtp) and out via your relay.</p>
             <form id="mail-test-form" class="form">
               <label>Recipient
                 <input type="text" id="mail-test-to" placeholder="me@example.com" autocomplete="off">
@@ -437,6 +441,12 @@
           </div>
         </div>
 
+        <h2 class="section-title">System Components</h2>
+        <div class="card">
+          <p class="muted">What the panel relies on, per area. Missing pieces can be installed; anything installed but unused can be removed - only when apt shows nothing else would be removed with it. Installs never remove a conflicting package.</p>
+          <table class="table" id="components-table"></table>
+        </div>
+
         <h2 class="section-title">LinuStart Updates</h2>
         <div class="cards">
           <div class="card">
@@ -489,6 +499,7 @@
           </div>
           <span class="muted">Every change is applied with a 90-second confirm-or-revert window.</span>
         </div>
+        <div id="fw-findings"></div>
         <div class="cards">
           <div class="card">
             <h2>Rules</h2>
@@ -541,6 +552,7 @@
           </div>
           <span class="muted">Settings are validated with <code>sshd -t</code> and auto-revert after 90 seconds.</span>
         </div>
+        <p id="ssh-sources" class="muted hidden"></p>
         <div class="cards">
           <div class="card">
             <h2>Access</h2>
@@ -736,6 +748,7 @@
             <label class="switch-row">
               <input type="checkbox" id="edit-sudo"> <span>Administrator (sudo)</span>
             </label>
+            <p id="edit-sudo-via" class="muted"></p>
             <label class="switch-row">
               <input type="checkbox" id="edit-locked"> <span>Account locked</span>
             </label>

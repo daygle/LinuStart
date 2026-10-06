@@ -456,10 +456,67 @@ function renderResolver(resolver) {
   const generated = resolver.generated_by && resolver.generated_by !== resolver.manager
     ? ` (file says: ${esc(resolver.generated_by)})`
     : "";
+  const fix = resolver.can_install_resolvconf
+    ? `<p><button class="btn" id="net-resolvconf-install">Install resolvconf</button>
+       <span class="muted">makes the DNS servers saved below apply, now and at boot</span></p>`
+    : "";
   box.innerHTML = `
     <p><span class="badge">${esc(resolver.manager)}</span>${generated} ${badge}</p>
     <p class="muted">${esc(resolver.path || "/etc/resolv.conf")} → ${servers}</p>
-    ${notes}`;
+    ${notes}${fix}`;
+  const button = $("#net-resolvconf-install");
+  if (button) button.addEventListener("click", installResolvconf);
+}
+
+async function installResolvconf() {
+  if (!window.confirm(
+    "Install resolvconf? It takes over /etc/resolv.conf and fills it from the DNS servers " +
+    "configured on each interface, keeping the current search domains and options. The current " +
+    "file is backed up first, and put back if the result has no nameserver.",
+  )) return;
+  try {
+    const job = await api("/network/resolvconf", { method: "POST" });
+    toast("Installing resolvconf…", "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+}
+
+/* A page's setup checks: what is wrong, and a fix button posting to the
+   endpoint the server named for it. reload() refreshes the page after. */
+function renderFindings(selector, title, findings, reload) {
+  const box = $(selector);
+  if (!findings || !findings.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="card findings"><h2>${esc(title)}</h2>${findings.map((f) => `
+    <div class="finding">
+      <p><span class="badge ${f.severity === "warn" ? "warn" : "muted"}">${f.severity === "warn" ? "fix" : "note"}</span>
+        <strong>${esc(f.title)}</strong></p>
+      <p class="muted">${esc(f.detail)}</p>
+      ${f.fix ? `<p><button class="btn" type="button" data-fix="${esc(f.id)}">${esc(f.fix.label)}</button></p>` : ""}
+    </div>`).join("")}</div>`;
+  $$(`${selector} button[data-fix]`).forEach((button) => {
+    button.addEventListener("click", async () => {
+      const item = findings.find((f) => f.id === button.dataset.fix);
+      if (!item || !item.fix) return;
+      if (item.fix.confirm && !window.confirm(item.fix.confirm)) return;
+      try {
+        const result = await api(item.fix.endpoint, { method: "POST" });
+        toast("Fix applied", "success");
+        if (result.session) startRevertBar(result.session);
+        if (result.id && result.status) openJob(result.id);
+        reload();
+      } catch (err) { toast(err.message, "error"); }
+    });
+  });
+}
+
+function readonlyCard(iface) {
+  return `
+    <div class="card">
+      <h2>${esc(iface.name)} <span class="badge">${esc(iface.method || "")}</span> <span class="badge muted">read-only</span></h2>
+      <p class="muted">${esc(iface.source || "")}</p>
+      <p>Address: ${esc(iface.address || "-")} · Gateway: ${esc(iface.gateway || "-")}</p>
+      <p>DNS: ${esc((iface.dns || []).join(", ") || "-")}</p>
+    </div>`;
 }
 
 async function loadNetwork() {
@@ -467,6 +524,7 @@ async function loadNetwork() {
   $("#net-backend").textContent = `backend: ${data.backend}`;
   $("#net-source").textContent = (data.config && data.config.source) || "";
   renderResolver(data.resolver);
+  renderFindings("#net-findings", "Network Setup Checks", data.findings, loadNetwork);
   const runtimeRows = (data.runtime.interfaces || []).map((iface) => `
     <tr>
       <td><code>${esc(iface.name)}</code></td>
@@ -479,6 +537,7 @@ async function loadNetwork() {
     <tbody>${runtimeRows || "<tr><td colspan='4' class='muted'>No interfaces found</td></tr>"}</tbody>`;
 
   const cards = (data.config.interfaces || []).map((iface) => {
+    if (iface.readonly) return readonlyCard(iface);
     const method = iface.method || "dhcp";
     const stanzas = Number(iface.stanza_count || 1);
     const duplicated = stanzas > 1
@@ -503,9 +562,11 @@ async function loadNetwork() {
     const kind = iface.kind && iface.kind !== "ethernets" && iface.kind !== "ethernet"
       ? ` <span class="badge muted">${esc(String(iface.kind).replace(/s$/, ""))}</span>` : "";
     const inactive = iface.active === false ? ' <span class="badge warn">inactive</span>' : "";
+    const owner = iface.backend && iface.backend !== data.backend
+      ? ` <span class="badge muted" title="NetworkManager leaves this interface to ifupdown">${esc(iface.backend)}</span>` : "";
     return `
     <div class="card">
-      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}</h2>
+      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}${owner}</h2>
       ${duplicated}
       ${dhcpElsewhere}
       ${dnsNoop}
@@ -631,6 +692,13 @@ async function loadSystem() {
   loadPowerStatus();
   const [host, tz] = await Promise.all([api("/hostname"), api("/timezone")]);
   $("#hostname-input").value = host.hostname || "";
+  const cloud = host.cloud_init || {};
+  const hostNote = $("#hostname-cloud-note");
+  hostNote.classList.toggle("hidden", !cloud.managed);
+  hostNote.textContent = cloud.managed
+    ? `cloud-init resets the ${(cloud.undone || []).join(" and ")} at boot on this machine. Saving a ` +
+      "hostname here also tells cloud-init to keep it (/etc/cloud/cloud.cfg.d/99-linustart-hostname.cfg)."
+    : "";
   $("#timezone-input").value = tz.timezone || "";
   $("#timezone-list").innerHTML = (tz.zones || []).map((z) => `<option value="${esc(z)}"></option>`).join("");
   $("#ntp-status").textContent = tz.ntp
@@ -703,7 +771,7 @@ $("#hostname-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
     const result = await api("/hostname", { method: "POST", body: { hostname: $("#hostname-input").value.trim() } });
-    toast(`Hostname set to ${result.hostname}`, "success");
+    toast(`Hostname set to ${result.hostname}${result.cloud_init_preserved ? " (cloud-init will keep it)" : ""}`, "success");
     loadSystem();
   } catch (err) { toast(err.message, "error"); }
 });
@@ -967,6 +1035,7 @@ $("#cron-modal-delete").addEventListener("click", async () => {
 
 async function loadSysctl() {
   const data = await api("/sysctl");
+  renderFindings("#sysctl-findings", "Kernel Settings Checks", data.findings, loadSysctl);
   state.sysctlFiles = data.files || [];
   $("#sysctl-summary").textContent =
     `${data.settings || 0} setting(s) in ${state.sysctlFiles.length} file(s)`;
@@ -978,7 +1047,9 @@ async function loadSysctl() {
     const rows = (file.entries || []).map((entry) => `
       <tr${entry.valid ? "" : ' class="muted"'}>
         <td><code>${esc(entry.key)}</code></td>
-        <td><code>${esc(entry.value)}</code></td>
+        <td><code>${esc(entry.value)}</code>${entry.overridden_by
+          ? ` <span class="badge warn" title="At boot ${esc(entry.overridden_by.file)} sets ${esc(entry.overridden_by.value)}, which wins">overridden by ${esc(entry.overridden_by.file)}</span>`
+          : ""}</td>
         <td>${entry.runtime === null || entry.runtime === undefined
           ? '<span class="muted">-</span>'
           : `<code>${esc(entry.runtime)}</code>${entry.changed ? ' <span class="badge">pending</span>' : ""}`}</td>
@@ -1118,22 +1189,41 @@ $("#sysctl-modal-delete").addEventListener("click", async () => {
 
 const MAIL_PACKAGES = { postfix: "postfix", msmtp: "msmtp-mta" };
 
+function mailPackageInstalled(transport) {
+  const data = state.mailData || {};
+  const packages = (data.mailer && data.mailer.packages) || [];
+  return packages.includes(MAIL_PACKAGES[transport]) || !!(data.installed && transport === data.transport);
+}
+
 function mailInstallButton() {
   const chosen = $("#mail-transport-select").value;
-  const configured = state.mailData && state.mailData.transport;
   const button = $("#mail-install");
   button.textContent = `Install ${MAIL_PACKAGES[chosen]}`;
-  // offer the install whenever the chosen transport is not the one known to be installed
-  button.classList.toggle("hidden", !!(state.mailData && state.mailData.installed && chosen === configured));
+  // offer the install whenever the chosen transport's package is missing
+  button.classList.toggle("hidden", mailPackageInstalled(chosen));
 }
+
+const MAIL_SERVER_KINDS = { mailcow: "mailcow", docker: "a Docker mail stack", host: "a mail server" };
 
 async function loadMail() {
   const data = await api("/mail");
   state.mailData = data;
-  const transport = data.transport || "postfix";
+  const server = data.mail_server || {};
+  // On a mail server only msmtp is offered: no daemon, nothing on port 25.
+  const transport = server.detected ? "msmtp" : (data.transport || "postfix");
   $("#mail-transport-select").value = transport;
+  $("#mail-transport-select").querySelector('option[value="postfix"]').disabled = !!server.detected;
+  const banner = $("#mail-server-banner");
+  banner.classList.toggle("hidden", !server.detected);
+  if (server.detected) {
+    banner.innerHTML = `<span class="badge ok">${esc(MAIL_SERVER_KINDS[server.kind] || "mail server")} detected</span>
+      ${esc(server.detail || "")}. LinuStart leaves it alone: it sends its own mail through msmtp, which
+      runs no daemon and listens on no port, and never installs, removes or reconfigures Postfix or Exim here.
+      Point it at a mailbox on this server (port 587, STARTTLS) and use the server's public hostname so the
+      TLS certificate matches.`;
+  }
   const badge = $("#mail-status-badge");
-  if (!data.installed) {
+  if (!mailPackageInstalled(transport)) {
     badge.textContent = `${MAIL_PACKAGES[transport]} not installed`;
     badge.className = "badge warn";
   } else if (transport === "msmtp") {
@@ -1154,14 +1244,16 @@ async function loadMail() {
   $("#mail-password-hint").textContent = data.credentials_set ? "(password on file)" : "";
   const msmtp = data.msmtp || {};
   const msmtpHint = $("#mail-msmtp-hint");
-  if (msmtp.detected && !data.relayhost && transport === "postfix") {
+  if (msmtp.detected && !data.relayhost && (transport === "postfix" || server.detected)) {
     msmtpHint.classList.remove("hidden");
     msmtpHint.textContent =
       "Existing msmtp configuration found - the form is pre-filled from /etc/msmtprc. " +
       (msmtp.password_available
         ? "Leave the password blank and the msmtp password file is used automatically. "
         : "") +
-      "Keep msmtp by choosing it under Delivery, or save with Postfix and use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
+      (server.detected
+        ? "Saving adds a 'linustart' account to /etc/msmtprc and makes it the default; your other accounts and settings stay."
+        : "Keep msmtp by choosing it under Delivery, or save with Postfix and use ‘Remove conflicting mailers’ so Postfix takes over sendmail.");
     $("#mail-host").value = msmtp.host || $("#mail-host").value;
     $("#mail-port").value = msmtp.port || $("#mail-port").value;
     $("#mail-security").value = msmtp.security || $("#mail-security").value;
@@ -1181,7 +1273,7 @@ async function loadMail() {
     transportText += " · msmtp client present (not used for delivery, left untouched)";
   }
   transportLine.textContent = transportText;
-  $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
+  $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0 || !!server.detected);
   let summary = "No relay configured yet.";
   if (data.relayhost) {
     summary = transport === "msmtp"
@@ -1266,7 +1358,7 @@ async function loadUsers() {
       <td>${esc(u.full_name || "-")}</td>
       <td><code>${esc(u.shell)}</code></td>
       <td>
-        ${u.sudo ? '<span class="badge ok">sudo</span> ' : ""}
+        ${u.sudo ? `<span class="badge ok" title="${esc(sudoSources(u))}">sudo</span> ` : ""}
         ${u.locked ? '<span class="badge warn">locked</span>' : '<span class="badge ok">active</span>'}
       </td>
       <td><button class="btn btn-small" data-user="${esc(u.name)}" data-action="edit">Edit</button></td>
@@ -1350,6 +1442,15 @@ $("#group-create-form").addEventListener("submit", async (event) => {
   } catch (err) { toast(err.message, "error"); }
 });
 
+function sudoSources(u) {
+  return (u.sudo_via || []).map((g) => `${g.via === "user" ? "rule" : g.via} in ${g.file}`).join("; ");
+}
+
+/* Grants the panel cannot take away: rules another tool wrote for the user. */
+function foreignSudo(u) {
+  return (u.sudo_via || []).filter((g) => g.via === "user" && !/\/linustart-[^/]*$/.test(g.file));
+}
+
 async function openUser(name) {
   try {
     const data = await api(`/users/${encodeURIComponent(name)}`);
@@ -1360,6 +1461,12 @@ async function openUser(name) {
     $("#edit-shell").innerHTML = state.shells.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
     $("#edit-shell").value = u.shell;
     $("#edit-sudo").checked = !!u.sudo;
+    const via = $("#edit-sudo-via");
+    via.textContent = u.sudo && (u.sudo_via || []).length ? `Granted by: ${sudoSources(u)}.` : "";
+    const foreign = foreignSudo(u);
+    if (foreign.length) {
+      via.textContent += ` Turning sudo off removes group memberships and the panel's rule; the rule in ${foreign.map((g) => g.file).join(", ")} was written by another tool and stays until that file is edited.`;
+    }
     $("#edit-locked").checked = !!u.locked;
     $("#edit-password").value = "";
     // Always start from a clean key form: an edit left in flight for another
@@ -1466,7 +1573,13 @@ $("#user-edit-form").addEventListener("submit", async (event) => {
         locked: $("#edit-locked").checked,
       },
     });
-    toast("Account updated", "success");
+    const updated = await api(`/users/${encodeURIComponent(state.editUser)}`);
+    const left = foreignSudo(updated.user);
+    if (!$("#edit-sudo").checked && left.length) {
+      toast(`Account updated - ${state.editUser} still has sudo through ${left.map((g) => g.file).join(", ")}`, "error");
+    } else {
+      toast("Account updated", "success");
+    }
     loadUsers();
     openUser(state.editUser);
   } catch (err) { toast(err.message, "error"); }
@@ -1642,7 +1755,43 @@ async function loadSoftware() {
       || "<tr><td colspan='4' class='muted'>System is up to date</td></tr>"}</tbody>`;
   renderInstalled();
   if (!state.updateChecked) checkUpdate();
+  loadComponents();
 }
+
+const COMPONENT_BADGES = { "in use": "ok", "installed, unused": "warn", "not installed": "muted" };
+
+async function loadComponents() {
+  const table = $("#components-table");
+  let data;
+  try { data = await api("/components"); } catch (err) {
+    table.innerHTML = `<tbody><tr><td class="muted">Could not read components: ${esc(err.message)}</td></tr></tbody>`;
+    return;
+  }
+  const rows = (data.groups || []).map((group) => group.items.map((item, i) => `
+    <tr>
+      <td>${i === 0 ? `<strong>${esc(group.name)}</strong>` : ""}</td>
+      <td><code>${esc(item.label)}</code><div class="muted">${esc(item.about)}</div></td>
+      <td><span class="badge ${COMPONENT_BADGES[item.state] || "muted"}">${esc(item.state)}</span>
+        ${item.detail ? `<div class="muted">${esc(item.detail)}</div>` : ""}
+        ${item.blocked ? `<div class="muted">${esc(item.blocked)}</div>` : ""}</td>
+      <td>${item.can_install ? `<button class="btn btn-small" data-component-install="${esc(item.id)}">Install</button>` : ""}
+        ${item.can_remove ? `<button class="btn btn-small btn-danger" data-component-remove="${esc(item.id)}">Remove</button>` : ""}</td>
+    </tr>`).join("")).join("");
+  table.innerHTML = `<thead><tr><th>Area</th><th>Component</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody>`;
+}
+
+$("#components-table").addEventListener("click", async (event) => {
+  const install = event.target.closest("button[data-component-install]");
+  const remove = event.target.closest("button[data-component-remove]");
+  if (!install && !remove) return;
+  const cid = (install || remove).dataset[install ? "componentInstall" : "componentRemove"];
+  if (remove && !window.confirm(`Remove ${cid}? It is installed but not in use. Its configuration files are kept.`)) return;
+  try {
+    const job = await api(`/components/${encodeURIComponent(cid)}/${install ? "install" : "remove"}`, { method: "POST" });
+    toast(`${install ? "Installing" : "Removing"} ${cid}…`, "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
 
 /* ------------------------------------------------------ linustart updates */
 
@@ -1837,6 +1986,7 @@ async function pollJob() {
     if (data.job.status !== "running") {
       clearInterval(state.jobTimer);
       if (state.view === "software") loadSoftware();
+      if (state.view === "network") loadNetwork();
       if (state.view === "jobs") loadJobs();
     }
   } catch (err) {
@@ -1884,7 +2034,10 @@ async function loadAudit() {
 async function loadFirewall() {
   const data = await api("/firewall");
   const firewalld = data.backend === "firewalld";
-  $("#fw-backend").textContent = `backend: ${data.backend}${firewalld && data.zone ? ` (zone ${data.zone})` : ""}`;
+  renderFindings("#fw-findings", "Firewall Setup Checks", data.findings, loadFirewall);
+  $("#fw-backend").textContent = data.backend
+    ? `backend: ${data.backend}${firewalld && data.zone ? ` (zone ${data.zone})` : ""}`
+    : "no firewall installed";
   // firewalld zones only filter incoming traffic
   $("#fw-outgoing").disabled = firewalld;
   $('#fw-direction option[value="out"]').disabled = firewalld;
@@ -1989,6 +2142,21 @@ async function loadSsh() {
   validation.textContent = data.validation_error ? "config problem" : "config valid";
   validation.className = `badge ${data.validation_error ? "danger" : "ok"}`;
   validation.title = data.validation_error || "";
+  const notes = [];
+  if (data.writes_to) notes.push(`Changes are written to <code>${esc(data.writes_to)}</code>.`);
+  if ((data.overriding_files || []).length) {
+    const sources = data.sources || {};
+    const keys = Object.keys(sources).filter((k) => data.overriding_files.includes(sources[k]));
+    notes.push(`<span class="badge warn">overridden</span> ${keys.map((k) => `<code>${esc(k)}</code>`).join(", ")}
+      ${keys.length === 1 ? "is" : "are"} set in ${data.overriding_files.map((f) => `<code>${esc(f)}</code>`).join(", ")},
+      which sshd reads first - the values shown are the ones in effect.`);
+  }
+  if (data.socket_activated) {
+    notes.push("sshd is socket-activated (ssh.socket): a Port change regenerates and restarts the socket; open sessions stay connected.");
+  }
+  const sources = $("#ssh-sources");
+  sources.innerHTML = notes.join(" ");
+  sources.classList.toggle("hidden", notes.length === 0);
 }
 
 async function submitSsh(body, message) {

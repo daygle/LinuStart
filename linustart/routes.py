@@ -22,9 +22,12 @@ from .modules import hostname as hostname_mod
 from .modules import logs as logs_mod
 from .modules import mail as mail_mod
 from .modules import network as network_mod
+from .modules import nethealth as nethealth_mod
 from .modules import packages as packages_mod
 from .modules import power as power_mod
+from .modules import components as components_mod
 from .modules import procs as procs_mod
+from .modules import resolvconf as resolvconf_mod
 from .modules import services as services_mod
 from .modules import sshd as sshd_mod
 from .modules import cron as cron_mod
@@ -34,7 +37,6 @@ from .modules import sysinfo as sysinfo_mod
 from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
 from .modules import users as users_mod
-from .paths import SSHD_CONFIG
 from .ratelimit import AuthThrottle, client_key
 from .sessions import SessionManager
 from .settings import Settings
@@ -331,11 +333,12 @@ def build_router(
         return data
 
     @router.get("/hostname", dependencies=guard)
-    async def get_hostname() -> Dict[str, str]:
-        return {"hostname": await hostname_mod.current()}
+    async def get_hostname() -> Dict[str, object]:
+        return {"hostname": await hostname_mod.current(), "cloud_init": hostname_mod.cloud_init_status()}
 
     @router.post("/hostname", dependencies=guard)
-    async def set_hostname(body: HostnameBody) -> Dict[str, str]:
+    async def set_hostname(body: HostnameBody) -> Dict[str, object]:
+        cloud = hostname_mod.cloud_init_status()
         try:
             name = await hostname_mod.set_hostname(body.hostname)
         except ValueError as exc:
@@ -343,8 +346,9 @@ def build_router(
         except RuntimeError as exc:
             audit.record("hostname.set", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
-        audit.record("hostname.set", f"hostname set to {name}")
-        return {"hostname": name}
+        audit.record("hostname.set", f"hostname set to {name}"
+                     + (f"; cloud-init told to keep it ({hostname_mod.CLOUD_HOSTNAME_FILE})" if cloud["managed"] else ""))
+        return {"hostname": name, "cloud_init_preserved": bool(cloud["managed"])}
 
     @router.get("/timezone", dependencies=guard)
     async def get_timezone() -> Dict[str, object]:
@@ -415,17 +419,78 @@ def build_router(
     @router.get("/network", dependencies=guard)
     async def network() -> Dict[str, object]:
         backend = await network_mod.detect_backend()
+        resolver = await network_mod.resolver_status(backend)
+        resolver["can_install_resolvconf"] = resolvconf_mod.setup_offered(backend, resolver)
+        config = await network_mod.get_config(backend)
         return {
             "backend": backend,
-            "config": await network_mod.get_config(backend),
+            "config": config,
             "runtime": await network_mod.runtime_status(),
-            "resolver": await network_mod.resolver_status(backend),
+            "resolver": resolver,
+            "findings": await nethealth_mod.findings(backend, config),
             "sessions": [s.to_dict() for s in sessions.pending()],
         }
 
+    @router.post("/network/fix/{finding_id}", dependencies=guard)
+    async def network_fix(finding_id: str) -> Dict[str, object]:
+        backend = await network_mod.detect_backend()
+        config = await network_mod.get_config(backend)
+        current = {f["id"]: f for f in await nethealth_mod.findings(backend, config)}
+        if finding_id not in current or not current[finding_id].get("fix"):
+            raise HTTPException(status_code=400, detail=f"nothing to fix for {finding_id!r} on this machine")
+        if finding_id == "cloud-init":
+            done = nethealth_mod.fix_cloud_init()
+            audit.record("network.fix", f"cloud-init: {done}")
+            return {"ok": True, "done": [done]}
+        if finding_id == "ifupdown-leftover":
+            names = nethealth_mod.ifupdown_leftover_names()
+            changed = nethealth_mod.fix_ifupdown_leftovers(names)
+            audit.record("network.fix", f"removed ifupdown entries for {', '.join(names)} from {', '.join(changed)}")
+            return {"ok": True, "done": changed}
+        if finding_id == "dhcpcd":
+            names = await nethealth_mod.dhcpcd_conflicts()
+            files = [network_mod.DHCPCD_CONF]
+            snapshots = snapshot_files(files)
+            nethealth_mod.write_dhcpcd_deny(names)
+            try:
+                ran = await nethealth_mod.apply_dhcpcd_fix(names)
+            except RuntimeError as exc:
+                audit.record("network.fix", f"dhcpcd: {exc}", ok=False)
+                await restore_and_reapply(
+                    snapshots, functools.partial(nethealth_mod.apply_dhcpcd_fix, names), "network"
+                )
+                raise HTTPException(status_code=500, detail=str(exc))
+            session = sessions.create(
+                "network", f"dhcpcd leaves {', '.join(names)} to ifupdown", snapshots,
+                timeout=90, reapply={"kind": "dhcpcd", "names": ",".join(names)},
+            )
+            audit.record("network.fix", f"dhcpcd: denyinterfaces {' '.join(names)}")
+            return {"ok": True, "done": ran, "session": session.to_dict()}
+        raise HTTPException(status_code=400, detail=f"no fix for {finding_id!r}")
+
+    @router.post("/network/resolvconf", dependencies=guard)
+    async def network_install_resolvconf() -> Dict[str, object]:
+        backend = await network_mod.detect_backend()
+        resolver = await network_mod.resolver_status(backend)
+        if not resolvconf_mod.setup_offered(backend, resolver):
+            raise HTTPException(
+                status_code=400,
+                detail="resolvconf is only needed on ifupdown systems where the panel's DNS does not apply",
+            )
+        job = await jobs.start(
+            "network.resolvconf", "Install resolvconf so the panel's DNS applies", resolvconf_mod.command()
+        )
+        audit.record("network.resolvconf", "install resolvconf")
+        return job.to_dict()
+
     @router.post("/network/interfaces/{name}", dependencies=guard)
     async def configure_interface(name: str, body: InterfaceBody) -> Dict[str, object]:
-        backend = await network_mod.detect_backend()
+        try:
+            network_mod.validate_interface_name(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # NetworkManager machines can still have interfaces ifupdown owns
+        backend = await network_mod.backend_for(name)
         files = network_mod.managed_config_files(backend)
         snapshots = snapshot_files(files)
         try:
@@ -532,10 +597,21 @@ def build_router(
         data = await mail_mod.status()
         data["mailer"] = await mail_mod.mailer_status(str(data.get("transport") or "postfix"))
         data["msmtp"] = await mail_mod.msmtp_status()
+        data["mail_server"] = await mail_mod.mail_server_status()
         return data
+
+    async def refuse_on_mail_server(action: str) -> Dict[str, object]:
+        server = await mail_mod.mail_server_status()
+        reason = mail_mod.mail_server_refusal(server, action)
+        if reason:
+            audit.record("mail.refused", reason, ok=False)
+            raise HTTPException(status_code=409, detail=reason)
+        return server
 
     @router.post("/mail", dependencies=guard)
     async def mail_apply(body: MailBody) -> Dict[str, object]:
+        if body.transport == "postfix":
+            await refuse_on_mail_server("Configuring Postfix as a relay")
         try:
             result = await mail_mod.apply(
                 host=body.host,
@@ -574,6 +650,7 @@ def build_router(
 
     @router.post("/mail/remove-conflicts", dependencies=guard)
     async def mail_remove_conflicts() -> Dict[str, object]:
+        await refuse_on_mail_server("Removing mail transfer agents")
         state = await mail_mod.mailer_status()
         conflicts = list(state.get("conflicts") or [])
         if not conflicts:
@@ -594,16 +671,62 @@ def build_router(
     async def mail_install(transport: str = Query("postfix", pattern="^(postfix|msmtp)$")) -> Dict[str, object]:
         package = mail_mod.TRANSPORT_PACKAGE[transport]
         if transport == "postfix":
+            await refuse_on_mail_server("Installing Postfix")
             try:
                 await mail_mod.preseed_postfix()
             except RuntimeError as exc:
                 raise HTTPException(status_code=500, detail=str(exc))
+        server = await mail_mod.mail_server_status()
         job = await jobs.start(
             "mail.install",
             f"Install {package} (SMTP relay)",
-            packages_mod.install_command([package]),
+            mail_mod.install_command(transport, mail_server=bool(server.get("detected"))),
         )
         audit.record("mail.install", f"{package} install")
+        return job.to_dict()
+
+    # ---- system components -----------------------------------------------
+    @router.get("/components", dependencies=guard)
+    async def components_status() -> Dict[str, object]:
+        return await components_mod.status()
+
+    @router.post("/components/{cid}/install", dependencies=guard)
+    async def components_install(cid: str) -> Dict[str, object]:
+        if cid not in components_mod.COMPONENTS:
+            raise HTTPException(status_code=404, detail=f"unknown component: {cid}")
+        reason = await components_mod.check_install(cid)
+        if reason:
+            raise HTTPException(status_code=409, detail=f"not installing {cid}: {reason}")
+        if cid == "resolvconf":
+            # the guarded setup job: registers the configured DNS servers and
+            # puts the old resolv.conf back if the result has no nameserver
+            argv = resolvconf_mod.command()
+        else:
+            if cid == "postfix":
+                try:
+                    await mail_mod.preseed_postfix()
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=500, detail=str(exc))
+            argv = components_mod.install_command(cid)
+        job = await jobs.start("components.install", f"Install {components_mod.COMPONENTS[cid]['label']}", argv)
+        audit.record("components.install", cid)
+        return job.to_dict()
+
+    @router.post("/components/{cid}/remove", dependencies=guard)
+    async def components_remove(cid: str) -> Dict[str, object]:
+        if cid not in components_mod.COMPONENTS:
+            raise HTTPException(status_code=404, detail=f"unknown component: {cid}")
+        try:
+            names = await components_mod.check_removal(cid)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        job = await jobs.start(
+            "components.remove", f"Remove unused {components_mod.COMPONENTS[cid]['label']}",
+            components_mod.remove_command(names),
+        )
+        audit.record("components.remove", f"{cid}: {' '.join(names)}")
         return job.to_dict()
 
     # ---- packages --------------------------------------------------------
@@ -889,7 +1012,7 @@ def build_router(
             updates["ClientAliveCountMax"] = body.client_alive_count_max
         if not updates:
             raise HTTPException(status_code=400, detail="nothing to change")
-        snapshots = snapshot_files([SSHD_CONFIG])
+        snapshots = snapshot_files(sshd_mod.config_files())
         try:
             values = await sshd_mod.apply_settings(updates)
         except ValueError as exc:
@@ -937,6 +1060,21 @@ def build_router(
     @router.get("/firewall", dependencies=guard)
     async def firewall_status() -> Dict[str, object]:
         return await firewall_mod.status()
+
+    @router.post("/firewall/fix/{finding_id}", dependencies=guard)
+    async def firewall_fix(finding_id: str) -> Dict[str, object]:
+        state = await firewall_mod.status()
+        current = {f["id"]: f for f in state.get("findings") or []}
+        if finding_id not in current or not current[finding_id].get("fix") \
+                or finding_id not in firewall_mod.FIX_COMMANDS:
+            raise HTTPException(status_code=400, detail=f"nothing to fix for {finding_id!r} on this machine")
+        try:
+            done = await firewall_mod.apply_fix(finding_id)
+        except RuntimeError as exc:
+            audit.record("firewall.fix", f"{finding_id}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("firewall.fix", done)
+        return {"ok": True, "done": [done]}
 
     @router.post("/firewall", dependencies=guard)
     async def firewall_policy(body: FirewallPolicyBody) -> Dict[str, object]:
@@ -1346,6 +1484,18 @@ def build_router(
     @router.get("/sysctl", dependencies=guard)
     async def sysctl_list() -> Dict[str, object]:
         return sysctl_mod.list_files()
+
+    @router.post("/sysctl/fix/{finding_id}", dependencies=guard)
+    async def sysctl_fix(finding_id: str) -> Dict[str, object]:
+        current = {f["id"] for f in sysctl_mod.list_files()["findings"]}  # type: ignore[union-attr]
+        if finding_id != "sysctl-conf-boot" or finding_id not in current:
+            raise HTTPException(status_code=400, detail=f"nothing to fix for {finding_id!r} on this machine")
+        try:
+            done = sysctl_mod.link_sysctl_conf()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        audit.record("sysctl.fix", f"linked {done} to /etc/sysctl.conf")
+        return {"ok": True, "done": [done]}
 
     @router.post("/sysctl/entry", dependencies=guard)
     async def sysctl_upsert(body: SysctlBody) -> Dict[str, object]:

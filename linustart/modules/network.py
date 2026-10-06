@@ -15,7 +15,7 @@ import shutil
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from ..paths import DHCPCD_CONF, INTERFACES_FILE, NETPLAN_DIR, RESOLV_CONF_FILE, ROOT
+from ..paths import DHCPCD_CONF, INTERFACES_FILE, NETPLAN_DIR, NETWORKD_DIR, RESOLV_CONF_FILE, ROOT
 from ..util import is_within, read_text, run, write_text
 
 try:  # PyYAML is only required for the netplan backend.
@@ -727,13 +727,99 @@ def update_netplan_interface(
 # Backend detection and IO
 # --------------------------------------------------------------------------
 
+async def _unit_active(unit: str) -> bool:
+    try:
+        return (await run(["systemctl", "is-active", "--quiet", unit])).ok
+    except RuntimeError:
+        return False
+
+
 async def detect_backend() -> str:
     if NETPLAN_DIR.is_dir() and any(NETPLAN_DIR.glob("*.yaml")):
         return "netplan"
-    nm = await run(["systemctl", "is-active", "--quiet", "NetworkManager"])
-    if nm.ok:
+    if await _unit_active("NetworkManager"):
         return "NetworkManager"
+    # systemd-networkd configured by hand (no netplan): the panel shows it
+    # read-only rather than writing an /etc/network/interfaces nobody reads.
+    if networkd_files() and not ifupdown_interface_names() and await _unit_active("systemd-networkd"):
+        return "systemd-networkd"
     return "ifupdown"
+
+
+def networkd_files() -> List[Path]:
+    return sorted(NETWORKD_DIR.glob("*.network")) if NETWORKD_DIR.is_dir() else []
+
+
+def ifupdown_interface_names() -> List[str]:
+    """Interfaces (not loopback) with an inet or inet6 stanza in the ifupdown files."""
+    names: List[str] = []
+    for path in ifupdown_files():
+        for key in stanza_counts(read_text(path)):
+            name = key.split(" ", 1)[0]
+            if name != "lo" and name not in names:
+                names.append(name)
+    return names
+
+
+def parse_networkd_file(text: str) -> Optional[Dict[str, object]]:
+    """The settings the Networking page shows for one ``.network`` file."""
+    section = ""
+    names: List[str] = []
+    info: Dict[str, object] = {"addresses": [], "gateway": None, "dns": [], "dhcp": ""}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip().lower(), value.strip()
+        if section == "match" and key == "name":
+            names.extend(value.split())
+        elif section == "network":
+            if key == "address":
+                info["addresses"].append(value)  # type: ignore[union-attr]
+            elif key == "gateway" and not info["gateway"]:
+                info["gateway"] = value
+            elif key == "dns":
+                info["dns"].extend(value.split())  # type: ignore[union-attr]
+            elif key == "dhcp":
+                info["dhcp"] = value.lower()
+        elif section == "address" and key == "address":
+            info["addresses"].append(value)  # type: ignore[union-attr]
+        elif section == "route" and key == "gateway" and not info["gateway"]:
+            info["gateway"] = value
+    if not names:
+        return None
+    addresses = [str(a) for a in info["addresses"]]  # type: ignore[union-attr]
+    dhcp = str(info["dhcp"])
+    method = "dhcp" if dhcp in ("yes", "true", "ipv4", "both") else ("static" if addresses else "manual")
+    v4 = next((a for a in addresses if ":" not in a), None)
+    return {
+        "name": " ".join(names),
+        "method": method,
+        "address": v4,
+        "gateway": info["gateway"],
+        "dns": info["dns"],
+        "readonly": True,
+    }
+
+
+async def backend_for(name: str, detected: Optional[str] = None) -> str:
+    """The backend that really configures interface *name*.
+
+    NetworkManager leaves interfaces listed in /etc/network/interfaces alone
+    (its ifupdown plugin marks them unmanaged), so on such a machine those
+    are still ifupdown's to edit.
+    """
+    detected = detected or await detect_backend()
+    if detected == "NetworkManager" and name in ifupdown_interface_names():
+        config = await get_config("NetworkManager")
+        nm_names = {str(i.get("name")) for i in config["interfaces"] if i.get("backend") != "ifupdown"}  # type: ignore[union-attr]
+        if name not in nm_names:
+            return "ifupdown"
+    return detected
 
 
 def _netplan_files() -> List[Path]:
@@ -918,8 +1004,28 @@ async def get_config(backend: Optional[str] = None) -> Dict[str, object]:
         ]
         # active connections first, then by name
         interfaces.sort(key=lambda info: (not info["active"], str(info["name"])))
+        # Interfaces in /etc/network/interfaces are left unmanaged by
+        # NetworkManager; they are still configured (by ifupdown), so list
+        # them instead of hiding what is often the main uplink.
+        nm_names = {str(info["name"]) for info in interfaces}
+        legacy = await get_config("ifupdown")
+        for info in legacy["interfaces"]:  # type: ignore[union-attr]
+            if info.get("name") not in nm_names:
+                info["backend"] = "ifupdown"
+                interfaces.append(info)
         return {"backend": backend, "interfaces": interfaces}
+    if backend == "systemd-networkd":
+        interfaces = []
+        for path in networkd_files():
+            info = parse_networkd_file(read_text(path))
+            if info:
+                info["source"] = str(path)
+                interfaces.append(info)
+        return {"backend": backend, "interfaces": interfaces, "source": str(NETWORKD_DIR), "readonly": True}
     raise ValueError(f"unknown backend: {backend!r}")
+
+
+READONLY_BACKENDS = ("systemd-networkd",)
 
 
 async def write_interface_config(
@@ -935,6 +1041,11 @@ async def write_interface_config(
     to leave IPv6 exactly as it is."""
     name = validate_interface_name(name)
     dns = validate_dns(dns)
+    if backend in READONLY_BACKENDS:
+        raise ValueError(
+            f"this machine's network is managed by {backend} ({NETWORKD_DIR}); "
+            "the panel shows it read-only - edit the .network files and run 'networkctl reload'"
+        )
     if backend == "ifupdown":
         documents = {str(path): read_text(path) for path in ifupdown_files()}
         updated, changed = apply_ifupdown_across(
@@ -1009,15 +1120,53 @@ async def nm_connection_for(name: str) -> str:
     """The connection id behind interface *name* (active ones win)."""
     config = await get_config("NetworkManager")
     for info in config["interfaces"]:  # type: ignore[index]
-        if info.get("name") == name:
+        if info.get("name") == name and info.get("backend") != "ifupdown":
             return str(info["connection"])
     raise RuntimeError(f"no NetworkManager connection found for {name}")
 
 
+def dhcp_release_commands(name: str) -> List[List[str]]:
+    """Stop a DHCP client left running for *name*, whichever ifupdown used.
+
+    ``ifdown`` reads the configuration as it is *now*: after a switch from
+    DHCP to static it sees "static", never stops the client started for the
+    old DHCP stanza, and that client keeps renewing and re-adding its address
+    next to the static one. Best effort: each command fails harmlessly when
+    no such client runs.
+    """
+    name = validate_interface_name(name)
+    commands: List[List[str]] = []
+    pidfile = ROOT / "run" / f"dhclient.{name}.pid"
+    if shutil.which("dhclient") and pidfile.exists():
+        commands.append(["dhclient", "-r", "-pf", str(pidfile), name])
+    if shutil.which("dhcpcd"):
+        commands.append(["dhcpcd", "-k", "-4", name])
+    return commands
+
+
+def ifupdown_apply_commands(name: Optional[str]) -> List[List[str]]:
+    """ifdown, clear what the old configuration left behind, ifup.
+
+    The IPv4 addresses are flushed between the two so the interface ends up
+    with exactly what its stanza says - the same stale-configuration problem
+    leaves a static address behind after a switch to DHCP.
+    """
+    if not name:
+        return [["systemctl", "restart", "networking"]]
+    name = validate_interface_name(name)
+    return (
+        [["ifdown", "--force", name]]
+        + dhcp_release_commands(name)
+        + [["ip", "-4", "addr", "flush", "dev", name, "scope", "global"], ["ifup", name]]
+    )
+
+
 async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
     """Apply the written configuration and return the commands that ran."""
+    if backend in READONLY_BACKENDS:
+        raise ValueError(f"{backend} is shown read-only; the panel does not apply it")
     if backend == "ifupdown":
-        commands = [["ifdown", "--force", name], ["ifup", name]] if name else [["systemctl", "restart", "networking"]]
+        commands = ifupdown_apply_commands(name)
     elif backend == "netplan":
         commands = [["netplan", "apply"]]
     elif backend == "NetworkManager":
@@ -1036,8 +1185,9 @@ async def apply_backend(backend: str, name: Optional[str] = None) -> List[str]:
             continue
         result = await run(argv)
         ran.append(" ".join(str(part) for part in argv))
-        if not result.ok and backend == "ifupdown" and argv[0] == "ifdown":
-            # Interface may not be up yet; ifup must still run.
+        if not result.ok and backend == "ifupdown" and argv[0] in ("ifdown", "dhclient", "dhcpcd", "ip"):
+            # Interface may not be up yet, and no DHCP client may be running
+            # (or have anything to flush); ifup must still run.
             continue
         if not result.ok:
             raise RuntimeError(f"{' '.join(str(p) for p in argv)} failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -1198,6 +1348,8 @@ def dns_setting_applies(backend: str, manager: str, has_resolvconf: bool) -> boo
         return True  # nmcli writes ipv4.dns straight into the connection
     if backend == "netplan":
         return True  # netplan apply feeds systemd-resolved / systemd-networkd
+    if backend == "systemd-networkd":
+        return True  # its own DNS= lines feed systemd-resolved; the panel only shows them
     # ifupdown: `dns-nameservers` is a request, not a write - something has
     # to pick it up and rewrite /etc/resolv.conf. resolvconf and its
     # equivalents (openresolv, resolvectl's shim) do; dhcpcd, which owns the

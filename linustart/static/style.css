@@ -76,6 +76,8 @@ body {
 }
 .card h2 { margin: 0 0 14px; font-size: 15px; }
 .key-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.finding + .finding { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 4px; }
+.card.findings { margin: 18px 0; }
 .card h2 + h2, .card h2.spaced { margin-top: 22px; }
 .danger-card { border-color: var(--danger); }
 .danger-card h2 { color: var(--danger); }

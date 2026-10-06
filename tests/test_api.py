@@ -34,7 +34,7 @@ def env(tmp_path, monkeypatch):
     async def reapply(spec):
         calls.append(("reapply", dict(spec)))
 
-    for kind in ("network", "ssh", "firewall"):
+    for kind in ("network", "ssh", "firewall", "dhcpcd"):
         monkeypatch.setitem(sessions.REAPPLIERS, kind, reapply)
     app = create_app(Settings(token=TOKEN))
     with TestClient(app) as client:
@@ -80,8 +80,14 @@ def test_hostname_validation_and_audit(env):
         return name
 
     monkeypatch.setattr(routes.hostname_mod, "set_hostname", fake_set)
-    assert client.post("/api/hostname", json={"hostname": "web-01"}, headers=AUTH).json() == {"hostname": "web-01"}
+    monkeypatch.setattr(routes.hostname_mod, "cloud_init_status", lambda: {"managed": False, "undone": []})
+    assert client.post("/api/hostname", json={"hostname": "web-01"}, headers=AUTH).json() == {
+        "hostname": "web-01", "cloud_init_preserved": False}
     assert "hostname set to web-01" in audit_text(tmp_path)
+    # on a cloud-init machine the save says cloud-init was told to keep it
+    monkeypatch.setattr(routes.hostname_mod, "cloud_init_status", lambda: {"managed": True, "undone": ["hostname"]})
+    assert client.post("/api/hostname", json={"hostname": "web-02"}, headers=AUTH).json()["cloud_init_preserved"]
+    assert "cloud-init told to keep it" in audit_text(tmp_path)
 
     async def refuse(name):
         raise ValueError("invalid hostname")
@@ -237,3 +243,205 @@ def test_update_check_reports_checksums(env):
     monkeypatch.setattr(routes.updater_mod, "latest_release", lambda repo: release)
     data = client.get("/api/update/check", headers=AUTH).json()
     assert data["newer_available"] and data["checksum_published"]
+
+
+def _fake_resolver(monkeypatch, backend, **summary):
+    async def detect():
+        return backend
+
+    async def status(_backend=None):
+        return {"dns_setting_applies": False, "has_resolvconf": False, **summary}
+
+    monkeypatch.setattr(routes.network_mod, "detect_backend", detect)
+    monkeypatch.setattr(routes.network_mod, "resolver_status", status)
+
+
+def test_resolvconf_install_starts_a_job_where_dns_does_not_apply(env):
+    client, tmp_path, _, monkeypatch = env
+    _fake_resolver(monkeypatch, "ifupdown")
+    monkeypatch.setattr(routes.resolvconf_mod, "command", lambda: ["true"])
+    job = client.post("/api/network/resolvconf", headers=AUTH).json()
+    assert job["kind"] == "network.resolvconf"
+    assert "resolvconf" in audit_text(tmp_path)
+
+
+@pytest.mark.parametrize("backend,summary", [
+    ("netplan", {}),
+    ("ifupdown", {"has_resolvconf": True}),
+    ("ifupdown", {"dns_setting_applies": True}),
+])
+def test_resolvconf_install_is_refused_where_it_is_not_needed(env, backend, summary):
+    client, _, _, monkeypatch = env
+    _fake_resolver(monkeypatch, backend, **summary)
+    monkeypatch.setattr(routes.resolvconf_mod, "command", lambda: ["false"])
+    assert client.post("/api/network/resolvconf", headers=AUTH).status_code == 400
+
+
+MAILCOW = {"detected": True, "kind": "mailcow", "detail": "mailcow containers: postfix-mailcow"}
+
+
+def _fake_mail_server(monkeypatch, server):
+    async def status():
+        return server
+
+    monkeypatch.setattr(routes.mail_mod, "mail_server_status", status)
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("post", "/api/mail/install?transport=postfix", None),
+    ("post", "/api/mail/remove-conflicts", None),
+    ("post", "/api/mail", {"host": "mail.example.com", "port": 587, "security": "starttls",
+                           "username": "u@example.com", "from_address": "u@example.com",
+                           "password": "pw", "report_to": "ops@example.com", "transport": "postfix"}),
+])
+def test_a_mail_server_is_never_touched(env, method, path, body):
+    client, tmp_path, _, monkeypatch = env
+    _fake_mail_server(monkeypatch, MAILCOW)
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("reached the mail server")
+
+    monkeypatch.setattr(routes.mail_mod, "preseed_postfix", must_not_run)
+    monkeypatch.setattr(routes.mail_mod, "apply", must_not_run)
+    response = getattr(client, method)(path, headers=AUTH, **({"json": body} if body else {}))
+    assert response.status_code == 409
+    assert "mail server" in response.json()["detail"]
+    assert "mail.refused" in audit_text(tmp_path)
+
+
+def test_msmtp_install_on_a_mail_server_never_removes_packages(env):
+    client, _, _, monkeypatch = env
+    _fake_mail_server(monkeypatch, MAILCOW)
+    seen = []
+
+    def install_command(transport, mail_server=False):
+        seen.append((transport, mail_server))
+        return ["true"]
+
+    monkeypatch.setattr(routes.mail_mod, "install_command", install_command)
+    job = client.post("/api/mail/install?transport=msmtp", headers=AUTH).json()
+    assert job["kind"] == "mail.install"
+    assert seen == [("msmtp", True)]
+
+
+def test_mail_page_reports_the_mail_server(env):
+    client, _, _, monkeypatch = env
+    _fake_mail_server(monkeypatch, MAILCOW)
+    assert client.get("/api/mail", headers=AUTH).json()["mail_server"]["kind"] == "mailcow"
+
+
+def _fake_findings(monkeypatch, found):
+    async def backend():
+        return "ifupdown"
+
+    async def config(_backend=None):
+        return {"interfaces": []}
+
+    async def findings(_backend, _config):
+        return found
+
+    monkeypatch.setattr(routes.network_mod, "detect_backend", backend)
+    monkeypatch.setattr(routes.network_mod, "get_config", config)
+    monkeypatch.setattr(routes.nethealth_mod, "findings", findings)
+
+
+def test_network_fix_needs_a_current_finding(env):
+    client, _, _, monkeypatch = env
+    _fake_findings(monkeypatch, [{"id": "nm-unmanaged", "fix": None}])
+    assert client.post("/api/network/fix/cloud-init", headers=AUTH).status_code == 400
+    assert client.post("/api/network/fix/nm-unmanaged", headers=AUTH).status_code == 400
+
+
+def test_network_fix_cloud_init(env):
+    client, tmp_path, _, monkeypatch = env
+    _fake_findings(monkeypatch, [{"id": "cloud-init", "fix": {"label": "x"}}])
+    target = tmp_path / "99-disable-network-config.cfg"
+    monkeypatch.setattr(routes.nethealth_mod, "CLOUD_DISABLE_FILE", target)
+    assert client.post("/api/network/fix/cloud-init", headers=AUTH).json()["ok"]
+    assert "config: disabled" in target.read_text()
+    assert "cloud-init" in audit_text(tmp_path)
+
+
+def test_network_fix_dhcpcd_opens_a_revert_session(env):
+    client, tmp_path, calls, monkeypatch = env
+    _fake_findings(monkeypatch, [{"id": "dhcpcd", "fix": {"label": "x"}}])
+    conf = tmp_path / "dhcpcd.conf"
+    conf.write_text("hostname\n")
+    monkeypatch.setattr(routes.network_mod, "DHCPCD_CONF", conf)
+    monkeypatch.setattr(routes.nethealth_mod, "DHCPCD_CONF", conf)
+
+    async def conflicts():
+        return ["ens18"]
+
+    async def apply(names):
+        return [f"ifup {n}" for n in names]
+
+    monkeypatch.setattr(routes.nethealth_mod, "dhcpcd_conflicts", conflicts)
+    monkeypatch.setattr(routes.nethealth_mod, "apply_dhcpcd_fix", apply)
+    result = client.post("/api/network/fix/dhcpcd", headers=AUTH).json()
+    assert "denyinterfaces ens18" in conf.read_text()
+    session = result["session"]
+    # reverting puts the old dhcpcd.conf back and re-applies through the dhcpcd re-applier
+    client.post(f"/api/network/sessions/{session['id']}/revert", headers=AUTH)
+    assert conf.read_text() == "hostname\n"
+    assert ("reapply", {"kind": "dhcpcd", "names": "ens18"}) in calls
+
+
+def test_firewall_fix_runs_only_a_current_finding(env):
+    client, tmp_path, _, monkeypatch = env
+
+    async def status():
+        return {"backend": "ufw", "findings": [
+            {"id": "nftables-service", "fix": {"label": "x"}}, {"id": "docker", "fix": None}]}
+
+    ran = []
+
+    async def apply_fix(fid):
+        ran.append(fid)
+        return "systemctl disable nftables"
+
+    monkeypatch.setattr(routes.firewall_mod, "status", status)
+    monkeypatch.setattr(routes.firewall_mod, "apply_fix", apply_fix)
+    assert client.post("/api/firewall/fix/firewalld-enabled", headers=AUTH).status_code == 400
+    assert client.post("/api/firewall/fix/docker", headers=AUTH).status_code == 400
+    assert client.post("/api/firewall/fix/nftables-service", headers=AUTH).json()["ok"]
+    assert ran == ["nftables-service"] and "firewall.fix" in audit_text(tmp_path)
+
+
+def test_sysctl_fix_only_when_needed(env):
+    client, tmp_path, _, monkeypatch = env
+    monkeypatch.setattr(routes.sysctl_mod, "list_files", lambda: {"findings": []})
+    assert client.post("/api/sysctl/fix/sysctl-conf-boot", headers=AUTH).status_code == 400
+    monkeypatch.setattr(routes.sysctl_mod, "list_files", lambda: {"findings": [{"id": "sysctl-conf-boot"}]})
+    monkeypatch.setattr(routes.sysctl_mod, "link_sysctl_conf", lambda: "/etc/sysctl.d/99-sysctl.conf")
+    assert client.post("/api/sysctl/fix/sysctl-conf-boot", headers=AUTH).json()["ok"]
+    assert "sysctl.fix" in audit_text(tmp_path)
+
+
+def test_components_install_and_remove_are_guarded(env):
+    client, tmp_path, _, monkeypatch = env
+
+    async def refuse_install(cid):
+        return "chrony already keeps the time"
+
+    async def allow_install(cid):
+        return None
+
+    async def refuse_removal(cid):
+        raise ValueError("firewalld cannot be removed: it is in use")
+
+    async def allow_removal(cid):
+        return ["firewalld"]
+
+    monkeypatch.setattr(routes.components_mod, "install_command", lambda cid: ["true"])
+    monkeypatch.setattr(routes.components_mod, "remove_command", lambda names: ["true"])
+    assert client.post("/api/components/nope/install", headers=AUTH).status_code == 404
+    monkeypatch.setattr(routes.components_mod, "check_install", refuse_install)
+    assert client.post("/api/components/systemd-timesyncd/install", headers=AUTH).status_code == 409
+    monkeypatch.setattr(routes.components_mod, "check_install", allow_install)
+    assert client.post("/api/components/systemd-timesyncd/install", headers=AUTH).json()["kind"] == "components.install"
+    monkeypatch.setattr(routes.components_mod, "check_removal", refuse_removal)
+    assert client.post("/api/components/firewalld/remove", headers=AUTH).status_code == 409
+    monkeypatch.setattr(routes.components_mod, "check_removal", allow_removal)
+    assert client.post("/api/components/firewalld/remove", headers=AUTH).json()["kind"] == "components.remove"
+    assert "components.remove" in audit_text(tmp_path)

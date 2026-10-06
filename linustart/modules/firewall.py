@@ -28,9 +28,8 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
-from ..paths import FIREWALLD_DIR, NFTABLES_CONF, SSHD_CONFIG, UFW_DIR
+from ..paths import FIREWALLD_DIR, NFTABLES_CONF, UFW_DIR
 from ..util import read_text, run, write_text
-from .sshd import parse_sshd_config
 
 MANAGED_BEGIN = "# >>> linustart firewall (managed) >>>"
 MANAGED_END = "# <<< linustart firewall (managed) <<<"
@@ -557,9 +556,114 @@ async def detect_backend() -> str:
     raise RuntimeError("no supported firewall backend found (install 'ufw', 'nftables' or 'firewalld')")
 
 
+# --------------------------------------------------------------------------
+# Living next to other firewalls
+# --------------------------------------------------------------------------
+
+async def _systemctl_ok(*args: str) -> bool:
+    try:
+        return (await run(["systemctl", *args])).ok
+    except RuntimeError:
+        return False
+
+
+def firewall_findings(
+    backend: str,
+    panel_enabled: bool,
+    *,
+    nft_service_enabled: bool,
+    firewalld_enabled: bool,
+    firewalld_running: bool,
+    ufw_active: bool,
+    docker: bool,
+) -> List[Dict[str, object]]:
+    """Problems with the firewall setup as a whole (pure, see :func:`findings`)."""
+    from .nethealth import finding
+
+    found: List[Dict[str, object]] = []
+    if backend == "nftables" and panel_enabled and not nft_service_enabled:
+        found.append(finding(
+            "nftables-persist", "warn", "The firewall is not loaded at boot",
+            "nftables.service is disabled, so the rules in /etc/nftables.conf are lost when the machine "
+            "restarts and the server comes back with no firewall. Enabling the service loads them at boot "
+            "(it is not started now, so nothing changes until the next boot).",
+            {"label": "Load the firewall at boot", "confirm": "Enable nftables.service so the rules load at boot?"},
+            endpoint="/firewall/fix",
+        ))
+    if backend in ("ufw", "firewalld") and nft_service_enabled:
+        found.append(finding(
+            "nftables-service", "warn", "nftables.service also loads rules at boot",
+            f"The panel manages the firewall through {backend}, but nftables.service is enabled and loads "
+            "/etc/nftables.conf at boot as well - two rule sets that can contradict each other, and that "
+            "file usually starts with 'flush ruleset'. Disabling the service stops that at the next boot; "
+            "it is not stopped now (stopping it would flush the live rules).",
+            {"label": "Disable nftables.service", "confirm": "Disable nftables.service (it is not stopped now)?"},
+            endpoint="/firewall/fix",
+        ))
+    if backend != "firewalld" and firewalld_enabled and not firewalld_running:
+        found.append(finding(
+            "firewalld-enabled", "warn", "firewalld will take over at the next boot",
+            f"firewalld is stopped but enabled: when the machine restarts it starts and owns the firewall, "
+            f"replacing the {backend} rules managed here.",
+            {"label": "Disable firewalld", "confirm": "Disable firewalld so it does not start at boot?"},
+            endpoint="/firewall/fix",
+        ))
+    if backend == "firewalld" and ufw_active:
+        found.append(finding(
+            "ufw-active", "warn", "ufw is active next to firewalld",
+            "Both ufw and firewalld are loading rules; they fight over the same tables. firewalld is the one "
+            "managed here, so ufw should be turned off.",
+            {"label": "Turn ufw off", "confirm": "Run 'ufw disable'? firewalld keeps filtering."},
+            endpoint="/firewall/fix",
+        ))
+    if docker:
+        found.append(finding(
+            "docker", "info", "Docker publishes ports around this firewall",
+            "Docker inserts its own rules for published container ports ahead of ufw and nftables input "
+            "rules, so rules here neither open nor block those ports. Control them where the containers "
+            "are published (or in Docker's DOCKER-USER chain).",
+        ))
+    return found
+
+
+async def findings(backend: str, panel_enabled: bool) -> List[Dict[str, object]]:
+    ufw_active = False
+    if backend == "firewalld" and shutil.which("ufw"):
+        try:
+            ufw_active = bool(parse_ufw_status((await run(["ufw", "status"])).stdout).get("enabled"))
+        except RuntimeError:
+            ufw_active = False
+    return firewall_findings(
+        backend, panel_enabled,
+        nft_service_enabled=await _systemctl_ok("is-enabled", "--quiet", "nftables"),
+        firewalld_enabled=await _systemctl_ok("is-enabled", "--quiet", "firewalld"),
+        firewalld_running=await firewalld_running(),
+        ufw_active=ufw_active,
+        docker=shutil.which("docker") is not None or await _systemctl_ok("is-active", "--quiet", "docker"),
+    )
+
+
+FIX_COMMANDS = {
+    "nftables-persist": ["systemctl", "enable", "nftables"],
+    "nftables-service": ["systemctl", "disable", "nftables"],
+    "firewalld-enabled": ["systemctl", "disable", "firewalld"],
+    "ufw-active": ["ufw", "disable"],
+}
+
+
+async def apply_fix(fid: str) -> str:
+    argv = FIX_COMMANDS[fid]
+    result = await run(argv)
+    if not result.ok:
+        raise RuntimeError(f"{' '.join(argv)} failed: {(result.stderr or result.stdout).strip()}")
+    return " ".join(argv)
+
+
 def ssh_port() -> str:
     """The port sshd currently listens on - kept open when enabling a lockdown."""
-    return parse_sshd_config(read_text(SSHD_CONFIG)).get("Port", "22")
+    from .sshd import effective
+
+    return effective().get("Port", ("22", ""))[0]
 
 
 def firewalld_zone_file() -> Path:
@@ -664,7 +768,20 @@ async def firewalld_set_running(enabled: bool) -> str:
 
 
 async def status() -> Dict[str, object]:
-    backend = await detect_backend()
+    try:
+        backend = await detect_backend()
+    except RuntimeError as exc:
+        # A fresh minimal install may have no firewall at all: say so, and
+        # let the page offer one to install instead of failing.
+        return {
+            "backend": "", "installed": False, "enabled": False, "rules": [],
+            "default_incoming": "deny", "default_outgoing": "allow", "ssh_port": ssh_port(),
+            "findings": [{
+                "id": "no-firewall", "severity": "warn", "title": "No firewall is installed",
+                "detail": f"{exc}. Install ufw (simplest) from Software → System Components.",
+                "fix": None,
+            }],
+        }
     if backend == "firewalld":
         data = await firewalld_status()
     elif backend == "ufw":
@@ -678,6 +795,7 @@ async def status() -> Dict[str, object]:
         data["installed"] = shutil.which("nft") is not None
     data["backend"] = backend
     data["ssh_port"] = ssh_port()
+    data["findings"] = await findings(backend, bool(data.get("enabled")))
     return data
 
 
@@ -708,6 +826,10 @@ async def nftables_apply(
         applied = await run(["nft", "-f", "-"], input_text=script)
         if not applied.ok:
             raise RuntimeError(f"loading the nftables ruleset failed: {(applied.stderr or applied.stdout).strip()}")
+        # Without the service the rules are gone after a reboot. Enabled
+        # only, not started: starting it would re-run the whole file.
+        if not await _systemctl_ok("is-enabled", "--quiet", "nftables"):
+            await run(["systemctl", "enable", "nftables"])
     else:
         await run(["nft", "delete", "table", *NFT_TABLE.split()])
 

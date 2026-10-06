@@ -5,6 +5,7 @@ Managed pieces:
   * /etc/postfix/main.cf          - relayhost, TLS, SASL, myorigin (key = value)
   * /etc/postfix/sasl_passwd      - "[mail.example.com]:587 user@domain:password"
   * /etc/postfix/sender_canonical - "@domain relay@domain": envelope sender only
+  * /etc/msmtprc                  - (msmtp) only the marked 'linustart' account
   * /etc/linustart/mail.json      - panel state (never the password)
   * unattended-upgrades Mail      - notification recipient
 
@@ -18,7 +19,7 @@ import os
 import re
 import shutil
 from pathlib import PurePosixPath
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..paths import (
     MAIL_STATE_FILE,
@@ -148,6 +149,99 @@ def remove_conflicting_command(packages: Sequence[str], transport: str = "postfi
         if name not in MAILER_PACKAGES or MAILER_PACKAGES[name]["kind"] != "mta" or name == own:
             raise ValueError(f"refusing to remove {name!r}")
     return ["apt-get", "remove", "-y"] + names
+
+
+# --------------------------------------------------------------------------
+# Mail servers: never touch a machine whose job is mail
+#
+# The relay setup assumes a box that only sends its own notifications. On a
+# real mail server it would be destructive: Postfix's main.cf gets relayhost
+# and inet_interfaces=loopback-only, "remove conflicting mailers" uninstalls
+# Exim or Postfix, and installing a Postfix next to a Dockerised stack races
+# it for port 25 at boot. When a mail server is detected the panel only
+# sends through msmtp (no daemon, no listener) and refuses everything else.
+# --------------------------------------------------------------------------
+
+# Images and container names of Dockerised mail stacks.
+MAIL_STACK_RE = re.compile(
+    r"mailcow|postfix|exim|dovecot|docker-mailserver|mailserver|mailu|poste\.io|stalwart|maddy|haraka",
+    re.I,
+)
+# Mailbox servers on the host itself: the machine stores mail, so its MTA is
+# a real mail server, not a notification relay.
+MAILBOX_SERVERS = {
+    "dovecot": ("usr", "sbin", "dovecot"),
+    "cyrus": ("usr", "lib", "cyrus", "bin", "master"),
+    "courier": ("usr", "sbin", "courier-imapd"),
+}
+
+
+def parse_docker_ps(text: str) -> List[Tuple[str, str]]:
+    """``(name, image)`` pairs from ``docker ps --format '{{.Names}} {{.Image}}'``."""
+    pairs = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            pairs.append((parts[0], parts[1]))
+    return pairs
+
+
+def parse_listener_processes(text: str) -> List[str]:
+    """Process names in ``ss -Hltnp`` output (``users:(("docker-proxy",...``)."""
+    return sorted(set(re.findall(r'\(\("([^"]+)"', text or "")))
+
+
+def classify_mail_server(
+    containers: Sequence[Tuple[str, str]], port25_processes: Sequence[str], mailbox_servers: Sequence[str]
+) -> Dict[str, object]:
+    """Is this machine a mail server, and what kind?"""
+    mailcow = [name for name, image in containers if "mailcow" in f"{name} {image}".lower()]
+    if mailcow:
+        return {"detected": True, "kind": "mailcow",
+                "detail": f"mailcow containers: {', '.join(sorted(mailcow)[:4])}"}
+    stack = [name for name, image in containers if MAIL_STACK_RE.search(f"{name} {image}")]
+    if stack:
+        return {"detected": True, "kind": "docker",
+                "detail": f"mail containers: {', '.join(sorted(stack)[:4])}"}
+    if "docker-proxy" in port25_processes:
+        return {"detected": True, "kind": "docker", "detail": "port 25 is published by a Docker container"}
+    if mailbox_servers:
+        return {"detected": True, "kind": "host",
+                "detail": f"mailbox server installed: {', '.join(mailbox_servers)}"}
+    return {"detected": False, "kind": "", "detail": ""}
+
+
+async def mail_server_status() -> Dict[str, object]:
+    """Detect a mail server on this machine (read-only, never fails the page)."""
+    async def output(argv: Sequence[str]) -> str:
+        try:
+            result = await run(list(argv), timeout=15)
+        except RuntimeError:
+            return ""
+        return result.stdout if result.ok else ""
+
+    containers = parse_docker_ps(
+        await output(["docker", "ps", "--format", "{{.Names}} {{.Image}}"]) if shutil.which("docker") else ""
+    )
+    listeners = parse_listener_processes(await output(["ss", "-Hltnp", "sport = :25"]))
+    mailbox = [name for name, parts in MAILBOX_SERVERS.items() if ROOT.joinpath(*parts).exists()]
+    return classify_mail_server(containers, listeners, mailbox)
+
+
+def mail_server_refusal(server: Mapping[str, object], action: str) -> Optional[str]:
+    """Why *action* is refused on a detected mail server, or None."""
+    if not server.get("detected"):
+        return None
+    return (f"{action} is disabled because this machine is a mail server ({server.get('detail')}); "
+            "LinuStart sends its own mail through msmtp here and leaves the mail server alone")
+
+
+def install_command(transport: str, mail_server: bool = False) -> List[str]:
+    """apt-get install for a transport; on a mail server it never removes anything."""
+    from . import packages
+
+    argv = packages.install_command([TRANSPORT_PACKAGE[valid_transport(transport)]])
+    return argv[:2] + ["--no-remove"] + argv[2:] if mail_server else argv
 
 
 async def installed_mailers() -> List[str]:
@@ -501,36 +595,78 @@ def msmtp_tls(security: str) -> Dict[str, str]:
     }[security]
 
 
+MSMTP_ACCOUNT = "linustart"
+MSMTP_BEGIN = "# BEGIN LinuStart account - edited from the Email page, keep these markers"
+MSMTP_END = "# END LinuStart account"
+# Files written before the panel kept to its own account started with this.
+MSMTP_OLD_HEADER = "# Managed by LinuStart"
+MSMTP_DEFAULT_RE = re.compile(r"^\s*account\s+default\s*:", re.I)
+MSMTP_ACCOUNT_RE = re.compile(r"^\s*account\s+(?P<name>[^\s:]+)\s*(:.*)?$", re.I)
+
+
 def build_msmtprc(host: str, port: int, security: str, username: str, from_address: str) -> str:
-    """The /etc/msmtprc the panel manages.
+    """The panel's account block in /etc/msmtprc.
+
+    Self-contained (no reliance on a ``defaults`` section) so it can sit at
+    the end of a file the administrator also edits; settings it does not
+    name, such as ``logfile`` in their ``defaults``, still apply to it.
 
     ``from`` is the envelope sender, pinned to the relay account like the
     Postfix sender_canonical map; the visible From: header stays whatever
     the message (unattended-upgrades' Sender) says. The password lives in a
-    separate root-only file read through passwordeval.
+    separate root-only file read through passwordeval. The account is the
+    default because sendmail callers (unattended-upgrades) cannot pick one.
     """
     if security not in SECURITIES:
         raise ValueError(f"security must be one of {SECURITIES}")
     tls = msmtp_tls(security)
     lines = [
-        "# Managed by LinuStart - changes made here are overwritten from the Email page.",
-        "defaults",
+        MSMTP_BEGIN,
+        f"account        {MSMTP_ACCOUNT}",
         "auth           on",
         f"tls            {tls['tls']}",
         f"tls_starttls   {tls['tls_starttls']}",
         "tls_trust_file /etc/ssl/certs/ca-certificates.crt",
         "syslog         LOG_MAIL",
-        "",
-        "account        linustart",
         f"host           {host}",
         f"port           {int(port)}",
         f"from           {envelope_sender(username, from_address)}",
         f"user           {username}",
         f'passwordeval   "cat {logical(MSMTP_PASSWORD_FILE)}"',
         "",
-        "account default : linustart",
+        f"account default : {MSMTP_ACCOUNT}",
+        MSMTP_END,
     ]
     return "\n".join(lines) + "\n"
+
+
+def merge_msmtprc(existing: str, block: str) -> str:
+    """Put the panel's account into an msmtprc, leaving everything else as is.
+
+    The previous panel block is replaced and the new one goes at the end, so
+    no key of the administrator's can fall into the panel's section. Other
+    ``account default`` lines are commented out (msmtp refuses a second
+    definition); the panel's account has to be the default for sendmail.
+    """
+    text = existing or ""
+    if not text.strip() or text.lstrip().startswith(MSMTP_OLD_HEADER):
+        return block
+    begin, end = text.find(MSMTP_BEGIN), text.find(MSMTP_END)
+    if begin != -1 and end > begin:
+        text = text[:begin] + text[end + len(MSMTP_END):].lstrip("\n")
+    kept = []
+    for line in text.splitlines():
+        if MSMTP_DEFAULT_RE.match(line):
+            line = f"# disabled by LinuStart, its account is the default: {line.strip()}"
+        else:
+            match = MSMTP_ACCOUNT_RE.match(line)
+            if match and match.group("name") == MSMTP_ACCOUNT:
+                raise ValueError(
+                    f"/etc/msmtprc already defines an account named {MSMTP_ACCOUNT!r}; rename it first"
+                )
+        kept.append(line)
+    head = "\n".join(kept).rstrip("\n")
+    return (head + "\n\n" if head else "") + block
 
 
 def logical(path) -> str:
@@ -703,8 +839,10 @@ async def _apply_msmtp(host: str, port: int, security: str, username: str, from_
         raise ValueError("a password is required for a new SMTP account")
     if not valid_sasl_password(password):
         raise ValueError("the SMTP password may not contain line breaks")
+    # Merged first: a refusal (a foreign 'linustart' account) changes nothing.
+    merged = merge_msmtprc(read_text(MSMTPRC), build_msmtprc(host, port, security, username, from_address))
     write_text(MSMTP_PASSWORD_FILE, password + "\n", mode=MSMTP_PASSWORD_MODE)
-    write_text(MSMTPRC, build_msmtprc(host, port, security, username, from_address), mode=MSMTPRC_MODE)
+    write_text(MSMTPRC, merged, mode=MSMTPRC_MODE)  # write_text backs up the previous file
     _save_state("msmtp", host, port, security, username, from_address, report_to, report_mode)
     await apply_report_settings(report_to, report_mode, from_address)
     return await status()
