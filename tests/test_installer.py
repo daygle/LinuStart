@@ -7,6 +7,7 @@ of the friendly message.
 """
 
 import pathlib
+import re
 
 INSTALLER = pathlib.Path(__file__).resolve().parents[1] / "install.sh"
 
@@ -55,9 +56,23 @@ def test_uninstall_keeps_configuration_and_state():
     block = source[block_start:block_end]
     assert 'rm -rf "$APP_DIR"' in block
     assert 'rm -f "$SERVICE_FILE"' in block
-    assert 'rm -rf "$CONFIG_DIR"' not in block
-    assert 'rm -rf "$STATE_DIR"' not in block
     assert "exit 0" in block
+    # config and state go only with --purge
+    purge_at = block.index('if [[ "$PURGE" -eq 1 ]]')
+    assert 'rm -rf "$CONFIG_DIR" "$STATE_DIR"' in block[purge_at:]
+    assert '"$CONFIG_DIR"' not in block[:purge_at].replace('echo "LinuStart', "")
+
+
+def test_purge_implies_uninstall_and_never_touches_system_settings():
+    source = read_installer()
+    assert "--purge)     UNINSTALL=1; PURGE=1 ;;" in source
+    report = source[source.index("report_system_changes() {"):source.index(UNINSTALL_BLOCK)]
+    # The report only reads: once the quoted messages (which name the undo
+    # commands) are taken out, nothing in it removes or changes anything.
+    commands = re.sub(r'"[^"]*"' + "|'[^']*'", '""', report)
+    commands = "\n".join(line for line in commands.splitlines() if not line.lstrip().startswith("#"))
+    for forbidden in ("rm ", "nft ", "systemctl ", "sed -i", ">"):
+        assert forbidden not in commands, forbidden
 
 
 if __name__ == "__main__":

@@ -76,7 +76,19 @@ ssh -L 8765:127.0.0.1:8765 user@your-server
 Install flags: `--source` installs the checkout instead of the newest release,
 `--loopback` binds `127.0.0.1` only, `--host ADDR` and
 `--port N` set the listen address, and `./install.sh --uninstall` removes the
-service again.
+service again. Uninstalling lists what LinuStart changed on the system (sudo
+rules, SSH and kernel settings, firewall rules, mail and network fixes) with
+the command to undo each one, and leaves them in place: removing them
+automatically could open the firewall or lock someone out. `--purge` also
+deletes the panel's own configuration and state (`/etc/linustart`,
+`/var/lib/linustart`).
+
+The **Software → System Components** section shows, per area (firewall, mail,
+DNS, time sync, automatic updates, cron), what is in use, what is installed
+but unused and what is missing. Missing pieces install with one click
+(`apt-get --no-remove`, so nothing is removed to make room), and an unused
+component can be removed once `apt-get -s remove` shows nothing else would go
+with it.
 
 ### Updating LinuStart
 
