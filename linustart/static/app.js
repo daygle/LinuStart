@@ -1035,6 +1035,7 @@ $("#cron-modal-delete").addEventListener("click", async () => {
 
 async function loadSysctl() {
   const data = await api("/sysctl");
+  renderFindings("#sysctl-findings", "Kernel Settings Checks", data.findings, loadSysctl);
   state.sysctlFiles = data.files || [];
   $("#sysctl-summary").textContent =
     `${data.settings || 0} setting(s) in ${state.sysctlFiles.length} file(s)`;
@@ -1046,7 +1047,9 @@ async function loadSysctl() {
     const rows = (file.entries || []).map((entry) => `
       <tr${entry.valid ? "" : ' class="muted"'}>
         <td><code>${esc(entry.key)}</code></td>
-        <td><code>${esc(entry.value)}</code></td>
+        <td><code>${esc(entry.value)}</code>${entry.overridden_by
+          ? ` <span class="badge warn" title="At boot ${esc(entry.overridden_by.file)} sets ${esc(entry.overridden_by.value)}, which wins">overridden by ${esc(entry.overridden_by.file)}</span>`
+          : ""}</td>
         <td>${entry.runtime === null || entry.runtime === undefined
           ? '<span class="muted">-</span>'
           : `<code>${esc(entry.runtime)}</code>${entry.changed ? ' <span class="badge">pending</span>' : ""}`}</td>

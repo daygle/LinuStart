@@ -406,3 +406,13 @@ def test_firewall_fix_runs_only_a_current_finding(env):
     assert client.post("/api/firewall/fix/docker", headers=AUTH).status_code == 400
     assert client.post("/api/firewall/fix/nftables-service", headers=AUTH).json()["ok"]
     assert ran == ["nftables-service"] and "firewall.fix" in audit_text(tmp_path)
+
+
+def test_sysctl_fix_only_when_needed(env):
+    client, tmp_path, _, monkeypatch = env
+    monkeypatch.setattr(routes.sysctl_mod, "list_files", lambda: {"findings": []})
+    assert client.post("/api/sysctl/fix/sysctl-conf-boot", headers=AUTH).status_code == 400
+    monkeypatch.setattr(routes.sysctl_mod, "list_files", lambda: {"findings": [{"id": "sysctl-conf-boot"}]})
+    monkeypatch.setattr(routes.sysctl_mod, "link_sysctl_conf", lambda: "/etc/sysctl.d/99-sysctl.conf")
+    assert client.post("/api/sysctl/fix/sysctl-conf-boot", headers=AUTH).json()["ok"]
+    assert "sysctl.fix" in audit_text(tmp_path)

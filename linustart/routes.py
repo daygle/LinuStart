@@ -1440,6 +1440,18 @@ def build_router(
     async def sysctl_list() -> Dict[str, object]:
         return sysctl_mod.list_files()
 
+    @router.post("/sysctl/fix/{finding_id}", dependencies=guard)
+    async def sysctl_fix(finding_id: str) -> Dict[str, object]:
+        current = {f["id"] for f in sysctl_mod.list_files()["findings"]}  # type: ignore[union-attr]
+        if finding_id != "sysctl-conf-boot" or finding_id not in current:
+            raise HTTPException(status_code=400, detail=f"nothing to fix for {finding_id!r} on this machine")
+        try:
+            done = sysctl_mod.link_sysctl_conf()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        audit.record("sysctl.fix", f"linked {done} to /etc/sysctl.conf")
+        return {"ok": True, "done": [done]}
+
     @router.post("/sysctl/entry", dependencies=guard)
     async def sysctl_upsert(body: SysctlBody) -> Dict[str, object]:
         try:

@@ -16,12 +16,13 @@ without root.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
-from ..paths import PROC_SYS, ROOT, SYSCTL_CONF, SYSCTL_D
+from ..paths import PROC_SYS, ROOT, SYSCTL_CONF, SYSCTL_D, rooted
 from ..util import backup, read_text, restore_files, run, write_text
 
 DEFAULT_FILE = "99-linustart.conf"
@@ -287,7 +288,30 @@ def list_files() -> Dict[str, object]:
                 {"path": logical_path(path), "kind": "error", "detail": READ_ERROR, "entries": []}
             )
     default_file = logical_path(SYSCTL_D / DEFAULT_FILE)
+    order = precedence()
+    winners = order["winners"]
+    for item in files:
+        for entry in item.get("entries") or []:
+            winner = winners.get(entry["key"])  # type: ignore[union-attr]
+            if winner and winner[0] != item["path"]:
+                entry["overridden_by"] = {"file": winner[0], "value": winner[1]}
+    main = next((item for item in files if item.get("kind") == "main"), None)
+    findings = []
+    if main and main.get("count") and not order["sysctl_conf_at_boot"]:
+        from .nethealth import finding
+
+        findings.append(finding(
+            "sysctl-conf-boot", "warn", "/etc/sysctl.conf is not applied at boot",
+            f"This system has no {SYSCTL_CONF_LINK} link in /etc/sysctl.d, so systemd-sysctl skips "
+            "/etc/sysctl.conf when the machine starts: its settings only hold until the next reboot. "
+            f"Restoring the link (/etc/sysctl.d/{SYSCTL_CONF_LINK} -> ../sysctl.conf, as older Debian "
+            "releases ship it) applies them at boot again. Settings saved to drop-ins are not affected.",
+            {"label": "Apply /etc/sysctl.conf at boot",
+             "confirm": f"Create /etc/sysctl.d/{SYSCTL_CONF_LINK} pointing at /etc/sysctl.conf?"},
+            endpoint="/sysctl/fix",
+        ))
     return {
+        "findings": findings,
         "files": files,
         "settings": sum(int(item.get("count") or 0) for item in files),
         "default_file": default_file,
@@ -296,6 +320,81 @@ def list_files() -> Dict[str, object]:
             "sysctl_d": logical_path(SYSCTL_D),
         },
     }
+
+
+# --------------------------------------------------------------------------
+# What really applies, and in which order
+#
+# At boot systemd-sysctl reads *.conf from /etc/sysctl.d, /run/sysctl.d,
+# /usr/local/lib/sysctl.d, /usr/lib/sysctl.d and /lib/sysctl.d - a name in
+# an earlier directory masks the same name in a later one - and applies the
+# files sorted by name, so a later file overrides an earlier one's keys.
+# /etc/sysctl.conf is read at boot only through a 99-sysctl.conf link to it,
+# which older Debian releases ship and newer ones do not.
+# --------------------------------------------------------------------------
+
+SYSTEM_SYSCTL_DIRS = [
+    rooted("run", "sysctl.d"), rooted("usr", "local", "lib", "sysctl.d"),
+    rooted("usr", "lib", "sysctl.d"), rooted("lib", "sysctl.d"),
+]
+SYSCTL_CONF_LINK = "99-sysctl.conf"
+
+
+def boot_files() -> List[Path]:
+    """The files systemd-sysctl applies at boot, in order."""
+    chosen: Dict[str, Path] = {}
+    for directory in [SYSCTL_D, *SYSTEM_SYSCTL_DIRS]:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.name.endswith(".conf") and not path.name.startswith(".") and path.name not in chosen:
+                chosen[path.name] = path
+    return [chosen[name] for name in sorted(chosen)]
+
+
+def sysctl_conf_read_at_boot(files: List[Path]) -> bool:
+    for path in files:
+        if path.name == SYSCTL_CONF_LINK:
+            try:
+                return path.resolve() == SYSCTL_CONF.resolve()
+            except OSError:
+                return False
+    return False
+
+
+def last_writers(ordered: List[Tuple[str, Dict[str, str]]]) -> Dict[str, Tuple[str, str]]:
+    """``{key: (file, value)}`` for the file whose value is applied last."""
+    winners: Dict[str, Tuple[str, str]] = {}
+    for logical, values in ordered:
+        for key, value in values.items():
+            winners[key] = (logical, value)
+    return winners
+
+
+def _values(path: Path) -> Dict[str, str]:
+    try:
+        return {entry.key: entry.value for entry in parse_entries(read_text(path)) if entry.valid}
+    except (OSError, ValueError):
+        return {}
+
+
+def precedence() -> Dict[str, object]:
+    """Who wins each key at boot, and whether /etc/sysctl.conf is read then."""
+    files = boot_files()
+    conf_at_boot = sysctl_conf_read_at_boot(files)
+    ordered = [(logical_path(SYSCTL_CONF if path.name == SYSCTL_CONF_LINK and conf_at_boot else path),
+                _values(path)) for path in files]
+    return {"winners": last_writers(ordered), "sysctl_conf_at_boot": conf_at_boot}
+
+
+def link_sysctl_conf() -> str:
+    """Restore the 99-sysctl.conf link so /etc/sysctl.conf is applied at boot."""
+    link = SYSCTL_D / SYSCTL_CONF_LINK
+    if link.exists() or link.is_symlink():
+        raise ValueError(f"{logical_path(link)} already exists; it is not a link to /etc/sysctl.conf")
+    SYSCTL_D.mkdir(parents=True, exist_ok=True)
+    os.symlink("../sysctl.conf", link)
+    return logical_path(link)
 
 
 def apply_command() -> List[str]:
