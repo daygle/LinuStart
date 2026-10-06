@@ -419,6 +419,7 @@ def build_router(
             "backend": backend,
             "config": await network_mod.get_config(backend),
             "runtime": await network_mod.runtime_status(),
+            "resolver": await network_mod.resolver_status(backend),
             "sessions": [s.to_dict() for s in sessions.pending()],
         }
 

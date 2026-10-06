@@ -438,10 +438,35 @@ $("#alert-test").addEventListener("click", async () => {
 
 /* ---------------------------------------------------------------- network */
 
+function renderResolver(resolver) {
+  const box = $("#net-resolver");
+  if (!resolver) {
+    box.innerHTML = "<p class='muted'>resolver status unavailable</p>";
+    return;
+  }
+  const servers = (resolver.nameservers || []).length
+    ? resolver.nameservers.map((n) => `<code>${esc(n)}</code>`).join(", ")
+    : '<span class="badge warn">no nameservers configured</span>';
+  const badge = resolver.dns_setting_applies
+    ? '<span class="badge ok">panel DNS applies</span>'
+    : '<span class="badge warn">panel DNS not applied</span>';
+  const notes = (resolver.warnings || [])
+    .map((w) => `<p class="muted"><span class="badge warn">note</span> ${esc(w)}</p>`)
+    .join("");
+  const generated = resolver.generated_by && resolver.generated_by !== resolver.manager
+    ? ` (file says: ${esc(resolver.generated_by)})`
+    : "";
+  box.innerHTML = `
+    <p><span class="badge">${esc(resolver.manager)}</span>${generated} ${badge}</p>
+    <p class="muted">${esc(resolver.path || "/etc/resolv.conf")} → ${servers}</p>
+    ${notes}`;
+}
+
 async function loadNetwork() {
   const data = await api("/network");
   $("#net-backend").textContent = `backend: ${data.backend}`;
   $("#net-source").textContent = (data.config && data.config.source) || "";
+  renderResolver(data.resolver);
   const runtimeRows = (data.runtime.interfaces || []).map((iface) => `
     <tr>
       <td><code>${esc(iface.name)}</code></td>
@@ -469,6 +494,10 @@ async function loadNetwork() {
          still applies to this interface. Saving this interface switches DHCP off in every
          file that has it.</p>`
       : "";
+    const dnsNoop = data.resolver && !data.resolver.dns_setting_applies
+      ? `<p class="muted"><span class="badge warn">DNS no-op</span> the DNS servers entered here
+         are not applied on this system${(data.resolver.warnings || []).length ? ` - ${esc(data.resolver.warnings[0])}` : ""}.</p>`
+      : "";
     const v6 = iface.ipv6 || null;
     const v6method = v6 ? v6.method : "";
     const kind = iface.kind && iface.kind !== "ethernets" && iface.kind !== "ethernet"
@@ -479,6 +508,7 @@ async function loadNetwork() {
       <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}</h2>
       ${duplicated}
       ${dhcpElsewhere}
+      ${dnsNoop}
       <form class="form" data-iface="${esc(iface.name)}">
         <label>Mode
           <select name="method">
