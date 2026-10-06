@@ -550,10 +550,21 @@ def build_router(
         data = await mail_mod.status()
         data["mailer"] = await mail_mod.mailer_status(str(data.get("transport") or "postfix"))
         data["msmtp"] = await mail_mod.msmtp_status()
+        data["mail_server"] = await mail_mod.mail_server_status()
         return data
+
+    async def refuse_on_mail_server(action: str) -> Dict[str, object]:
+        server = await mail_mod.mail_server_status()
+        reason = mail_mod.mail_server_refusal(server, action)
+        if reason:
+            audit.record("mail.refused", reason, ok=False)
+            raise HTTPException(status_code=409, detail=reason)
+        return server
 
     @router.post("/mail", dependencies=guard)
     async def mail_apply(body: MailBody) -> Dict[str, object]:
+        if body.transport == "postfix":
+            await refuse_on_mail_server("Configuring Postfix as a relay")
         try:
             result = await mail_mod.apply(
                 host=body.host,
@@ -592,6 +603,7 @@ def build_router(
 
     @router.post("/mail/remove-conflicts", dependencies=guard)
     async def mail_remove_conflicts() -> Dict[str, object]:
+        await refuse_on_mail_server("Removing mail transfer agents")
         state = await mail_mod.mailer_status()
         conflicts = list(state.get("conflicts") or [])
         if not conflicts:
@@ -612,14 +624,16 @@ def build_router(
     async def mail_install(transport: str = Query("postfix", pattern="^(postfix|msmtp)$")) -> Dict[str, object]:
         package = mail_mod.TRANSPORT_PACKAGE[transport]
         if transport == "postfix":
+            await refuse_on_mail_server("Installing Postfix")
             try:
                 await mail_mod.preseed_postfix()
             except RuntimeError as exc:
                 raise HTTPException(status_code=500, detail=str(exc))
+        server = await mail_mod.mail_server_status()
         job = await jobs.start(
             "mail.install",
             f"Install {package} (SMTP relay)",
-            packages_mod.install_command([package]),
+            mail_mod.install_command(transport, mail_server=bool(server.get("detected"))),
         )
         audit.record("mail.install", f"{package} install")
         return job.to_dict()

@@ -1137,22 +1137,41 @@ $("#sysctl-modal-delete").addEventListener("click", async () => {
 
 const MAIL_PACKAGES = { postfix: "postfix", msmtp: "msmtp-mta" };
 
+function mailPackageInstalled(transport) {
+  const data = state.mailData || {};
+  const packages = (data.mailer && data.mailer.packages) || [];
+  return packages.includes(MAIL_PACKAGES[transport]) || !!(data.installed && transport === data.transport);
+}
+
 function mailInstallButton() {
   const chosen = $("#mail-transport-select").value;
-  const configured = state.mailData && state.mailData.transport;
   const button = $("#mail-install");
   button.textContent = `Install ${MAIL_PACKAGES[chosen]}`;
-  // offer the install whenever the chosen transport is not the one known to be installed
-  button.classList.toggle("hidden", !!(state.mailData && state.mailData.installed && chosen === configured));
+  // offer the install whenever the chosen transport's package is missing
+  button.classList.toggle("hidden", mailPackageInstalled(chosen));
 }
+
+const MAIL_SERVER_KINDS = { mailcow: "mailcow", docker: "a Docker mail stack", host: "a mail server" };
 
 async function loadMail() {
   const data = await api("/mail");
   state.mailData = data;
-  const transport = data.transport || "postfix";
+  const server = data.mail_server || {};
+  // On a mail server only msmtp is offered: no daemon, nothing on port 25.
+  const transport = server.detected ? "msmtp" : (data.transport || "postfix");
   $("#mail-transport-select").value = transport;
+  $("#mail-transport-select").querySelector('option[value="postfix"]').disabled = !!server.detected;
+  const banner = $("#mail-server-banner");
+  banner.classList.toggle("hidden", !server.detected);
+  if (server.detected) {
+    banner.innerHTML = `<span class="badge ok">${esc(MAIL_SERVER_KINDS[server.kind] || "mail server")} detected</span>
+      ${esc(server.detail || "")}. LinuStart leaves it alone: it sends its own mail through msmtp, which
+      runs no daemon and listens on no port, and never installs, removes or reconfigures Postfix or Exim here.
+      Point it at a mailbox on this server (port 587, STARTTLS) and use the server's public hostname so the
+      TLS certificate matches.`;
+  }
   const badge = $("#mail-status-badge");
-  if (!data.installed) {
+  if (!mailPackageInstalled(transport)) {
     badge.textContent = `${MAIL_PACKAGES[transport]} not installed`;
     badge.className = "badge warn";
   } else if (transport === "msmtp") {
@@ -1173,14 +1192,16 @@ async function loadMail() {
   $("#mail-password-hint").textContent = data.credentials_set ? "(password on file)" : "";
   const msmtp = data.msmtp || {};
   const msmtpHint = $("#mail-msmtp-hint");
-  if (msmtp.detected && !data.relayhost && transport === "postfix") {
+  if (msmtp.detected && !data.relayhost && (transport === "postfix" || server.detected)) {
     msmtpHint.classList.remove("hidden");
     msmtpHint.textContent =
       "Existing msmtp configuration found - the form is pre-filled from /etc/msmtprc. " +
       (msmtp.password_available
         ? "Leave the password blank and the msmtp password file is used automatically. "
         : "") +
-      "Keep msmtp by choosing it under Delivery, or save with Postfix and use ‘Remove conflicting mailers’ so Postfix takes over sendmail.";
+      (server.detected
+        ? "Saving adds a 'linustart' account to /etc/msmtprc and makes it the default; your other accounts and settings stay."
+        : "Keep msmtp by choosing it under Delivery, or save with Postfix and use ‘Remove conflicting mailers’ so Postfix takes over sendmail.");
     $("#mail-host").value = msmtp.host || $("#mail-host").value;
     $("#mail-port").value = msmtp.port || $("#mail-port").value;
     $("#mail-security").value = msmtp.security || $("#mail-security").value;
@@ -1200,7 +1221,7 @@ async function loadMail() {
     transportText += " · msmtp client present (not used for delivery, left untouched)";
   }
   transportLine.textContent = transportText;
-  $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0);
+  $("#mail-remove-conflicts").classList.toggle("hidden", conflicts.length === 0 || !!server.detected);
   let summary = "No relay configured yet.";
   if (data.relayhost) {
     summary = transport === "msmtp"

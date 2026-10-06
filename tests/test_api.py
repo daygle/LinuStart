@@ -269,3 +269,56 @@ def test_resolvconf_install_is_refused_where_it_is_not_needed(env, backend, summ
     _fake_resolver(monkeypatch, backend, **summary)
     monkeypatch.setattr(routes.resolvconf_mod, "command", lambda: ["false"])
     assert client.post("/api/network/resolvconf", headers=AUTH).status_code == 400
+
+
+MAILCOW = {"detected": True, "kind": "mailcow", "detail": "mailcow containers: postfix-mailcow"}
+
+
+def _fake_mail_server(monkeypatch, server):
+    async def status():
+        return server
+
+    monkeypatch.setattr(routes.mail_mod, "mail_server_status", status)
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("post", "/api/mail/install?transport=postfix", None),
+    ("post", "/api/mail/remove-conflicts", None),
+    ("post", "/api/mail", {"host": "mail.example.com", "port": 587, "security": "starttls",
+                           "username": "u@example.com", "from_address": "u@example.com",
+                           "password": "pw", "report_to": "ops@example.com", "transport": "postfix"}),
+])
+def test_a_mail_server_is_never_touched(env, method, path, body):
+    client, tmp_path, _, monkeypatch = env
+    _fake_mail_server(monkeypatch, MAILCOW)
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("reached the mail server")
+
+    monkeypatch.setattr(routes.mail_mod, "preseed_postfix", must_not_run)
+    monkeypatch.setattr(routes.mail_mod, "apply", must_not_run)
+    response = getattr(client, method)(path, headers=AUTH, **({"json": body} if body else {}))
+    assert response.status_code == 409
+    assert "mail server" in response.json()["detail"]
+    assert "mail.refused" in audit_text(tmp_path)
+
+
+def test_msmtp_install_on_a_mail_server_never_removes_packages(env):
+    client, _, _, monkeypatch = env
+    _fake_mail_server(monkeypatch, MAILCOW)
+    seen = []
+
+    def install_command(transport, mail_server=False):
+        seen.append((transport, mail_server))
+        return ["true"]
+
+    monkeypatch.setattr(routes.mail_mod, "install_command", install_command)
+    job = client.post("/api/mail/install?transport=msmtp", headers=AUTH).json()
+    assert job["kind"] == "mail.install"
+    assert seen == [("msmtp", True)]
+
+
+def test_mail_page_reports_the_mail_server(env):
+    client, _, _, monkeypatch = env
+    _fake_mail_server(monkeypatch, MAILCOW)
+    assert client.get("/api/mail", headers=AUTH).json()["mail_server"]["kind"] == "mailcow"

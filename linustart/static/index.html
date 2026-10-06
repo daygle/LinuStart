@@ -301,6 +301,7 @@
         <div class="cards">
           <div class="card">
             <h2>Mail Delivery (SMTP relay)</h2>
+            <p id="mail-server-banner" class="muted hidden"></p>
             <p id="mail-msmtp-hint" class="muted hidden"></p>
             <form id="mail-form" class="form">
               <label>Delivery
@@ -346,7 +347,7 @@
           </div>
           <div class="card">
             <h2>Test Delivery</h2>
-            <p class="muted">Queues a message through the whole local Postfix pipeline and out via your relay.</p>
+            <p class="muted">Sends a message through this server's sendmail (Postfix or msmtp) and out via your relay.</p>
             <form id="mail-test-form" class="form">
               <label>Recipient
                 <input type="text" id="mail-test-to" placeholder="me@example.com" autocomplete="off">
