@@ -236,6 +236,13 @@ if [[ -n "$RELEASE_WORK" ]]; then
     rm -rf "$RELEASE_WORK"
 fi
 
+# The release tag is the version: stamp it into the tree, which matters when
+# GitHub's source tarball (not the workflow-built archive) was installed.
+# RELEASE_TAG passed TAG_PATTERN, so it holds only [0-9A-Za-z.-].
+if [[ -n "$RELEASE_TAG" ]]; then
+    sed -i "s/^__version__ = \".*\"/__version__ = \"${RELEASE_TAG#[vV]}\"/" "$SRC_DIR/linustart/__init__.py"
+fi
+
 INSTALLED_VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$SRC_DIR/linustart/__init__.py" | head -n1)"
 echo "    Installed version ${INSTALLED_VERSION:-unknown}${RELEASE_TAG:+ (release $RELEASE_TAG)}"
 

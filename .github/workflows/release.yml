@@ -38,27 +38,26 @@ jobs:
           ref: ${{ steps.tag.outputs.tag }}
           fetch-depth: 1
 
-      # A tag whose code still declares the previous version is refused by
-      # every installed panel (v1.0.1 and v1.0.2 shipped declaring 1.0.0).
-      # Fail here, before any asset is attached, so the mistake is visible.
-      - name: Check the tag matches the declared version
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          declared="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' linustart/__init__.py | head -n1)"
-          project="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -n1)"
-          if [ "${TAG#[vV]}" != "$declared" ] || [ "$declared" != "$project" ]; then
-            echo "tag $TAG does not match linustart/__init__.py ($declared) and pyproject.toml ($project)" >&2
-            echo "bump both, commit, and tag that commit" >&2
-            exit 1
-          fi
-
+      # The tag is the version: nobody edits linustart/__init__.py to cut a
+      # release, so stamp the tag into the archive here. The archive is built
+      # from the index (git write-tree) so it carries the stamp and nothing
+      # else from the runner, with the tagged commit's time as every file's
+      # mtime so a rebuild of the same tag is byte-identical.
       - name: Build the archive and SHA256SUMS
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          version="${TAG#[vV]}"
+          sed -i "s/^__version__ = \".*\"/__version__ = \"${version}\"/" linustart/__init__.py
+          grep -qx "__version__ = \"${version}\"" linustart/__init__.py || {
+            echo "could not stamp version ${version} into linustart/__init__.py" >&2
+            exit 1
+          }
+          git add linustart/__init__.py
+          tree="$(git write-tree)"
           name="linustart-${TAG}.tar.gz"
-          git archive --format=tar --prefix="linustart-${TAG}/" HEAD | gzip -n -9 > "$name"
+          git archive --format=tar --prefix="linustart-${TAG}/" \
+            --mtime="$(git log -1 --format=%cI HEAD)" "$tree" | gzip -n -9 > "$name"
           sha256sum "$name" > SHA256SUMS
           cat SHA256SUMS
 

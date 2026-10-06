@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linustart"
-version = "1.0.1"  # must match linustart/__init__.py - tests/test_updater.py enforces it
+# The version lives in linustart/__init__.py only, and releases stamp it from
+# the tag (see .github/workflows/release.yml): nobody edits it by hand.
+dynamic = ["version"]
 description = "Self-hosted web panel for Debian and Ubuntu server administration: networking, unattended updates, hostname, timezone and APT package management."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +23,9 @@ dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.5"]
 
 [project.scripts]
 linustart = "linustart.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "linustart.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["linustart*"]

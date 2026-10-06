@@ -185,18 +185,18 @@ def test_replace_tree_swaps_and_can_undo():
 
 
 def test_version_is_the_single_source_of_truth():
-    """The tag, the package metadata and the running code must agree.
+    """The package metadata reads the version from linustart/__init__.py.
 
-    A release tagged v1.0.0 while the code still said 0.1.0 made the
-    updater roll every install straight back, so pin the two together.
+    Releases stamp the tag into __init__.py only; a second, static copy in
+    pyproject.toml would go stale and pip would install the wrong metadata.
     """
     import linustart
 
     root = pathlib.Path(__file__).resolve().parents[1]
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
-    declared = re.search(r'^version = "([^"]+)"', pyproject, re.M)
-    assert declared, "pyproject.toml has no static version"
-    assert declared.group(1) == linustart.__version__
+    assert not re.search(r'^version\s*=\s*"', pyproject, re.M), "pyproject.toml must not pin a version"
+    assert re.search(r'^dynamic = \["version"\]', pyproject, re.M)
+    assert 'version = { attr = "linustart.__version__" }' in pyproject
     assert re.fullmatch(r"\d{1,4}(\.\d{1,4}){0,3}(-[0-9A-Za-z.]+)?", linustart.__version__), (
         f"version {linustart.__version__!r} would not pass validate_tag when tagged"
     )
@@ -249,7 +249,7 @@ def test_declared_version_is_never_ahead_of_the_newest_tag():
     /update/check compares the newest release against what is installed; if
     the declared version runs ahead of the last release there is nothing left
     to offer, and the panel says 'up to date' while running unreleased code.
-    Bump the version on main only together with cutting the tag.
+    Releases stamp the tag into the archive; never bump it on main by hand.
     """
     import linustart
 
@@ -381,30 +381,42 @@ def test_declared_version_reads_the_unpacked_tree(tmp_path):
     assert updater_mod.declared_version(tmp_path) == "1.0.3"
 
 
-def test_a_release_tagged_without_a_version_bump_is_refused_untouched(tmp_path, monkeypatch):
-    """v1.0.2 shipped declaring 1.0.0: refuse it before backing up or swapping."""
+def test_stamp_version_writes_the_tag(tmp_path):
+    (tmp_path / "linustart").mkdir()
+    init = tmp_path / "linustart" / "__init__.py"
+    init.write_text('"""doc"""\n\n__version__ = "1.0.0"\nOTHER = "1.0.0"\n', encoding="utf-8")
+    assert updater_mod.stamp_version(tmp_path, "v1.0.2") == "1.0.2"
+    assert init.read_text(encoding="utf-8") == '"""doc"""\n\n__version__ = "1.0.2"\nOTHER = "1.0.0"\n'
+    with pytest.raises(ValueError):
+        updater_mod.stamp_version(tmp_path, "v1.0.2; rm -rf /")
+    init.write_text("nothing here\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        updater_mod.stamp_version(tmp_path, "v1.0.2")
+
+
+def test_the_release_tag_is_the_version(tmp_path, monkeypatch):
+    """v1.0.2 was tagged on code declaring 1.0.0: install it as 1.0.2."""
     import tarfile
 
     src = tmp_path / "linustart-v1.0.2"
     (src / "linustart").mkdir(parents=True)
     (src / "linustart" / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
-    (src / "pyproject.toml").write_text('version = "1.0.0"\n', encoding="utf-8")
+    (src / "pyproject.toml").write_text("", encoding="utf-8")
     archive = tmp_path / "release.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(str(src), arcname=src.name)
 
     app_dir = tmp_path / "opt" / "app"
     app_dir.mkdir(parents=True)
-    (app_dir / "marker").write_text("old", encoding="utf-8")
     monkeypatch.setattr(updater_mod, "app_source_dir", lambda: app_dir)
     monkeypatch.setattr(updater_mod, "is_managed_install", lambda: True)
+    monkeypatch.setattr("linustart.paths.BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(updater_mod, "pip_install", lambda target: None)
+    monkeypatch.setattr(
+        updater_mod, "installed_version", lambda: updater_mod.declared_version(app_dir)
+    )
+    monkeypatch.setattr(updater_mod, "refresh_unit", lambda app: False)
+    monkeypatch.setattr(updater_mod, "schedule_restart", lambda: None)
 
-    def untouched(*_args, **_kwargs):
-        raise AssertionError("the install must not be touched")
-
-    monkeypatch.setattr(updater_mod, "backup_tree", untouched)
-    monkeypatch.setattr(updater_mod, "replace_tree", untouched)
-    monkeypatch.setattr(updater_mod, "pip_install", untouched)
-
-    assert updater_mod.cmd_apply("daygle/LinuStart", tag="v1.0.2", tarball=str(archive)) == 1
-    assert (app_dir / "marker").read_text(encoding="utf-8") == "old"
+    assert updater_mod.cmd_apply("daygle/LinuStart", tag="v1.0.2", tarball=str(archive)) == 0
+    assert updater_mod.declared_version(app_dir) == "1.0.2"
