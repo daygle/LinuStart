@@ -471,7 +471,8 @@ function renderResolver(resolver) {
 async function installResolvconf() {
   if (!window.confirm(
     "Install resolvconf? It takes over /etc/resolv.conf and fills it from the DNS servers " +
-    "configured on each interface. If that leaves no nameserver, the current file is put back.",
+    "configured on each interface, keeping the current search domains and options. The current " +
+    "file is backed up first, and put back if the result has no nameserver.",
   )) return;
   try {
     const job = await api("/network/resolvconf", { method: "POST" });
