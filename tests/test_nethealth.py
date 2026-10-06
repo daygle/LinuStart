@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from linustart import util  # noqa: E402
 from linustart.modules import nethealth, network  # noqa: E402
 from linustart.util import CmdResult  # noqa: E402
 
@@ -250,6 +251,7 @@ def test_networkd_is_detected_and_read_only(monkeypatch, tmp_path):
 def test_findings_on_an_upgraded_cloud_machine(monkeypatch, tmp_path):
     _machine(monkeypatch, tmp_path, LEFTOVER, netplan={"50-cloud-init.yaml": CLOUD_NETPLAN.replace("ens3", "eth0")})
     monkeypatch.setattr(nethealth, "ROOT", tmp_path)
+    monkeypatch.setattr(util, "BACKUP_DIR", tmp_path / "backups")  # write_text backs up here
     monkeypatch.setattr(nethealth, "CLOUD_DISABLED_MARKER", tmp_path / "nope")
     monkeypatch.setattr(nethealth, "_cloud_cfg_texts", lambda: [""])
     monkeypatch.setattr(nethealth.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
@@ -258,6 +260,7 @@ def test_findings_on_an_upgraded_cloud_machine(monkeypatch, tmp_path):
     changed = nethealth.fix_ifupdown_leftovers(nethealth.ifupdown_leftover_names())
     assert changed == [str(tmp_path / "etc" / "network" / "interfaces")]
     assert "eth0" not in (tmp_path / "etc" / "network" / "interfaces").read_text()
+    assert len(list((tmp_path / "backups").iterdir())) == 1  # the old file was kept
 
 
 def test_findings_never_raise(monkeypatch):
