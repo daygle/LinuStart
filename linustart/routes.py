@@ -25,6 +25,7 @@ from .modules import network as network_mod
 from .modules import packages as packages_mod
 from .modules import power as power_mod
 from .modules import procs as procs_mod
+from .modules import resolvconf as resolvconf_mod
 from .modules import services as services_mod
 from .modules import sshd as sshd_mod
 from .modules import cron as cron_mod
@@ -415,13 +416,30 @@ def build_router(
     @router.get("/network", dependencies=guard)
     async def network() -> Dict[str, object]:
         backend = await network_mod.detect_backend()
+        resolver = await network_mod.resolver_status(backend)
+        resolver["can_install_resolvconf"] = resolvconf_mod.setup_offered(backend, resolver)
         return {
             "backend": backend,
             "config": await network_mod.get_config(backend),
             "runtime": await network_mod.runtime_status(),
-            "resolver": await network_mod.resolver_status(backend),
+            "resolver": resolver,
             "sessions": [s.to_dict() for s in sessions.pending()],
         }
+
+    @router.post("/network/resolvconf", dependencies=guard)
+    async def network_install_resolvconf() -> Dict[str, object]:
+        backend = await network_mod.detect_backend()
+        resolver = await network_mod.resolver_status(backend)
+        if not resolvconf_mod.setup_offered(backend, resolver):
+            raise HTTPException(
+                status_code=400,
+                detail="resolvconf is only needed on ifupdown systems where the panel's DNS does not apply",
+            )
+        job = await jobs.start(
+            "network.resolvconf", "Install resolvconf so the panel's DNS applies", resolvconf_mod.command()
+        )
+        audit.record("network.resolvconf", "install resolvconf")
+        return job.to_dict()
 
     @router.post("/network/interfaces/{name}", dependencies=guard)
     async def configure_interface(name: str, body: InterfaceBody) -> Dict[str, object]:

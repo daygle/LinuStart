@@ -456,10 +456,28 @@ function renderResolver(resolver) {
   const generated = resolver.generated_by && resolver.generated_by !== resolver.manager
     ? ` (file says: ${esc(resolver.generated_by)})`
     : "";
+  const fix = resolver.can_install_resolvconf
+    ? `<p><button class="btn" id="net-resolvconf-install">Install resolvconf</button>
+       <span class="muted">makes the DNS servers saved below apply, now and at boot</span></p>`
+    : "";
   box.innerHTML = `
     <p><span class="badge">${esc(resolver.manager)}</span>${generated} ${badge}</p>
     <p class="muted">${esc(resolver.path || "/etc/resolv.conf")} → ${servers}</p>
-    ${notes}`;
+    ${notes}${fix}`;
+  const button = $("#net-resolvconf-install");
+  if (button) button.addEventListener("click", installResolvconf);
+}
+
+async function installResolvconf() {
+  if (!window.confirm(
+    "Install resolvconf? It takes over /etc/resolv.conf and fills it from the DNS servers " +
+    "configured on each interface. If that leaves no nameserver, the current file is put back.",
+  )) return;
+  try {
+    const job = await api("/network/resolvconf", { method: "POST" });
+    toast("Installing resolvconf…", "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
 }
 
 async function loadNetwork() {
@@ -1837,6 +1855,7 @@ async function pollJob() {
     if (data.job.status !== "running") {
       clearInterval(state.jobTimer);
       if (state.view === "software") loadSoftware();
+      if (state.view === "network") loadNetwork();
       if (state.view === "jobs") loadJobs();
     }
   } catch (err) {

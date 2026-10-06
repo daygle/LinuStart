@@ -237,3 +237,35 @@ def test_update_check_reports_checksums(env):
     monkeypatch.setattr(routes.updater_mod, "latest_release", lambda repo: release)
     data = client.get("/api/update/check", headers=AUTH).json()
     assert data["newer_available"] and data["checksum_published"]
+
+
+def _fake_resolver(monkeypatch, backend, **summary):
+    async def detect():
+        return backend
+
+    async def status(_backend=None):
+        return {"dns_setting_applies": False, "has_resolvconf": False, **summary}
+
+    monkeypatch.setattr(routes.network_mod, "detect_backend", detect)
+    monkeypatch.setattr(routes.network_mod, "resolver_status", status)
+
+
+def test_resolvconf_install_starts_a_job_where_dns_does_not_apply(env):
+    client, tmp_path, _, monkeypatch = env
+    _fake_resolver(monkeypatch, "ifupdown")
+    monkeypatch.setattr(routes.resolvconf_mod, "command", lambda: ["true"])
+    job = client.post("/api/network/resolvconf", headers=AUTH).json()
+    assert job["kind"] == "network.resolvconf"
+    assert "resolvconf" in audit_text(tmp_path)
+
+
+@pytest.mark.parametrize("backend,summary", [
+    ("netplan", {}),
+    ("ifupdown", {"has_resolvconf": True}),
+    ("ifupdown", {"dns_setting_applies": True}),
+])
+def test_resolvconf_install_is_refused_where_it_is_not_needed(env, backend, summary):
+    client, _, _, monkeypatch = env
+    _fake_resolver(monkeypatch, backend, **summary)
+    monkeypatch.setattr(routes.resolvconf_mod, "command", lambda: ["false"])
+    assert client.post("/api/network/resolvconf", headers=AUTH).status_code == 400
