@@ -34,7 +34,7 @@ def env(tmp_path, monkeypatch):
     async def reapply(spec):
         calls.append(("reapply", dict(spec)))
 
-    for kind in ("network", "ssh", "firewall"):
+    for kind in ("network", "ssh", "firewall", "dhcpcd"):
         monkeypatch.setitem(sessions.REAPPLIERS, kind, reapply)
     app = create_app(Settings(token=TOKEN))
     with TestClient(app) as client:
@@ -322,3 +322,60 @@ def test_mail_page_reports_the_mail_server(env):
     client, _, _, monkeypatch = env
     _fake_mail_server(monkeypatch, MAILCOW)
     assert client.get("/api/mail", headers=AUTH).json()["mail_server"]["kind"] == "mailcow"
+
+
+def _fake_findings(monkeypatch, found):
+    async def backend():
+        return "ifupdown"
+
+    async def config(_backend=None):
+        return {"interfaces": []}
+
+    async def findings(_backend, _config):
+        return found
+
+    monkeypatch.setattr(routes.network_mod, "detect_backend", backend)
+    monkeypatch.setattr(routes.network_mod, "get_config", config)
+    monkeypatch.setattr(routes.nethealth_mod, "findings", findings)
+
+
+def test_network_fix_needs_a_current_finding(env):
+    client, _, _, monkeypatch = env
+    _fake_findings(monkeypatch, [{"id": "nm-unmanaged", "fix": None}])
+    assert client.post("/api/network/fix/cloud-init", headers=AUTH).status_code == 400
+    assert client.post("/api/network/fix/nm-unmanaged", headers=AUTH).status_code == 400
+
+
+def test_network_fix_cloud_init(env):
+    client, tmp_path, _, monkeypatch = env
+    _fake_findings(monkeypatch, [{"id": "cloud-init", "fix": {"label": "x"}}])
+    target = tmp_path / "99-disable-network-config.cfg"
+    monkeypatch.setattr(routes.nethealth_mod, "CLOUD_DISABLE_FILE", target)
+    assert client.post("/api/network/fix/cloud-init", headers=AUTH).json()["ok"]
+    assert "config: disabled" in target.read_text()
+    assert "cloud-init" in audit_text(tmp_path)
+
+
+def test_network_fix_dhcpcd_opens_a_revert_session(env):
+    client, tmp_path, calls, monkeypatch = env
+    _fake_findings(monkeypatch, [{"id": "dhcpcd", "fix": {"label": "x"}}])
+    conf = tmp_path / "dhcpcd.conf"
+    conf.write_text("hostname\n")
+    monkeypatch.setattr(routes.network_mod, "DHCPCD_CONF", conf)
+    monkeypatch.setattr(routes.nethealth_mod, "DHCPCD_CONF", conf)
+
+    async def conflicts():
+        return ["ens18"]
+
+    async def apply(names):
+        return [f"ifup {n}" for n in names]
+
+    monkeypatch.setattr(routes.nethealth_mod, "dhcpcd_conflicts", conflicts)
+    monkeypatch.setattr(routes.nethealth_mod, "apply_dhcpcd_fix", apply)
+    result = client.post("/api/network/fix/dhcpcd", headers=AUTH).json()
+    assert "denyinterfaces ens18" in conf.read_text()
+    session = result["session"]
+    # reverting puts the old dhcpcd.conf back and re-applies through the dhcpcd re-applier
+    client.post(f"/api/network/sessions/{session['id']}/revert", headers=AUTH)
+    assert conf.read_text() == "hostname\n"
+    assert ("reapply", {"kind": "dhcpcd", "names": "ens18"}) in calls

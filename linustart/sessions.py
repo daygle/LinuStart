@@ -29,6 +29,7 @@ from .util import now_iso, restore_files
 
 # Re-applying is described by data, not a closure, so it survives a restart:
 # {"kind": "network", "backend": ..., "name": ...}, {"kind": "ssh"},
+# {"kind": "dhcpcd", "names": "eth0,eth1"},
 # {"kind": "firewall", "backend": ..., "running": "yes"|"no"|None}.
 ReapplySpec = Dict[str, Optional[str]]
 
@@ -37,6 +38,13 @@ async def _reapply_network(spec: Mapping[str, Optional[str]]) -> None:
     from .modules import network
 
     await network.apply_backend(str(spec["backend"]), spec.get("name"))
+
+
+async def _reapply_dhcpcd(spec: Mapping[str, Optional[str]]) -> None:
+    from .modules import nethealth
+
+    names = [n for n in str(spec.get("names") or "").split(",") if n]
+    await nethealth.apply_dhcpcd_fix(names)
 
 
 async def _reapply_ssh(_spec: Mapping[str, Optional[str]]) -> None:
@@ -53,6 +61,7 @@ async def _reapply_firewall(spec: Mapping[str, Optional[str]]) -> None:
 
 REAPPLIERS: Dict[str, Callable[[Mapping[str, Optional[str]]], Awaitable[None]]] = {
     "network": _reapply_network,
+    "dhcpcd": _reapply_dhcpcd,
     "ssh": _reapply_ssh,
     "firewall": _reapply_firewall,
 }

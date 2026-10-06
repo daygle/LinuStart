@@ -22,6 +22,7 @@ from .modules import hostname as hostname_mod
 from .modules import logs as logs_mod
 from .modules import mail as mail_mod
 from .modules import network as network_mod
+from .modules import nethealth as nethealth_mod
 from .modules import packages as packages_mod
 from .modules import power as power_mod
 from .modules import procs as procs_mod
@@ -418,13 +419,52 @@ def build_router(
         backend = await network_mod.detect_backend()
         resolver = await network_mod.resolver_status(backend)
         resolver["can_install_resolvconf"] = resolvconf_mod.setup_offered(backend, resolver)
+        config = await network_mod.get_config(backend)
         return {
             "backend": backend,
-            "config": await network_mod.get_config(backend),
+            "config": config,
             "runtime": await network_mod.runtime_status(),
             "resolver": resolver,
+            "findings": await nethealth_mod.findings(backend, config),
             "sessions": [s.to_dict() for s in sessions.pending()],
         }
+
+    @router.post("/network/fix/{finding_id}", dependencies=guard)
+    async def network_fix(finding_id: str) -> Dict[str, object]:
+        backend = await network_mod.detect_backend()
+        config = await network_mod.get_config(backend)
+        current = {f["id"]: f for f in await nethealth_mod.findings(backend, config)}
+        if finding_id not in current or not current[finding_id].get("fix"):
+            raise HTTPException(status_code=400, detail=f"nothing to fix for {finding_id!r} on this machine")
+        if finding_id == "cloud-init":
+            done = nethealth_mod.fix_cloud_init()
+            audit.record("network.fix", f"cloud-init: {done}")
+            return {"ok": True, "done": [done]}
+        if finding_id == "ifupdown-leftover":
+            names = nethealth_mod.ifupdown_leftover_names()
+            changed = nethealth_mod.fix_ifupdown_leftovers(names)
+            audit.record("network.fix", f"removed ifupdown entries for {', '.join(names)} from {', '.join(changed)}")
+            return {"ok": True, "done": changed}
+        if finding_id == "dhcpcd":
+            names = await nethealth_mod.dhcpcd_conflicts()
+            files = [network_mod.DHCPCD_CONF]
+            snapshots = snapshot_files(files)
+            nethealth_mod.write_dhcpcd_deny(names)
+            try:
+                ran = await nethealth_mod.apply_dhcpcd_fix(names)
+            except RuntimeError as exc:
+                audit.record("network.fix", f"dhcpcd: {exc}", ok=False)
+                await restore_and_reapply(
+                    snapshots, functools.partial(nethealth_mod.apply_dhcpcd_fix, names), "network"
+                )
+                raise HTTPException(status_code=500, detail=str(exc))
+            session = sessions.create(
+                "network", f"dhcpcd leaves {', '.join(names)} to ifupdown", snapshots,
+                timeout=90, reapply={"kind": "dhcpcd", "names": ",".join(names)},
+            )
+            audit.record("network.fix", f"dhcpcd: denyinterfaces {' '.join(names)}")
+            return {"ok": True, "done": ran, "session": session.to_dict()}
+        raise HTTPException(status_code=400, detail=f"no fix for {finding_id!r}")
 
     @router.post("/network/resolvconf", dependencies=guard)
     async def network_install_resolvconf() -> Dict[str, object]:
@@ -443,7 +483,12 @@ def build_router(
 
     @router.post("/network/interfaces/{name}", dependencies=guard)
     async def configure_interface(name: str, body: InterfaceBody) -> Dict[str, object]:
-        backend = await network_mod.detect_backend()
+        try:
+            network_mod.validate_interface_name(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # NetworkManager machines can still have interfaces ifupdown owns
+        backend = await network_mod.backend_for(name)
         files = network_mod.managed_config_files(backend)
         snapshots = snapshot_files(files)
         try:

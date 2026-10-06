@@ -481,11 +481,46 @@ async function installResolvconf() {
   } catch (err) { toast(err.message, "error"); }
 }
 
+function renderFindings(findings) {
+  const box = $("#net-findings");
+  if (!findings || !findings.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="card"><h2>Network Setup Checks</h2>${findings.map((f) => `
+    <div class="finding">
+      <p><span class="badge ${f.severity === "warn" ? "warn" : "muted"}">${f.severity === "warn" ? "fix" : "note"}</span>
+        <strong>${esc(f.title)}</strong></p>
+      <p class="muted">${esc(f.detail)}</p>
+      ${f.fix ? `<p><button class="btn" type="button" data-fix="${esc(f.id)}">${esc(f.fix.label)}</button></p>` : ""}
+    </div>`).join("")}</div>`;
+  $$("#net-findings button[data-fix]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const item = findings.find((f) => f.id === button.dataset.fix);
+      if (item && item.fix && item.fix.confirm && !window.confirm(item.fix.confirm)) return;
+      try {
+        const result = await api(`/network/fix/${encodeURIComponent(button.dataset.fix)}`, { method: "POST" });
+        toast("Fix applied", "success");
+        if (result.session) startRevertBar(result.session);
+        loadNetwork();
+      } catch (err) { toast(err.message, "error"); }
+    });
+  });
+}
+
+function readonlyCard(iface) {
+  return `
+    <div class="card">
+      <h2>${esc(iface.name)} <span class="badge">${esc(iface.method || "")}</span> <span class="badge muted">read-only</span></h2>
+      <p class="muted">${esc(iface.source || "")}</p>
+      <p>Address: ${esc(iface.address || "-")} · Gateway: ${esc(iface.gateway || "-")}</p>
+      <p>DNS: ${esc((iface.dns || []).join(", ") || "-")}</p>
+    </div>`;
+}
+
 async function loadNetwork() {
   const data = await api("/network");
   $("#net-backend").textContent = `backend: ${data.backend}`;
   $("#net-source").textContent = (data.config && data.config.source) || "";
   renderResolver(data.resolver);
+  renderFindings(data.findings);
   const runtimeRows = (data.runtime.interfaces || []).map((iface) => `
     <tr>
       <td><code>${esc(iface.name)}</code></td>
@@ -498,6 +533,7 @@ async function loadNetwork() {
     <tbody>${runtimeRows || "<tr><td colspan='4' class='muted'>No interfaces found</td></tr>"}</tbody>`;
 
   const cards = (data.config.interfaces || []).map((iface) => {
+    if (iface.readonly) return readonlyCard(iface);
     const method = iface.method || "dhcp";
     const stanzas = Number(iface.stanza_count || 1);
     const duplicated = stanzas > 1
@@ -522,9 +558,11 @@ async function loadNetwork() {
     const kind = iface.kind && iface.kind !== "ethernets" && iface.kind !== "ethernet"
       ? ` <span class="badge muted">${esc(String(iface.kind).replace(/s$/, ""))}</span>` : "";
     const inactive = iface.active === false ? ' <span class="badge warn">inactive</span>' : "";
+    const owner = iface.backend && iface.backend !== data.backend
+      ? ` <span class="badge muted" title="NetworkManager leaves this interface to ifupdown">${esc(iface.backend)}</span>` : "";
     return `
     <div class="card">
-      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}</h2>
+      <h2>${esc(iface.name)} <span class="badge">${esc(method)}</span>${kind}${inactive}${owner}</h2>
       ${duplicated}
       ${dhcpElsewhere}
       ${dnsNoop}
