@@ -4,4 +4,4 @@
 # the release archive, and the updater and install.sh do the same for GitHub's
 # source tarballs. In the repository it is only the fallback for a checkout
 # git cannot describe (see updater.version_details).
-__version__ = "1.0.1"
+__version__ = "1.0.0"
