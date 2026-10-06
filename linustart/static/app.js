@@ -1355,7 +1355,7 @@ async function loadUsers() {
       <td>${esc(u.full_name || "-")}</td>
       <td><code>${esc(u.shell)}</code></td>
       <td>
-        ${u.sudo ? '<span class="badge ok">sudo</span> ' : ""}
+        ${u.sudo ? `<span class="badge ok" title="${esc(sudoSources(u))}">sudo</span> ` : ""}
         ${u.locked ? '<span class="badge warn">locked</span>' : '<span class="badge ok">active</span>'}
       </td>
       <td><button class="btn btn-small" data-user="${esc(u.name)}" data-action="edit">Edit</button></td>
@@ -1439,6 +1439,15 @@ $("#group-create-form").addEventListener("submit", async (event) => {
   } catch (err) { toast(err.message, "error"); }
 });
 
+function sudoSources(u) {
+  return (u.sudo_via || []).map((g) => `${g.via === "user" ? "rule" : g.via} in ${g.file}`).join("; ");
+}
+
+/* Grants the panel cannot take away: rules another tool wrote for the user. */
+function foreignSudo(u) {
+  return (u.sudo_via || []).filter((g) => g.via === "user" && !/\/linustart-[^/]*$/.test(g.file));
+}
+
 async function openUser(name) {
   try {
     const data = await api(`/users/${encodeURIComponent(name)}`);
@@ -1449,6 +1458,12 @@ async function openUser(name) {
     $("#edit-shell").innerHTML = state.shells.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
     $("#edit-shell").value = u.shell;
     $("#edit-sudo").checked = !!u.sudo;
+    const via = $("#edit-sudo-via");
+    via.textContent = u.sudo && (u.sudo_via || []).length ? `Granted by: ${sudoSources(u)}.` : "";
+    const foreign = foreignSudo(u);
+    if (foreign.length) {
+      via.textContent += ` Turning sudo off removes group memberships and the panel's rule; the rule in ${foreign.map((g) => g.file).join(", ")} was written by another tool and stays until that file is edited.`;
+    }
     $("#edit-locked").checked = !!u.locked;
     $("#edit-password").value = "";
     // Always start from a clean key form: an edit left in flight for another
@@ -1555,7 +1570,13 @@ $("#user-edit-form").addEventListener("submit", async (event) => {
         locked: $("#edit-locked").checked,
       },
     });
-    toast("Account updated", "success");
+    const updated = await api(`/users/${encodeURIComponent(state.editUser)}`);
+    const left = foreignSudo(updated.user);
+    if (!$("#edit-sudo").checked && left.length) {
+      toast(`Account updated - ${state.editUser} still has sudo through ${left.map((g) => g.file).join(", ")}`, "error");
+    } else {
+      toast("Account updated", "success");
+    }
     loadUsers();
     openUser(state.editUser);
   } catch (err) { toast(err.message, "error"); }

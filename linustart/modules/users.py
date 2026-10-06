@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from ..paths import GROUP_FILE, PASSWD_FILE, SHADOW_FILE, SHELLS_FILE
+from ..paths import GROUP_FILE, PASSWD_FILE, SHADOW_FILE, SHELLS_FILE, SUDOERS_D, rooted
 from ..util import read_text, run, write_text
 
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -189,6 +189,52 @@ def memberships(groups: Sequence[Dict[str, object]], username: str, primary_gid:
 
 
 # --------------------------------------------------------------------------
+# Where a user's sudo comes from
+#
+# sudo can be granted by membership of a group named in a sudoers rule
+# (%sudo on Debian/Ubuntu, %admin on old Ubuntu), by the panel's own drop-in
+# (sudoers.d/linustart-<user>), or by a rule another tool wrote - cloud-init's
+# sudoers.d/90-cloud-init-users is the common one. The Users page used to
+# look at the sudo group only, so "sudo off" could leave a grant behind.
+# --------------------------------------------------------------------------
+
+SUDOERS_FILE = rooted("etc", "sudoers")
+SUDO_RULE_RE = re.compile(r"^(?P<who>%?[A-Za-z0-9_][A-Za-z0-9_.-]*)\s+\S.*=")
+SUDO_KEYWORDS = {"defaults", "user_alias", "runas_alias", "host_alias", "cmnd_alias"}
+
+
+def sudo_grants(name: str, groups_of: Sequence[str], files: Dict[str, str]) -> List[Dict[str, str]]:
+    """``[{"file", "via"}]``: each sudoers rule that names *name* or one of its groups."""
+    grants: List[Dict[str, str]] = []
+    for source, text in files.items():
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            match = SUDO_RULE_RE.match(line)
+            if not match or match.group("who").lower() in SUDO_KEYWORDS:
+                continue
+            who = match.group("who")
+            if who == name:
+                grants.append({"file": source, "via": "user"})
+            elif who.startswith("%") and who[1:] in groups_of:
+                grants.append({"file": source, "via": f"group {who[1:]}"})
+    return grants
+
+
+def sudoers_files() -> Dict[str, str]:
+    """/etc/sudoers and the drop-ins sudo reads (no '.' or trailing '~')."""
+    files = {str(SUDOERS_FILE): read_text(SUDOERS_FILE)}
+    try:
+        names = sorted(p for p in SUDOERS_D.iterdir() if p.is_file())
+    except OSError:
+        names = []
+    for path in names:
+        if "." not in path.name and not path.name.endswith("~"):
+            files[str(path)] = read_text(path)
+    return files
+
+
+
+# --------------------------------------------------------------------------
 # authorized_keys
 # --------------------------------------------------------------------------
 
@@ -312,16 +358,20 @@ async def list_users() -> Dict[str, object]:
     shadow = parse_shadow(read_text(SHADOW_FILE))
     groups = parse_group(read_text(GROUP_FILE))
     users = []
+    sudoers = sudoers_files()
     for user in visible_users(passwd):
         state = shadow.get(str(user["name"]), {"locked": False, "password_set": False})
         groups_of = memberships(groups, str(user["name"]), int(user["gid"]))
+        grants = sudo_grants(str(user["name"]), groups_of, sudoers)
         users.append(
             {
                 **user,
                 "locked": state["locked"],
                 "password_set": state["password_set"],
                 "groups": groups_of,
-                "sudo": SUDO_GROUP in groups_of,
+                # unreadable sudoers (tests, odd setups): fall back to the group
+                "sudo": bool(grants) or SUDO_GROUP in groups_of,
+                "sudo_via": grants,
             }
         )
     users.sort(key=lambda u: (int(u["uid"]) != 0, int(u["uid"])))
@@ -418,12 +468,41 @@ async def update_user(
         if sudo:
             await run(["usermod", "-aG", SUDO_GROUP, name], check=True)
         else:
-            result = await run(["gpasswd", "-d", name, SUDO_GROUP])
-            if not result.ok and "not a member" not in (result.stdout + result.stderr):
-                raise RuntimeError(f"removing {name} from {SUDO_GROUP} failed: {result.stderr.strip()}")
+            await revoke_sudo(name)
     if locked is not None:
         await run(["usermod", "-L" if locked else "-U", name], check=True)
     return await user_detail(name)
+
+
+async def revoke_sudo(name: str) -> List[Dict[str, str]]:
+    """Take away every grant the panel can: groups and its own drop-in.
+
+    Leaves rules other tools wrote (they are reported back as ``sudo_via``)
+    and the user's primary group, which cannot be left.
+    """
+    entry = _passwd_entry(name)
+    groups = parse_group(read_text(GROUP_FILE))
+    groups_of = memberships(groups, name, int(entry["gid"]))
+    primary = {str(g["name"]) for g in groups if g["gid"] == int(entry["gid"])}
+    granting = {SUDO_GROUP} | {
+        g["via"].split(" ", 1)[1] for g in sudo_grants(name, groups_of, sudoers_files())
+        if g["via"].startswith("group ")
+    }
+    for group in sorted(granting - primary):
+        if group not in groups_of:
+            continue
+        result = await run(["gpasswd", "-d", name, group])
+        if not result.ok and "not a member" not in (result.stdout + result.stderr):
+            raise RuntimeError(f"removing {name} from {group} failed: {result.stderr.strip()}")
+    from . import sudoers
+
+    try:
+        sudoers.remove_rule(name)
+    except ValueError:
+        pass  # no panel rule for this user
+    remaining = sudo_grants(name, memberships(parse_group(read_text(GROUP_FILE)), name, int(entry["gid"])),
+                            sudoers_files())
+    return remaining
 
 
 async def delete_user(name: str, remove_home: bool = False) -> None:
@@ -432,6 +511,14 @@ async def delete_user(name: str, remove_home: bool = False) -> None:
         raise ValueError("refusing to delete root")
     argv = ["userdel"] + (["-r"] if remove_home else []) + [name]
     await run(argv, check=True)
+    # A rule left behind would make the next account with this name an
+    # administrator the moment it is created.
+    from . import sudoers
+
+    try:
+        sudoers.remove_rule(name)
+    except ValueError:
+        pass
 
 
 async def add_key(name: str, key_line: str) -> List[Dict[str, object]]:
