@@ -466,6 +466,16 @@ def pip_install(target: Path) -> None:
         raise RuntimeError(f"pip install failed: {result.stderr.strip() or result.stdout.strip()}")
 
 
+def declared_version(tree: Path) -> str:
+    """The ``__version__`` an unpacked application tree declares, or ''."""
+    try:
+        text = (tree / "linustart" / "__init__.py").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.M)
+    return match.group(1).strip() if match else ""
+
+
 def installed_version() -> str:
     try:
         result = subprocess.run(
@@ -623,6 +633,15 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "", require_checksum: boo
             return 1
         if not (new_tree / "linustart" / "__init__.py").is_file() or not (new_tree / "pyproject.toml").is_file():
             log("refusing the archive: it does not contain a LinuStart application")
+            return 1
+        # Catch a release tagged without bumping __version__ before anything
+        # is backed up or replaced: the post-install check would only reject
+        # it after swapping the tree and running pip twice.
+        declared = declared_version(new_tree)
+        if declared and normalize_version(declared) != normalize_version(tag):
+            log(f"refusing release {tag}: its code declares version {declared}")
+            log("(the release was tagged without bumping linustart/__init__.py; "
+                "nothing was changed on this machine)")
             return 1
 
         log("backing up the current application tree")

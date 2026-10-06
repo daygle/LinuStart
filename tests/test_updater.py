@@ -372,3 +372,39 @@ def test_refresh_unit_replaces_only_a_changed_installed_unit(tmp_path, monkeypat
     assert "ProtectHome=false" in unit.read_text()
     assert ran == [["systemctl", "daemon-reload"]]
     assert updater_mod.refresh_unit(app) is False  # already current
+
+
+def test_declared_version_reads_the_unpacked_tree(tmp_path):
+    (tmp_path / "linustart").mkdir()
+    assert updater_mod.declared_version(tmp_path) == ""
+    (tmp_path / "linustart" / "__init__.py").write_text('"""x"""\n\n__version__ = "1.0.3"\n', encoding="utf-8")
+    assert updater_mod.declared_version(tmp_path) == "1.0.3"
+
+
+def test_a_release_tagged_without_a_version_bump_is_refused_untouched(tmp_path, monkeypatch):
+    """v1.0.2 shipped declaring 1.0.0: refuse it before backing up or swapping."""
+    import tarfile
+
+    src = tmp_path / "linustart-v1.0.2"
+    (src / "linustart").mkdir(parents=True)
+    (src / "linustart" / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    (src / "pyproject.toml").write_text('version = "1.0.0"\n', encoding="utf-8")
+    archive = tmp_path / "release.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(str(src), arcname=src.name)
+
+    app_dir = tmp_path / "opt" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "marker").write_text("old", encoding="utf-8")
+    monkeypatch.setattr(updater_mod, "app_source_dir", lambda: app_dir)
+    monkeypatch.setattr(updater_mod, "is_managed_install", lambda: True)
+
+    def untouched(*_args, **_kwargs):
+        raise AssertionError("the install must not be touched")
+
+    monkeypatch.setattr(updater_mod, "backup_tree", untouched)
+    monkeypatch.setattr(updater_mod, "replace_tree", untouched)
+    monkeypatch.setattr(updater_mod, "pip_install", untouched)
+
+    assert updater_mod.cmd_apply("daygle/LinuStart", tag="v1.0.2", tarball=str(archive)) == 1
+    assert (app_dir / "marker").read_text(encoding="utf-8") == "old"
