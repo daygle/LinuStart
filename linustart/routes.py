@@ -1014,6 +1014,21 @@ def build_router(
     async def firewall_status() -> Dict[str, object]:
         return await firewall_mod.status()
 
+    @router.post("/firewall/fix/{finding_id}", dependencies=guard)
+    async def firewall_fix(finding_id: str) -> Dict[str, object]:
+        state = await firewall_mod.status()
+        current = {f["id"]: f for f in state.get("findings") or []}
+        if finding_id not in current or not current[finding_id].get("fix") \
+                or finding_id not in firewall_mod.FIX_COMMANDS:
+            raise HTTPException(status_code=400, detail=f"nothing to fix for {finding_id!r} on this machine")
+        try:
+            done = await firewall_mod.apply_fix(finding_id)
+        except RuntimeError as exc:
+            audit.record("firewall.fix", f"{finding_id}: {exc}", ok=False)
+            raise HTTPException(status_code=500, detail=str(exc))
+        audit.record("firewall.fix", done)
+        return {"ok": True, "done": [done]}
+
     @router.post("/firewall", dependencies=guard)
     async def firewall_policy(body: FirewallPolicyBody) -> Dict[str, object]:
         backend = await firewall_mod.detect_backend()

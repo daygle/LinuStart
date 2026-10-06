@@ -379,3 +379,24 @@ def test_network_fix_dhcpcd_opens_a_revert_session(env):
     client.post(f"/api/network/sessions/{session['id']}/revert", headers=AUTH)
     assert conf.read_text() == "hostname\n"
     assert ("reapply", {"kind": "dhcpcd", "names": "ens18"}) in calls
+
+
+def test_firewall_fix_runs_only_a_current_finding(env):
+    client, tmp_path, _, monkeypatch = env
+
+    async def status():
+        return {"backend": "ufw", "findings": [
+            {"id": "nftables-service", "fix": {"label": "x"}}, {"id": "docker", "fix": None}]}
+
+    ran = []
+
+    async def apply_fix(fid):
+        ran.append(fid)
+        return "systemctl disable nftables"
+
+    monkeypatch.setattr(routes.firewall_mod, "status", status)
+    monkeypatch.setattr(routes.firewall_mod, "apply_fix", apply_fix)
+    assert client.post("/api/firewall/fix/firewalld-enabled", headers=AUTH).status_code == 400
+    assert client.post("/api/firewall/fix/docker", headers=AUTH).status_code == 400
+    assert client.post("/api/firewall/fix/nftables-service", headers=AUTH).json()["ok"]
+    assert ran == ["nftables-service"] and "firewall.fix" in audit_text(tmp_path)

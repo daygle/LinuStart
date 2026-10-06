@@ -481,25 +481,29 @@ async function installResolvconf() {
   } catch (err) { toast(err.message, "error"); }
 }
 
-function renderFindings(findings) {
-  const box = $("#net-findings");
+/* A page's setup checks: what is wrong, and a fix button posting to the
+   endpoint the server named for it. reload() refreshes the page after. */
+function renderFindings(selector, title, findings, reload) {
+  const box = $(selector);
   if (!findings || !findings.length) { box.innerHTML = ""; return; }
-  box.innerHTML = `<div class="card"><h2>Network Setup Checks</h2>${findings.map((f) => `
+  box.innerHTML = `<div class="card findings"><h2>${esc(title)}</h2>${findings.map((f) => `
     <div class="finding">
       <p><span class="badge ${f.severity === "warn" ? "warn" : "muted"}">${f.severity === "warn" ? "fix" : "note"}</span>
         <strong>${esc(f.title)}</strong></p>
       <p class="muted">${esc(f.detail)}</p>
       ${f.fix ? `<p><button class="btn" type="button" data-fix="${esc(f.id)}">${esc(f.fix.label)}</button></p>` : ""}
     </div>`).join("")}</div>`;
-  $$("#net-findings button[data-fix]").forEach((button) => {
+  $$(`${selector} button[data-fix]`).forEach((button) => {
     button.addEventListener("click", async () => {
       const item = findings.find((f) => f.id === button.dataset.fix);
-      if (item && item.fix && item.fix.confirm && !window.confirm(item.fix.confirm)) return;
+      if (!item || !item.fix) return;
+      if (item.fix.confirm && !window.confirm(item.fix.confirm)) return;
       try {
-        const result = await api(`/network/fix/${encodeURIComponent(button.dataset.fix)}`, { method: "POST" });
+        const result = await api(item.fix.endpoint, { method: "POST" });
         toast("Fix applied", "success");
         if (result.session) startRevertBar(result.session);
-        loadNetwork();
+        if (result.id && result.status) openJob(result.id);
+        reload();
       } catch (err) { toast(err.message, "error"); }
     });
   });
@@ -520,7 +524,7 @@ async function loadNetwork() {
   $("#net-backend").textContent = `backend: ${data.backend}`;
   $("#net-source").textContent = (data.config && data.config.source) || "";
   renderResolver(data.resolver);
-  renderFindings(data.findings);
+  renderFindings("#net-findings", "Network Setup Checks", data.findings, loadNetwork);
   const runtimeRows = (data.runtime.interfaces || []).map((iface) => `
     <tr>
       <td><code>${esc(iface.name)}</code></td>
@@ -1963,7 +1967,10 @@ async function loadAudit() {
 async function loadFirewall() {
   const data = await api("/firewall");
   const firewalld = data.backend === "firewalld";
-  $("#fw-backend").textContent = `backend: ${data.backend}${firewalld && data.zone ? ` (zone ${data.zone})` : ""}`;
+  renderFindings("#fw-findings", "Firewall Setup Checks", data.findings, loadFirewall);
+  $("#fw-backend").textContent = data.backend
+    ? `backend: ${data.backend}${firewalld && data.zone ? ` (zone ${data.zone})` : ""}`
+    : "no firewall installed";
   // firewalld zones only filter incoming traffic
   $("#fw-outgoing").disabled = firewalld;
   $('#fw-direction option[value="out"]').disabled = firewalld;

@@ -49,7 +49,11 @@ DHCPCD_END = "# END LinuStart"
 ALLOW_LINE_RE = re.compile(r"^\s*(?:auto|allow-[A-Za-z0-9-]+)\s+(?P<names>.+?)\s*$")
 
 
-def finding(fid: str, severity: str, title: str, detail: str, fix: Optional[Dict[str, str]] = None):
+def finding(fid: str, severity: str, title: str, detail: str, fix: Optional[Dict[str, str]] = None,
+            endpoint: str = "/network/fix"):
+    """A check result for a page's findings card; *fix* gets the URL its button posts to."""
+    if fix is not None:
+        fix = {**fix, "endpoint": f"{endpoint}/{fid}"}
     return {"id": fid, "severity": severity, "title": title, "detail": detail, "fix": fix}
 
 
