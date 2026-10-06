@@ -94,9 +94,10 @@ reports the release it came from; a **git checkout** reports what git says,
 e.g. `1.0.0-3-g0cdaeb8`, with the commit and how many commits past the tag it
 is - visible in the Updates panel, in `/api/health` and in `linustart --version`.
 Cloning `main` therefore never hides the fact that you are running unreleased
-code. For the same reason **bump `__version__` in `linustart/__init__.py` only
-together with the tag**: a version ahead of the newest release would leave
-nothing for the updater to offer, and the suite fails if that ever happens.
+code. **The tag is the version**: nobody edits `__version__` in
+`linustart/__init__.py`. The release workflow stamps the tag into the archive
+it attaches to the release, and the updater and `install.sh` stamp it into
+GitHub's source tarball too, so an installed copy always reports its tag.
 Source checkouts are also never self-updated from the GUI - the panel refuses
 to overwrite a working tree, and tells you to use `git pull` instead.
 

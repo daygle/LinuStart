@@ -43,6 +43,7 @@ from . import __version__
 
 DEFAULT_REPO = "daygle/LinuStart"
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+VERSION_LINE_RE = re.compile(r'^__version__\s*=\s*"([^"]*)"', re.M)
 TAG_RE = re.compile(r"^v?\d{1,4}(\.\d{1,4}){0,3}([-.][0-9A-Za-z.]+)?$")
 USER_AGENT = "LinuStart-Updater"
 DOWNLOAD_TIMEOUT = 120
@@ -472,8 +473,27 @@ def declared_version(tree: Path) -> str:
         text = (tree / "linustart" / "__init__.py").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
-    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.M)
+    match = VERSION_LINE_RE.search(text)
     return match.group(1).strip() if match else ""
+
+
+def stamp_version(tree: Path, tag: str) -> str:
+    """Write the release tag into an unpacked tree's ``__version__``.
+
+    The tag is the version: nobody edits linustart/__init__.py to cut a
+    release. The release workflow stamps its archive the same way; this
+    covers GitHub's generated source tarball, which carries whatever the
+    tagged commit declared. Returns the version written.
+    """
+    version = normalize_version(validate_tag(tag))
+    init = tree / "linustart" / "__init__.py"
+    text = init.read_text(encoding="utf-8")
+    stamped, count = VERSION_LINE_RE.subn(f'__version__ = "{version}"', text, count=1)
+    if not count:
+        raise ValueError(f"{init} declares no __version__")
+    if stamped != text:
+        init.write_text(stamped, encoding="utf-8")
+    return version
 
 
 def installed_version() -> str:
@@ -591,8 +611,8 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "", require_checksum: boo
     archive_name = "release.tar.gz"
     sums_url: Optional[str] = None
     if tarball:
-        tag = validate_tag(tag) if tag else __version__
-        log(f"using local archive {tarball} (tag {tag})")
+        tag = validate_tag(tag) if tag else ""
+        log(f"using local archive {tarball}" + (f" (tag {tag})" if tag else ""))
     else:
         release = release_by_tag(repo, tag) if tag else latest_release(repo)
         tag = release["tag"]
@@ -634,15 +654,18 @@ def cmd_apply(repo: str, tag: str = "", tarball: str = "", require_checksum: boo
         if not (new_tree / "linustart" / "__init__.py").is_file() or not (new_tree / "pyproject.toml").is_file():
             log("refusing the archive: it does not contain a LinuStart application")
             return 1
-        # Catch a release tagged without bumping __version__ before anything
-        # is backed up or replaced: the post-install check would only reject
-        # it after swapping the tree and running pip twice.
+        # The release tag is the version; a local archive with no tag keeps
+        # whatever it declares.
         declared = declared_version(new_tree)
-        if declared and normalize_version(declared) != normalize_version(tag):
-            log(f"refusing release {tag}: its code declares version {declared}")
-            log("(the release was tagged without bumping linustart/__init__.py; "
-                "nothing was changed on this machine)")
-            return 1
+        if not tag:
+            tag = declared or __version__
+        elif normalize_version(declared) != normalize_version(tag):
+            try:
+                stamp_version(new_tree, tag)
+            except (OSError, ValueError) as exc:
+                log(f"refusing the archive: {exc}")
+                return 1
+            log(f"set the version to {normalize_version(tag)} (the archive declared {declared or 'none'})")
 
         log("backing up the current application tree")
         backup = backup_tree(app_dir, BACKUP_DIR)
