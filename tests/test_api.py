@@ -416,3 +416,32 @@ def test_sysctl_fix_only_when_needed(env):
     monkeypatch.setattr(routes.sysctl_mod, "link_sysctl_conf", lambda: "/etc/sysctl.d/99-sysctl.conf")
     assert client.post("/api/sysctl/fix/sysctl-conf-boot", headers=AUTH).json()["ok"]
     assert "sysctl.fix" in audit_text(tmp_path)
+
+
+def test_components_install_and_remove_are_guarded(env):
+    client, tmp_path, _, monkeypatch = env
+
+    async def refuse_install(cid):
+        return "chrony already keeps the time"
+
+    async def allow_install(cid):
+        return None
+
+    async def refuse_removal(cid):
+        raise ValueError("firewalld cannot be removed: it is in use")
+
+    async def allow_removal(cid):
+        return ["firewalld"]
+
+    monkeypatch.setattr(routes.components_mod, "install_command", lambda cid: ["true"])
+    monkeypatch.setattr(routes.components_mod, "remove_command", lambda names: ["true"])
+    assert client.post("/api/components/nope/install", headers=AUTH).status_code == 404
+    monkeypatch.setattr(routes.components_mod, "check_install", refuse_install)
+    assert client.post("/api/components/systemd-timesyncd/install", headers=AUTH).status_code == 409
+    monkeypatch.setattr(routes.components_mod, "check_install", allow_install)
+    assert client.post("/api/components/systemd-timesyncd/install", headers=AUTH).json()["kind"] == "components.install"
+    monkeypatch.setattr(routes.components_mod, "check_removal", refuse_removal)
+    assert client.post("/api/components/firewalld/remove", headers=AUTH).status_code == 409
+    monkeypatch.setattr(routes.components_mod, "check_removal", allow_removal)
+    assert client.post("/api/components/firewalld/remove", headers=AUTH).json()["kind"] == "components.remove"
+    assert "components.remove" in audit_text(tmp_path)

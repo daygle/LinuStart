@@ -114,4 +114,13 @@ async def set_timezone(tz: str) -> str:
 
 
 async def set_ntp(enabled: bool) -> None:
-    await run(["timedatectl", "set-ntp", "yes" if enabled else "no"], check=True)
+    try:
+        await run(["timedatectl", "set-ntp", "yes" if enabled else "no"], check=True)
+    except RuntimeError as exc:
+        # A fresh minimal install may have no time-sync daemon at all.
+        if "not supported" in str(exc).lower():
+            raise RuntimeError(
+                "no time-sync service is installed: install systemd-timesyncd under "
+                "Software → System Components, then switch NTP on"
+            ) from None
+        raise

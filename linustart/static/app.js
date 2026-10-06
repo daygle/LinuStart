@@ -1755,7 +1755,43 @@ async function loadSoftware() {
       || "<tr><td colspan='4' class='muted'>System is up to date</td></tr>"}</tbody>`;
   renderInstalled();
   if (!state.updateChecked) checkUpdate();
+  loadComponents();
 }
+
+const COMPONENT_BADGES = { "in use": "ok", "installed, unused": "warn", "not installed": "muted" };
+
+async function loadComponents() {
+  const table = $("#components-table");
+  let data;
+  try { data = await api("/components"); } catch (err) {
+    table.innerHTML = `<tbody><tr><td class="muted">Could not read components: ${esc(err.message)}</td></tr></tbody>`;
+    return;
+  }
+  const rows = (data.groups || []).map((group) => group.items.map((item, i) => `
+    <tr>
+      <td>${i === 0 ? `<strong>${esc(group.name)}</strong>` : ""}</td>
+      <td><code>${esc(item.label)}</code><div class="muted">${esc(item.about)}</div></td>
+      <td><span class="badge ${COMPONENT_BADGES[item.state] || "muted"}">${esc(item.state)}</span>
+        ${item.detail ? `<div class="muted">${esc(item.detail)}</div>` : ""}
+        ${item.blocked ? `<div class="muted">${esc(item.blocked)}</div>` : ""}</td>
+      <td>${item.can_install ? `<button class="btn btn-small" data-component-install="${esc(item.id)}">Install</button>` : ""}
+        ${item.can_remove ? `<button class="btn btn-small btn-danger" data-component-remove="${esc(item.id)}">Remove</button>` : ""}</td>
+    </tr>`).join("")).join("");
+  table.innerHTML = `<thead><tr><th>Area</th><th>Component</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody>`;
+}
+
+$("#components-table").addEventListener("click", async (event) => {
+  const install = event.target.closest("button[data-component-install]");
+  const remove = event.target.closest("button[data-component-remove]");
+  if (!install && !remove) return;
+  const cid = (install || remove).dataset[install ? "componentInstall" : "componentRemove"];
+  if (remove && !window.confirm(`Remove ${cid}? It is installed but not in use. Its configuration files are kept.`)) return;
+  try {
+    const job = await api(`/components/${encodeURIComponent(cid)}/${install ? "install" : "remove"}`, { method: "POST" });
+    toast(`${install ? "Installing" : "Removing"} ${cid}…`, "success");
+    openJob(job.id);
+  } catch (err) { toast(err.message, "error"); }
+});
 
 /* ------------------------------------------------------ linustart updates */
 

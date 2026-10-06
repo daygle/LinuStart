@@ -25,6 +25,7 @@ from .modules import network as network_mod
 from .modules import nethealth as nethealth_mod
 from .modules import packages as packages_mod
 from .modules import power as power_mod
+from .modules import components as components_mod
 from .modules import procs as procs_mod
 from .modules import resolvconf as resolvconf_mod
 from .modules import services as services_mod
@@ -682,6 +683,50 @@ def build_router(
             mail_mod.install_command(transport, mail_server=bool(server.get("detected"))),
         )
         audit.record("mail.install", f"{package} install")
+        return job.to_dict()
+
+    # ---- system components -----------------------------------------------
+    @router.get("/components", dependencies=guard)
+    async def components_status() -> Dict[str, object]:
+        return await components_mod.status()
+
+    @router.post("/components/{cid}/install", dependencies=guard)
+    async def components_install(cid: str) -> Dict[str, object]:
+        if cid not in components_mod.COMPONENTS:
+            raise HTTPException(status_code=404, detail=f"unknown component: {cid}")
+        reason = await components_mod.check_install(cid)
+        if reason:
+            raise HTTPException(status_code=409, detail=f"not installing {cid}: {reason}")
+        if cid == "resolvconf":
+            # the guarded setup job: registers the configured DNS servers and
+            # puts the old resolv.conf back if the result has no nameserver
+            argv = resolvconf_mod.command()
+        else:
+            if cid == "postfix":
+                try:
+                    await mail_mod.preseed_postfix()
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=500, detail=str(exc))
+            argv = components_mod.install_command(cid)
+        job = await jobs.start("components.install", f"Install {components_mod.COMPONENTS[cid]['label']}", argv)
+        audit.record("components.install", cid)
+        return job.to_dict()
+
+    @router.post("/components/{cid}/remove", dependencies=guard)
+    async def components_remove(cid: str) -> Dict[str, object]:
+        if cid not in components_mod.COMPONENTS:
+            raise HTTPException(status_code=404, detail=f"unknown component: {cid}")
+        try:
+            names = await components_mod.check_removal(cid)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        job = await jobs.start(
+            "components.remove", f"Remove unused {components_mod.COMPONENTS[cid]['label']}",
+            components_mod.remove_command(names),
+        )
+        audit.record("components.remove", f"{cid}: {' '.join(names)}")
         return job.to_dict()
 
     # ---- packages --------------------------------------------------------
