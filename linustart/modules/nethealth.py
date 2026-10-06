@@ -61,6 +61,24 @@ def finding(fid: str, severity: str, title: str, detail: str, fix: Optional[Dict
 # cloud-init
 # --------------------------------------------------------------------------
 
+def cloud_settings(texts: Sequence[str]) -> Dict[str, object]:
+    """cloud.cfg then cloud.cfg.d/*.cfg merged at the top level (later wins)."""
+    merged: Dict[str, object] = {}
+    for text in texts:
+        try:
+            data = yaml.safe_load(text) if yaml is not None else None
+        except Exception:  # noqa: BLE001 - a broken file is cloud-init's problem
+            continue
+        if isinstance(data, dict):
+            merged.update(data)
+    return merged
+
+
+def cloud_init_active() -> bool:
+    """Installed and not switched off as a whole."""
+    return cloud_init_installed() and not CLOUD_DISABLED_MARKER.exists()
+
+
 def cloud_config_disables_network(texts: Sequence[str]) -> bool:
     """Does any cloud.cfg / cloud.cfg.d file say ``network: {config: disabled}``?"""
     for text in texts:

@@ -332,11 +332,12 @@ def build_router(
         return data
 
     @router.get("/hostname", dependencies=guard)
-    async def get_hostname() -> Dict[str, str]:
-        return {"hostname": await hostname_mod.current()}
+    async def get_hostname() -> Dict[str, object]:
+        return {"hostname": await hostname_mod.current(), "cloud_init": hostname_mod.cloud_init_status()}
 
     @router.post("/hostname", dependencies=guard)
-    async def set_hostname(body: HostnameBody) -> Dict[str, str]:
+    async def set_hostname(body: HostnameBody) -> Dict[str, object]:
+        cloud = hostname_mod.cloud_init_status()
         try:
             name = await hostname_mod.set_hostname(body.hostname)
         except ValueError as exc:
@@ -344,8 +345,9 @@ def build_router(
         except RuntimeError as exc:
             audit.record("hostname.set", str(exc), ok=False)
             raise HTTPException(status_code=500, detail=str(exc))
-        audit.record("hostname.set", f"hostname set to {name}")
-        return {"hostname": name}
+        audit.record("hostname.set", f"hostname set to {name}"
+                     + (f"; cloud-init told to keep it ({hostname_mod.CLOUD_HOSTNAME_FILE})" if cloud["managed"] else ""))
+        return {"hostname": name, "cloud_init_preserved": bool(cloud["managed"])}
 
     @router.get("/timezone", dependencies=guard)
     async def get_timezone() -> Dict[str, object]:

@@ -692,6 +692,13 @@ async function loadSystem() {
   loadPowerStatus();
   const [host, tz] = await Promise.all([api("/hostname"), api("/timezone")]);
   $("#hostname-input").value = host.hostname || "";
+  const cloud = host.cloud_init || {};
+  const hostNote = $("#hostname-cloud-note");
+  hostNote.classList.toggle("hidden", !cloud.managed);
+  hostNote.textContent = cloud.managed
+    ? `cloud-init resets the ${(cloud.undone || []).join(" and ")} at boot on this machine. Saving a ` +
+      "hostname here also tells cloud-init to keep it (/etc/cloud/cloud.cfg.d/99-linustart-hostname.cfg)."
+    : "";
   $("#timezone-input").value = tz.timezone || "";
   $("#timezone-list").innerHTML = (tz.zones || []).map((z) => `<option value="${esc(z)}"></option>`).join("");
   $("#ntp-status").textContent = tz.ntp
@@ -764,7 +771,7 @@ $("#hostname-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
     const result = await api("/hostname", { method: "POST", body: { hostname: $("#hostname-input").value.trim() } });
-    toast(`Hostname set to ${result.hostname}`, "success");
+    toast(`Hostname set to ${result.hostname}${result.cloud_init_preserved ? " (cloud-init will keep it)" : ""}`, "success");
     loadSystem();
   } catch (err) { toast(err.message, "error"); }
 });

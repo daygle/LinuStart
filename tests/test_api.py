@@ -80,8 +80,14 @@ def test_hostname_validation_and_audit(env):
         return name
 
     monkeypatch.setattr(routes.hostname_mod, "set_hostname", fake_set)
-    assert client.post("/api/hostname", json={"hostname": "web-01"}, headers=AUTH).json() == {"hostname": "web-01"}
+    monkeypatch.setattr(routes.hostname_mod, "cloud_init_status", lambda: {"managed": False, "undone": []})
+    assert client.post("/api/hostname", json={"hostname": "web-01"}, headers=AUTH).json() == {
+        "hostname": "web-01", "cloud_init_preserved": False}
     assert "hostname set to web-01" in audit_text(tmp_path)
+    # on a cloud-init machine the save says cloud-init was told to keep it
+    monkeypatch.setattr(routes.hostname_mod, "cloud_init_status", lambda: {"managed": True, "undone": ["hostname"]})
+    assert client.post("/api/hostname", json={"hostname": "web-02"}, headers=AUTH).json()["cloud_init_preserved"]
+    assert "cloud-init told to keep it" in audit_text(tmp_path)
 
     async def refuse(name):
         raise ValueError("invalid hostname")
