@@ -2068,6 +2068,21 @@ async function loadSsh() {
   validation.textContent = data.validation_error ? "config problem" : "config valid";
   validation.className = `badge ${data.validation_error ? "danger" : "ok"}`;
   validation.title = data.validation_error || "";
+  const notes = [];
+  if (data.writes_to) notes.push(`Changes are written to <code>${esc(data.writes_to)}</code>.`);
+  if ((data.overriding_files || []).length) {
+    const sources = data.sources || {};
+    const keys = Object.keys(sources).filter((k) => data.overriding_files.includes(sources[k]));
+    notes.push(`<span class="badge warn">overridden</span> ${keys.map((k) => `<code>${esc(k)}</code>`).join(", ")}
+      ${keys.length === 1 ? "is" : "are"} set in ${data.overriding_files.map((f) => `<code>${esc(f)}</code>`).join(", ")},
+      which sshd reads first - the values shown are the ones in effect.`);
+  }
+  if (data.socket_activated) {
+    notes.push("sshd is socket-activated (ssh.socket): a Port change regenerates and restarts the socket; open sessions stay connected.");
+  }
+  const sources = $("#ssh-sources");
+  sources.innerHTML = notes.join(" ");
+  sources.classList.toggle("hidden", notes.length === 0);
 }
 
 async function submitSsh(body, message) {

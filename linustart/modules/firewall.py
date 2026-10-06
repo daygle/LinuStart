@@ -28,9 +28,8 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
-from ..paths import FIREWALLD_DIR, NFTABLES_CONF, SSHD_CONFIG, UFW_DIR
+from ..paths import FIREWALLD_DIR, NFTABLES_CONF, UFW_DIR
 from ..util import read_text, run, write_text
-from .sshd import parse_sshd_config
 
 MANAGED_BEGIN = "# >>> linustart firewall (managed) >>>"
 MANAGED_END = "# <<< linustart firewall (managed) <<<"
@@ -559,7 +558,9 @@ async def detect_backend() -> str:
 
 def ssh_port() -> str:
     """The port sshd currently listens on - kept open when enabling a lockdown."""
-    return parse_sshd_config(read_text(SSHD_CONFIG)).get("Port", "22")
+    from .sshd import effective
+
+    return effective().get("Port", ("22", ""))[0]
 
 
 def firewalld_zone_file() -> Path:

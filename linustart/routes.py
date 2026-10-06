@@ -36,7 +36,6 @@ from .modules import sysinfo as sysinfo_mod
 from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
 from .modules import users as users_mod
-from .paths import SSHD_CONFIG
 from .ratelimit import AuthThrottle, client_key
 from .sessions import SessionManager
 from .settings import Settings
@@ -966,7 +965,7 @@ def build_router(
             updates["ClientAliveCountMax"] = body.client_alive_count_max
         if not updates:
             raise HTTPException(status_code=400, detail="nothing to change")
-        snapshots = snapshot_files([SSHD_CONFIG])
+        snapshots = snapshot_files(sshd_mod.config_files())
         try:
             values = await sshd_mod.apply_settings(updates)
         except ValueError as exc:
