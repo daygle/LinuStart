@@ -173,7 +173,9 @@ ASSIGN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*\s*=")
 
 def override_path(unit: str) -> Path:
     unit = normalize_unit(unit)
-    return SYSTEMD_SYSTEM_DIR / f"{unit}.d" / "override.conf"
+    path = SYSTEMD_SYSTEM_DIR / f"{unit}.d" / "override.conf"
+    _inside_systemd_dir(path)  # validate before the path leaves this helper
+    return path
 
 
 def validate_override(content: str) -> str:
@@ -212,7 +214,6 @@ def _inside_systemd_dir(path: Path) -> None:
 
 async def get_override(unit: str) -> Dict[str, object]:
     path = override_path(unit)
-    _inside_systemd_dir(path)
     shown = await run(["systemctl", "cat", "--no-pager", normalize_unit(unit)])
     return {
         "unit": normalize_unit(unit),
@@ -236,7 +237,6 @@ async def set_override(unit: str, content: str) -> Dict[str, object]:
     itself is not restarted - that stays the operator's call.
     """
     path = override_path(unit)
-    _inside_systemd_dir(path)
     text = validate_override(content or "")
     snapshots = snapshot_files([path])
     try:

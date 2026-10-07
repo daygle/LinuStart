@@ -182,16 +182,18 @@ def read_new_lines(path: Path, offset: int) -> "tuple[List[str], int]":
 def read_log_file(name: str, lines: object = 200, offset: Optional[int] = None) -> Dict[str, object]:
     safe = valid_log_name(name)
     path = VAR_LOG_DIR / safe
-    if not os.path.realpath(path).startswith(
-        os.path.join(os.path.realpath(VAR_LOG_DIR), "")
-    ):
+    # Confirm the resolved path is still under /var/log before we touch it.
+    # valid_log_name strips separators, but an explicit realpath check closes the
+    # path expression that CodeQL flags as built from the caller-controlled name.
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(VAR_LOG_DIR), "")):
         raise ValueError("refusing to read outside /var/log")
     if offset is not None:
         new_lines, next_offset = read_new_lines(path, offset)
         return {"name": safe, "lines": new_lines, "offset": next_offset}
     tail = tail_file(path, lines)
     try:
-        size = os.stat(os.path.realpath(path)).st_size
+        size = os.stat(real).st_size
     except OSError:
         size = 0
     return {"name": safe, "lines": tail, "offset": size}

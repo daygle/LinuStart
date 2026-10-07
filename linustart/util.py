@@ -72,6 +72,11 @@ async def run(
 
 
 def read_text(path: Path) -> str:
+    # Only files under the configured root are readable through this helper: a
+    # caller-built Path must not slip past ROOT via symlinks or ".." components.
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(ROOT), "")):
+        raise ValueError(f"refusing to read outside {ROOT}: {path!r}")
     try:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -146,6 +151,12 @@ def write_text(path: Path, content: str, *, mode: Optional[int] = None) -> None:
     New files get *mode* (default 0644); an explicit *mode* always wins, and
     is applied before the rename so a secret is never briefly world-readable.
     """
+    # The target must resolve inside ROOT before we touch the filesystem at all
+    # (parent creation, stat, backup, rename). This closes the path expression
+    # that was built from caller-controlled Path components.
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.join(os.path.realpath(ROOT), "")):
+        raise ValueError(f"refusing to write outside {ROOT}: {path!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
     old = read_text(path)
     if old == content and path.exists():

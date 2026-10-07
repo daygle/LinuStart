@@ -120,7 +120,10 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(util, "BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(util, "ROOT", tmp_path)
     for name, rel in [("MSMTPRC", "msmtprc"), ("MSMTP_PASSWORD_FILE", "linustart/msmtp-password"),
-                      ("MAIL_STATE_FILE", "linustart/mail.json"), ("UNATTENDED_FILE", "50unattended-upgrades")]:
+                      ("MAIL_STATE_FILE", "linustart/mail.json"), ("UNATTENDED_FILE", "50unattended-upgrades"),
+                      ("POSTFIX_MAIN_CF", "etc/postfix/main.cf"),
+                      ("POSTFIX_SASL_PASSWD", "etc/postfix/sasl_passwd"),
+                      ("POSTFIX_SENDER_CANONICAL", "etc/postfix/sender_canonical")]:
         monkeypatch.setattr(mail, name, tmp_path / rel)
     monkeypatch.setattr(mail.shutil, "which", lambda cmd: f"/usr/bin/{cmd}" if cmd == "msmtp" else None)
 
