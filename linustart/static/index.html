@@ -268,7 +268,7 @@
             <button class="btn btn-primary" type="button" id="cron-add">Add Job</button>
           </div>
         </div>
-        <div id="cron-files"></div>
+        <div id="cron-files" class="card-stack"></div>
         <p class="muted">Job files come from <code>/etc/crontab</code>, <code>/etc/cron.d/</code> and the user crontabs in <code>/var/spool/cron/crontabs/</code>. Every change is backed up to <code>/var/lib/linustart/backups</code> and recorded in the audit log.</p>
       </section>
 
@@ -285,7 +285,7 @@
           </div>
         </div>
         <div id="sysctl-findings"></div>
-        <div id="sysctl-files"></div>
+        <div id="sysctl-files" class="card-stack"></div>
         <p class="muted">Every change is written to the file, applied with <code>sysctl --system</code>, and rolled back automatically if the kernel rejects it. The runtime column shows what the kernel is using right now, read from <code>/proc/sys</code>. At boot the files in <code>/etc/sysctl.d/</code> and the system directories (<code>/run</code>, <code>/usr/lib/sysctl.d</code>) are applied in name order, the last one setting a parameter wins (marked "overridden by" elsewhere), and <code>/etc/sysctl.conf</code> is applied only where a <code>99-sysctl.conf</code> link points to it.</p>
       </section>
 

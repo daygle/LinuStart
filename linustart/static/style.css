@@ -64,7 +64,7 @@ body {
 .content { padding: 22px 26px 80px; max-width: 1200px; min-width: 0; }
 .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 .topbar h1 { font-size: 21px; margin: 0; }
-.section-title { margin: 26px 0 12px; font-size: 16px; }
+.section-title { margin: 26px 0 16px; font-size: 16px; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
 .card {
@@ -74,10 +74,16 @@ body {
   padding: 18px;
   box-shadow: var(--shadow);
 }
+/* One card rhythm everywhere: the grid's 16px gap also applies when cards
+   or card grids stack as page-section siblings, and to stacked card lists. */
+.view > .cards + .cards,
+.view > .cards + .card,
+.view > .card + .card { margin-top: 16px; }
+.card-stack { display: grid; gap: 16px; }
 .card h2 { margin: 0 0 14px; font-size: 15px; }
 .key-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .finding + .finding { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 4px; }
-.card.findings { margin: 18px 0; }
+.card.findings { margin: 16px 0; }
 .card h2 + h2, .card h2.spaced { margin-top: 22px; }
 .danger-card { border-color: var(--danger); }
 .danger-card h2 { color: var(--danger); }
