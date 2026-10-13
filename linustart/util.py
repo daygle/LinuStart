@@ -74,11 +74,12 @@ async def run(
 def read_text(path: Path) -> str:
     # Only files under the configured root are readable through this helper: a
     # caller-built Path must not slip past ROOT via symlinks or ".." components.
+    # The resolved path is the one opened, so what was checked is what is read.
     real = os.path.realpath(path)
     if not real.startswith(os.path.join(os.path.realpath(ROOT), "")):
         raise ValueError(f"refusing to read outside {ROOT}: {path!r}")
     try:
-        return path.read_text(encoding="utf-8")
+        return Path(real).read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
 
@@ -92,6 +93,23 @@ def is_within(base: Path, candidate: Path) -> bool:
     root = os.path.realpath(base)
     real = os.path.realpath(candidate)
     return real == root or real.startswith(os.path.join(root, ""))
+
+
+def confined(base: Path, path: Path) -> Path:
+    """*path* with its directories resolved, refused unless it sits under *base*.
+
+    The last component is kept rather than followed: replacing or removing a
+    symlinked file (/etc/resolv.conf) must act on the link, as os.replace and
+    unlink do. Callers use the returned path from then on, so the path that
+    was checked is the path that is touched.
+    """
+    name = os.path.basename(path)
+    if name in ("", ".", ".."):
+        raise ValueError(f"not a file path: {path!r}")
+    candidate = os.path.normpath(os.path.join(os.path.realpath(os.path.dirname(path)), name))
+    if not candidate.startswith(os.path.join(os.path.realpath(base), "")):
+        raise ValueError(f"refusing a path outside {base}: {path!r}")
+    return Path(candidate)
 
 
 def backup(path: Path) -> None:
@@ -151,12 +169,10 @@ def write_text(path: Path, content: str, *, mode: Optional[int] = None) -> None:
     New files get *mode* (default 0644); an explicit *mode* always wins, and
     is applied before the rename so a secret is never briefly world-readable.
     """
-    # The target must resolve inside ROOT before we touch the filesystem at all
-    # (parent creation, stat, backup, rename). This closes the path expression
-    # that was built from caller-controlled Path components.
-    real = os.path.realpath(path)
-    if not real.startswith(os.path.join(os.path.realpath(ROOT), "")):
-        raise ValueError(f"refusing to write outside {ROOT}: {path!r}")
+    # The target must sit inside ROOT before we touch the filesystem at all
+    # (parent creation, stat, backup, rename), and only the checked path is
+    # used below.
+    path = confined(ROOT, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     old = read_text(path)
     if old == content and path.exists():
