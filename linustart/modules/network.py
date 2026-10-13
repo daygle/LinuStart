@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from ..paths import DHCPCD_CONF, INTERFACES_FILE, NETPLAN_DIR, NETWORKD_DIR, RESOLV_CONF_FILE, ROOT
-from ..util import is_within, read_text, run, write_text
+from ..util import confined, is_within, read_text, run, write_text
 
 try:  # PyYAML is only required for the netplan backend.
     import yaml
@@ -1136,12 +1136,9 @@ def dhcp_release_commands(name: str) -> List[List[str]]:
     """
     name = validate_interface_name(name)
     commands: List[List[str]] = []
-    pidfile = ROOT / "run" / f"dhclient.{name}.pid"
-    # The pidfile path is assembled from a validated interface name; confirm the
-    # resolved path still sits under ROOT so a symlink in $ROOT/run cannot drag
-    # the check (and any later removal) onto a host path.
-    if not is_within(ROOT, pidfile):
-        raise ValueError(f"pidfile path escapes ROOT: {pidfile!r}")
+    # The pidfile path is assembled from a validated interface name; confined()
+    # also keeps a symlinked $ROOT/run from dragging it onto a host path.
+    pidfile = confined(ROOT, ROOT / "run" / f"dhclient.{name}.pid")
     if shutil.which("dhclient") and pidfile.exists():
         commands.append(["dhclient", "-r", "-pf", str(pidfile), name])
     if shutil.which("dhcpcd"):

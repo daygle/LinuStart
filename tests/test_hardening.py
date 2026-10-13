@@ -77,6 +77,33 @@ def test_write_text_explicit_mode_wins(tmp_path, backups):
 
 
 # --------------------------------------------------------------------------
+# Paths stay confined to their base
+# --------------------------------------------------------------------------
+
+def test_confined_refuses_paths_outside_base(tmp_path):
+    base = tmp_path / "root"
+    (base / "etc").mkdir(parents=True)
+    with pytest.raises(ValueError):
+        util.confined(base, base / "etc" / ".." / ".." / "escape.conf")
+    # a symlinked directory cannot drag the path out of the base either
+    (base / "run").symlink_to(tmp_path)
+    with pytest.raises(ValueError):
+        util.confined(base, base / "run" / "dhclient.eth0.pid")
+    with pytest.raises(ValueError):
+        util.confined(base, base / "etc" / "..")
+
+
+def test_confined_keeps_a_symlinked_file_as_the_link(tmp_path):
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "stub.conf").write_text("x\n")
+    link = tmp_path / "etc" / "resolv.conf"
+    link.symlink_to(tmp_path / "run" / "stub.conf")
+    # the link itself is the target, so os.replace swaps the link out
+    assert util.confined(tmp_path, link) == link.parent.resolve() / link.name
+
+
+# --------------------------------------------------------------------------
 # Input validation that guards config files and argv
 # --------------------------------------------------------------------------
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from ..paths import SYSTEMD_SYSTEM_DIR
-from ..util import backup, read_text, restore_files, run, snapshot_files, write_text
+from ..util import backup, confined, read_text, restore_files, run, snapshot_files, write_text
 
 # Must start with a letter or digit: a leading '-' would turn the unit name
 # into options for systemctl/journalctl.
@@ -173,8 +173,9 @@ ASSIGN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*\s*=")
 
 def override_path(unit: str) -> Path:
     unit = normalize_unit(unit)
-    path = SYSTEMD_SYSTEM_DIR / f"{unit}.d" / "override.conf"
-    _inside_systemd_dir(path)  # validate before the path leaves this helper
+    # validate before the path leaves this helper, and hand back the checked one
+    path = confined(SYSTEMD_SYSTEM_DIR, SYSTEMD_SYSTEM_DIR / f"{unit}.d" / "override.conf")
+    _inside_systemd_dir(path)  # a symlinked override.conf must not point out either
     return path
 
 
