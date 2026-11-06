@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 from .paths import CONFIG_FILE
 from .updater import DEFAULT_REPO
@@ -23,6 +23,9 @@ class Settings:
     # Web terminal sessions with no keyboard input for this long are closed
     # (0 disables the timeout).
     terminal_idle_minutes: int = 30
+    # Reverse proxies whose X-Forwarded-For may be believed when deciding
+    # which client a request came from (single addresses or CIDR ranges).
+    trusted_proxies: Tuple[str, ...] = ()
 
     @property
     def auth_enabled(self) -> bool:
@@ -35,6 +38,7 @@ def load_settings(
     port: Optional[int] = None,
     token: Optional[str] = None,
     no_auth: bool = False,
+    trusted_proxies: Optional[Sequence[str]] = None,
 ) -> Settings:
     path = Path(config_path) if config_path else CONFIG_FILE
     settings = Settings(config_path=path)
@@ -56,6 +60,13 @@ def load_settings(
             settings.terminal_idle_minutes = idle
         if isinstance(data.get("update_require_checksum"), bool):
             settings.update_require_checksum = data["update_require_checksum"]
+        proxies = data.get("trusted_proxies")
+        if isinstance(proxies, str):
+            proxies = [proxies]
+        if isinstance(proxies, list):
+            settings.trusted_proxies = tuple(
+                item.strip() for item in proxies if isinstance(item, str) and item.strip()
+            )
     if host is not None:
         settings.host = host
     if port is not None:
@@ -64,4 +75,6 @@ def load_settings(
         settings.token = None
     elif token is not None:
         settings.token = token
+    if trusted_proxies is not None:
+        settings.trusted_proxies = tuple(trusted_proxies)
     return settings

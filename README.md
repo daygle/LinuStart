@@ -60,8 +60,13 @@ The installer:
 4. fetches the **newest published release** from GitHub and installs it into `/opt/linustart` - an install is a released version, so the panel's own "check for updates" always has a real release to compare against. If GitHub is unreachable it installs the checkout it was run from instead and says so; `./install.sh --source` skips the release lookup deliberately (developers), and `LINUSTART_REPO=owner/name` points it at a fork,
 5. creates `/etc/linustart/config.json` with a generated access token and the
    listen address (every interface, so the panel is reachable on the LAN),
-6. offers to open the port in `ufw` (or prints the `firewalld` equivalent),
-7. installs and enables the `linustart` systemd service, then prints both the
+6. if it finds a reverse proxy (nginx, Caddy, Apache, HAProxy or Traefik)
+   configured to forward to the panel's port, offers to add that proxy to
+   `trusted_proxies` so the brute-force throttle stays per client - it only
+   adds what you confirm, and only prints the setting on an unattended run
+   (`--trusted-proxy <address>`, repeatable, names the proxies yourself),
+7. offers to open the port in `ufw` (or prints the `firewalld` equivalent),
+8. installs and enables the `linustart` systemd service, then prints both the
    loopback and LAN URLs.
 
 Open `http://<server-ip>:8765` from any machine on the LAN and paste the token
@@ -166,6 +171,32 @@ the installer generates one when an existing config lacks it. Because this is a
 root-level admin panel served over plain HTTP, prefer an SSH tunnel or a TLS
 reverse proxy (Caddy/nginx) over exposing it beyond a trusted network.
 
+### Behind a reverse proxy
+
+Wrong tokens are throttled per client address, and behind Caddy or nginx the
+address the panel sees is the proxy's - so every visitor would share one
+lockout and one guesser could lock everyone out. Tell the panel which proxies
+it may believe:
+
+```json
+{
+  "trusted_proxies": ["127.0.0.1/32", "::1/128"]
+}
+```
+
+or pass `--trusted-proxy 10.0.0.0/8` (repeatable, overrides the config file).
+The installer offers to fill this in when it finds a proxy config that forwards
+to the panel's port, and never changes an existing `trusted_proxies` on its
+own. `./install.sh --trusted-proxy 10.0.0.0/8` (repeatable) answers that offer
+ahead of time: it adds exactly the addresses you name and keeps anything
+already listed, which is how an unattended install opts in.
+Only requests whose direct peer is in that list have `X-Forwarded-For` read at
+all; the client is the right-most hop that is not itself a trusted proxy, so a
+visitor cannot invent a new identity by sending its own header. A client that
+reaches the panel directly is always keyed on its own address - including
+through an SSH tunnel, since this list is the panel's only trust decision and
+the server applies no forwarded-header handling of its own.
+
 ## Running without installing (development)
 
 ```bash
@@ -181,6 +212,7 @@ can point a dev instance at a scratch directory and play safely.
 
 ```
 linustart [--host HOST] [--port PORT] [--config PATH] [--token TOKEN] [--no-auth]
+          [--trusted-proxy ADDRESS ...]
 ```
 
 | Flag | Meaning |
@@ -188,6 +220,7 @@ linustart [--host HOST] [--port PORT] [--config PATH] [--token TOKEN] [--no-auth
 | `--config` | Path to `config.json` (default `/etc/linustart/config.json`) |
 | `--token` | Override the token from the config file |
 | `--no-auth` | Disable authentication (loopback binds only, unless forced) |
+| `--trusted-proxy` | Reverse proxy whose `X-Forwarded-For` is believed (repeatable) |
 
 OpenAPI docs are served at `/api/docs` when the service runs.
 

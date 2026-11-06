@@ -47,6 +47,11 @@ MAX_SESSIONS = 8
 # the most recent ones are kept so the list cannot grow without bound.
 MAX_CLOSED_KEPT = 50
 CHUNK = 8192
+# Output waiting for the browser. The pump drains only as fast as the client
+# reads, while the reader is fed as fast as the shell writes - an unbounded
+# queue would let `cat /dev/zero` in a backgrounded tab exhaust memory.
+MAX_PENDING_OUTPUT = 256
+OUTPUT_DROPPED_NOTICE = "\r\n[linustart] output dropped: this session is not being read fast enough\r\n"
 # Session recordings: the newest are kept, and one session stops recording
 # past a size cap (a `cat /dev/urandom` must not fill the disk).
 LOGS_KEPT = 200
@@ -123,7 +128,12 @@ class TerminalSession:
     closed: bool = False
     eof: bool = False
     closed_at: Optional[str] = None
-    output: "asyncio.Queue[Optional[str]]" = field(default_factory=asyncio.Queue)
+    output: "asyncio.Queue[Optional[str]]" = field(
+        default_factory=lambda: asyncio.Queue(maxsize=MAX_PENDING_OUTPUT)
+    )
+    output_dropped: bool = False
+    # Input the shell has not accepted yet; see TerminalManager._flush_writes.
+    write_pending: bytes = b""
     decoder: object = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")("replace"))
     log_handle: Optional[object] = field(default=None, repr=False)
     log_bytes: int = 0
@@ -160,6 +170,9 @@ class TerminalManager:
         rows_n = clamp_size(rows, 5, 200, 30)
 
         master_fd, slave_fd = pty.openpty()
+        # Non-blocking: writing more than the tty input buffer holds must not
+        # stall the event loop (see write/_flush_writes).
+        os.set_blocking(master_fd, False)
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows_n, cols_n, 0, 0))
 
         argv = shell_argv(target)
@@ -174,14 +187,25 @@ class TerminalManager:
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            env=env,
-            preexec_fn=child_setup,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                preexec_fn=child_setup,
+            )
+        except BaseException:
+            # Includes cancellation of the websocket handler mid-spawn: the
+            # PTY descriptors belong to us until a child holds them, and a
+            # long-lived panel must not leak a pair per failed attempt.
+            for fd in (master_fd, slave_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
         os.close(slave_fd)
 
         session_id = uuid.uuid4().hex[:12]
@@ -206,7 +230,7 @@ class TerminalManager:
             proc=proc,
             master_fd=master_fd,
             log_path=str(log_path),
-            output=asyncio.Queue(),
+            output=asyncio.Queue(maxsize=MAX_PENDING_OUTPUT),
             log_handle=log_handle,
         )
         self._prune_closed()
@@ -241,6 +265,8 @@ class TerminalManager:
             return
         try:
             data = os.read(session.master_fd, CHUNK)
+        except BlockingIOError:
+            return  # the master fd is non-blocking; nothing to read after all
         except OSError:
             data = b""
         if not data:
@@ -248,7 +274,29 @@ class TerminalManager:
             return
         text = session.decoder.decode(data)  # type: ignore[union-attr]
         self._log(session, text)
-        session.output.put_nowait(text)
+        self._queue_output(session, text)
+
+    def _queue_output(self, session: TerminalSession, text: str) -> None:
+        """Hand output to the websocket pump, keeping the queue bounded.
+
+        When the browser falls behind, the oldest waiting output is discarded
+        and the operator is told once that the transcript has a gap.
+        """
+        if session.output.full():
+            dropped = 0
+            while not session.output.empty():
+                try:
+                    session.output.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - emptied just above
+                    break
+                dropped += 1
+            if dropped and not session.output_dropped:
+                session.output_dropped = True
+                text = OUTPUT_DROPPED_NOTICE + text
+        try:
+            session.output.put_nowait(text)
+        except asyncio.QueueFull:  # pragma: no cover - the queue was just drained
+            pass
 
     def _pump_closed(self, session: TerminalSession) -> None:
         """The shell is gone: stop watching the fd and tell the pump once.
@@ -261,24 +309,65 @@ class TerminalManager:
         if session.closed or session.eof:
             return
         session.eof = True
+        self._stop_writes(session)
         try:
             asyncio.get_running_loop().remove_reader(session.master_fd)
         except (RuntimeError, ValueError):
             pass
+        # The pump needs the sentinel; make room for it if the client is a
+        # whole queue behind, otherwise the backlog would block it.
+        if session.output.full():
+            while not session.output.empty():
+                try:
+                    session.output.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - emptied just above
+                    break
         session.output.put_nowait(None)
 
     def write(self, session_id: str, data: str) -> None:
+        """Send input to the shell without blocking the event loop.
+
+        A PTY master blocks once the tty input buffer is full - a large paste
+        into a program that is not reading (a running ``sleep``, a pager) is
+        enough - and blocking here would freeze every request the panel
+        serves. What cannot be written now is flushed when the shell is ready.
+        """
         session = self._get(session_id)
         if session.closed or session.eof:
             raise ValueError("session is closed")
-        payload = data.encode("utf-8")
+        if not data:
+            return
+        session.write_pending += data.encode("utf-8")
+        self._flush_writes(session)
+
+    def _flush_writes(self, session: TerminalSession) -> None:
+        """Write as much buffered input as the shell accepts right now."""
+        loop = asyncio.get_running_loop()
+        while session.write_pending:
+            try:
+                written = os.write(session.master_fd, session.write_pending)
+            except BlockingIOError:
+                # The shell is not reading yet: finish from the event loop.
+                try:
+                    loop.add_writer(session.master_fd, self._flush_writes, session)
+                except (RuntimeError, ValueError):
+                    pass
+                return
+            except OSError as exc:
+                self._stop_writes(session)
+                raise ValueError(f"the shell is no longer accepting input: {exc}")
+            if written <= 0:  # pragma: no cover - defensive
+                break
+            session.write_pending = session.write_pending[written:]
+        self._stop_writes(session)
+
+    def _stop_writes(self, session: TerminalSession) -> None:
+        """Stop watching the master fd for writability and drop pending input."""
+        session.write_pending = b""
         try:
-            # os.write may take only part of a large paste; finish the job.
-            while payload:
-                written = os.write(session.master_fd, payload)
-                payload = payload[written:]
-        except OSError as exc:
-            raise ValueError(f"the shell is no longer accepting input: {exc}")
+            asyncio.get_running_loop().remove_writer(session.master_fd)
+        except (RuntimeError, ValueError):
+            pass
 
     def resize(self, session_id: str, cols: object, rows: object) -> None:
         session = self._get(session_id)
@@ -299,6 +388,7 @@ class TerminalManager:
         if not session.closed:
             session.closed = True
             session.closed_at = now_iso()
+            self._stop_writes(session)
             try:
                 asyncio.get_running_loop().remove_reader(session.master_fd)
             except (RuntimeError, ValueError):

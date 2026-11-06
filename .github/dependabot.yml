@@ -1,15 +1,16 @@
 version: 2
-registries:
-  pypi:
-    type: pip
-    url: https://pypi.org/simple
 
 updates:
   # Python: the panel itself plus the dev tooling. pip and setuptools get
   # weekly churn; the web stack is pinned to the major.
+  #
+  # Only ecosystems that exist are listed here: the panel has no JavaScript
+  # manifest (Node is used by CI to lint and test the static files, nothing
+  # is installed from a package.json), and Dependabot has no package
+  # ecosystem for Debian packages, so an apt watcher could never open a
+  # pull request.
   - package-ecosystem: "pip"
     directory: "/"
-    registry: "pypi"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
@@ -23,27 +24,4 @@ updates:
         exclude-patterns: []
     ignore:
       - dependency-name: "setuptools"
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
-
-  # JavaScript: the panel's only web dependency is websockets, but keep the
-  # tooling that lints and builds the panel current.
-  - package-ecosystem: "npm"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    ignore:
-      - dependency-name: "*"
-
-  # OS packages: the Debian family targets these utilities, so security
-  # fixes for them land first.
-  - package-ecosystem: "deb"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 3
-    ignore:
-      - dependency-name: "unattended-upgrades"
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
-      - dependency-name: "iproute2"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]

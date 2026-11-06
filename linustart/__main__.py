@@ -23,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, help="path to config.json")
     parser.add_argument("--token", help="authentication token (overrides the config file)")
     parser.add_argument(
+        "--trusted-proxy",
+        action="append",
+        metavar="ADDRESS",
+        help="reverse proxy whose X-Forwarded-For is believed (repeatable, e.g. 127.0.0.1/32)",
+    )
+    parser.add_argument(
         "--no-auth",
         action="store_true",
         help="disable token authentication (only use on localhost or behind a proxy)",
@@ -41,6 +47,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         port=args.port,
         token=args.token,
         no_auth=args.no_auth,
+        trusted_proxies=args.trusted_proxy,
     )
     loopback = settings.host in ("127.0.0.1", "localhost", "::1")
     if not loopback and not settings.auth_enabled:
@@ -66,9 +73,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
 
+    from .ratelimit import parse_trusted_proxies
+
+    try:
+        parse_trusted_proxies(settings.trusted_proxies)
+    except ValueError as exc:
+        print(f"invalid trusted proxy: {exc}", file=sys.stderr)
+        return 2
+
     import uvicorn
 
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_level="info")
+    uvicorn.run(
+        create_app(settings),
+        host=settings.host,
+        port=settings.port,
+        log_level="info",
+        # Uvicorn believes X-Forwarded-For from loopback peers by default,
+        # which would quietly put a second trust list in front of the
+        # throttle's own (--trusted-proxy). Only one of them may decide.
+        proxy_headers=False,
+    )
     return 0
 
 

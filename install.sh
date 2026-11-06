@@ -8,6 +8,7 @@
 #   ./install.sh --source            # install this checkout instead of the latest release
 #   ./install.sh --loopback          # bind 127.0.0.1 only (access over an SSH tunnel)
 #   ./install.sh --host 0.0.0.0 --port 8765
+#   ./install.sh --trusted-proxy 10.0.0.0/8  # trust that proxy's X-Forwarded-For
 #   ./install.sh --uninstall         # remove the service and files, list what LinuStart changed
 #   ./install.sh --purge             # --uninstall, and also delete its config and state
 #
@@ -32,6 +33,10 @@ PORT_SET=0
 UNINSTALL=0
 PURGE=0
 RESTART_NEEDED=0
+# Proxies named with --trusted-proxy, trusted without asking; the list is what
+# unattended installs use instead of answering the prompt.
+TRUSTED_FLAG=0
+TRUSTED_PROXIES=()
 # An install is a released version: cloning main gives you a tree ahead of
 # every tag, so the newest release is what gets installed unless --source
 # says otherwise. The panel then reports a version that matches the release
@@ -41,7 +46,7 @@ REPO="${LINUSTART_REPO:-daygle/LinuStart}"
 TAG_PATTERN='^v?[0-9]+(\.[0-9]+){0,3}([-.][0-9A-Za-z.]+)?$'
 
 usage() {
-    sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -52,6 +57,12 @@ while [[ $# -gt 0 ]]; do
         --loopback)  HOST="127.0.0.1"; HOST_SET=1 ;;
         --host)      HOST="${2:-}"; HOST_SET=1; shift ;;
         --port)      PORT="${2:-}"; PORT_SET=1; shift ;;
+        --trusted-proxy)
+            if [[ -z "${2:-}" ]]; then
+                echo "--trusted-proxy needs an address, for example: --trusted-proxy 127.0.0.1/32" >&2
+                exit 1
+            fi
+            TRUSTED_PROXIES+=("$2"); TRUSTED_FLAG=1; shift ;;
         -h|--help)   usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -65,6 +76,30 @@ fi
 if [[ "$HOST_SET" -eq 1 && -z "$HOST" ]]; then
     echo "--host needs an address, for example: --host 127.0.0.1" >&2
     exit 1
+fi
+
+# These addresses are written into the config without a prompt, and the panel
+# refuses to start on a bad entry (deliberately: ignoring a typo would leave the
+# throttle looking per-client while it is not), so a typo has to stop the
+# install here rather than leave an unattended server unable to boot.
+if [[ "$TRUSTED_FLAG" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+    BAD_TRUSTED="$(python3 - "${TRUSTED_PROXIES[@]}" <<'PY'
+import ipaddress
+import sys
+
+for value in sys.argv[1:]:
+    try:
+        ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        print(value)
+        break
+PY
+)" || BAD_TRUSTED="?"
+    if [[ -n "$BAD_TRUSTED" ]]; then
+        echo "Invalid --trusted-proxy address: '$BAD_TRUSTED'" >&2
+        echo "  use an IP address or CIDR range, for example: --trusted-proxy 10.0.0.0/8" >&2
+        exit 1
+    fi
 fi
 
 is_loopback() {
@@ -368,6 +403,222 @@ PY
     echo "    A new access token was generated (also stored in $CONFIG_FILE):"
     echo "    $TOKEN"
     echo ""
+fi
+
+# --- reverse proxy detection: trusted_proxies -------------------------------
+# A proxy in front of the panel makes every request arrive from the proxy's own
+# address, so unless the panel is told to believe that proxy's X-Forwarded-For
+# every visitor shares one access-token lockout and one guesser locks out the
+# rest. Only a proxy whose own configuration forwards to this port counts: an
+# nginx fronting something else must not change the panel's settings.
+proxy_config_files() {
+    local file
+    for file in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* \
+        /etc/caddy/Caddyfile /etc/caddy/conf.d/*.caddyfile \
+        /etc/apache2/apache2.conf /etc/apache2/conf-enabled/*.conf /etc/apache2/sites-enabled/* \
+        /etc/haproxy/haproxy.cfg /etc/traefik/*.yml /etc/traefik/*.yaml /etc/traefik/*.toml; do
+        if [[ -f "$file" ]]; then
+            printf '%s\n' "$file"
+        fi
+    done
+}
+
+proxy_name() {
+    case "$1" in
+        */nginx/*) printf 'nginx' ;;
+        */caddy/*) printf 'Caddy' ;;
+        */apache2/*) printf 'Apache' ;;
+        */haproxy/*) printf 'HAProxy' ;;
+        */traefik/*) printf 'Traefik' ;;
+        *) printf 'a reverse proxy' ;;
+    esac
+}
+
+# Lines of <file> that forward to <port>: the proxy directive is what counts,
+# not any mention of the number (a listen port or a log name is not a proxy).
+proxy_forward_lines() {
+    grep -iE '(proxy_pass|reverse_proxy|proxypass|server[[:space:]]|backend[[:space:]]|url:)[^#]*:'"$2"'([^0-9]|$)' \
+        "$1" 2>/dev/null || true
+}
+
+# "<name>|<file>" for every proxy configured to forward to <port>.
+detect_reverse_proxies() {
+    local port="$1" file
+    while IFS= read -r file; do
+        if [[ -n "$(proxy_forward_lines "$file" "$port")" ]]; then
+            printf '%s|%s\n' "$(proxy_name "$file")" "$file"
+        fi
+    done < <(proxy_config_files)
+}
+
+# Addresses such a proxy connects to the panel from: the literal IPv4 in its
+# forward target, or loopback when that target is localhost or a hostname.
+proxy_addresses() {
+    local port="$1" file targets addresses address
+    while IFS= read -r file; do
+        targets="$(proxy_forward_lines "$file" "$port")"
+        if [[ -z "$targets" ]]; then
+            continue
+        fi
+        addresses="$(printf '%s\n' "$targets" \
+            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:'"$port" \
+            | cut -d: -f1 | sort -u || true)"
+        if [[ -z "$addresses" ]]; then
+            printf '127.0.0.1/32\n::1/128\n'
+            continue
+        fi
+        while IFS= read -r address; do
+            case "$address" in
+                0.0.0.0|127.*) printf '127.0.0.1/32\n::1/128\n' ;;
+                *) printf '%s/32\n' "$address" ;;
+            esac
+        done <<< "$addresses"
+    done < <(proxy_config_files)
+}
+# --- end reverse proxy detection --------------------------------------------
+
+# The panel itself is the authority on which proxies it believes; the installer
+# only offers what it can see, and never edits an existing setting by itself -
+# --trusted-proxy is the operator saying what to trust, so that is applied.
+EXISTING_TRUSTED=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    EXISTING_TRUSTED="$(python3 - "$CONFIG_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle).get("trusted_proxies")
+if isinstance(value, str):
+    value = [value]
+print(", ".join(str(item) for item in value) if isinstance(value, list) else "")
+PY
+)"
+fi
+
+# The ["a", "b"] form of a list, for the messages and the hand-add hint.
+trusted_shown() {
+    local shown
+    shown="$(printf '"%s", ' "$@")"
+    printf '[%s]' "${shown%, }"
+}
+
+# Add addresses to trusted_proxies, keeping every entry already there, and say
+# what happened. Returns non-zero (having printed the line to add by hand) when
+# the config could not be written.
+add_trusted_proxies() {
+    local shown added status=0
+    shown="$(trusted_shown "$@")"
+    # Prints how many addresses were new; ``added`` is captured, not shown.
+    added="$(python3 - "$CONFIG_FILE" "$@" <<'MERGE'
+import json
+import os
+import sys
+import tempfile
+
+path, *addresses = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    config = json.load(handle)
+current = config.get("trusted_proxies")
+if isinstance(current, str):
+    current = [current]
+if not isinstance(current, list):
+    current = []
+merged = [str(item) for item in current]
+for address in addresses:
+    if address not in merged:
+        merged.append(address)
+if len(merged) == len(current):
+    print(0)
+    sys.exit(0)
+config["trusted_proxies"] = merged
+# Written beside the file and renamed into place: an interrupted install must
+# not leave a half-written config that the service cannot start from.
+handle, temporary = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".linustart-")
+with os.fdopen(handle, "w", encoding="utf-8") as out:
+    json.dump(config, out, indent=2)
+    out.write("\n")
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+print(len(merged) - len(current))
+MERGE
+)" || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        echo "    Could not update $CONFIG_FILE; add this line by hand:" >&2
+        echo "      \"trusted_proxies\": $shown" >&2
+        return 1
+    fi
+    if [[ "$added" == 0 ]]; then
+        echo "    Already in trusted_proxies: $shown"
+        return 0
+    fi
+    # An upgrade has a unit running with the old config already.
+    if [[ -f "$SERVICE_FILE" ]]; then
+        RESTART_NEEDED=1
+    fi
+    echo "    Added $shown to trusted_proxies"
+}
+
+# Addresses given on the command line are trusted without a prompt: that is what
+# lets an unattended install opt in instead of being told to edit the config.
+# Detection is skipped for the same reason - the operator has already said which
+# proxies face the panel.
+DETECTED_PROXIES=""
+if [[ "$TRUSTED_FLAG" -eq 0 && -z "$EXISTING_TRUSTED" ]]; then
+    DETECTED_PROXIES="$(detect_reverse_proxies "$BIND_PORT")"
+fi
+if [[ "$TRUSTED_FLAG" -eq 1 ]]; then
+    echo "==> Trusting the reverse proxies named on the command line"
+    add_trusted_proxies "${TRUSTED_PROXIES[@]}" || true
+elif [[ -n "$EXISTING_TRUSTED" ]]; then
+    echo "==> Reverse proxies already trusted ($EXISTING_TRUSTED); leaving $CONFIG_FILE alone"
+elif [[ -n "$DETECTED_PROXIES" ]]; then
+    echo "==> Reverse proxy in front of port $BIND_PORT"
+    while IFS='|' read -r PROXY_NAME PROXY_FILE; do
+        if [[ -n "$PROXY_NAME" ]]; then
+            echo "    $PROXY_NAME forwards to the panel ($PROXY_FILE)"
+        fi
+    done <<< "$DETECTED_PROXIES"
+
+    TRUSTED=()
+    while IFS= read -r address; do
+        if [[ -z "$address" ]]; then
+            continue
+        fi
+        case " ${TRUSTED[*]-} " in
+            *" $address "*) ;;
+            *) TRUSTED+=("$address") ;;
+        esac
+    done < <(proxy_addresses "$BIND_PORT")
+    if [[ ${#TRUSTED[@]} -eq 0 ]]; then
+        TRUSTED=("127.0.0.1/32" "::1/128")
+    fi
+    TRUSTED_SHOWN="$(trusted_shown "${TRUSTED[@]}")"
+    TRUSTS_LOOPBACK=0
+    for address in "${TRUSTED[@]}"; do
+        case "$address" in
+            127.*|::1/*) TRUSTS_LOOPBACK=1 ;;
+        esac
+    done
+
+    echo "    The panel sees the proxy's address instead of each visitor's, so"
+    echo "    without this list all visitors share one lockout and one wrong-token"
+    echo "    guesser locks out the rest."
+    if [[ "$TRUSTS_LOOPBACK" -eq 1 ]]; then
+        echo "    Loopback is also where SSH tunnels arrive, so this trusts them too."
+    fi
+    if [[ -t 0 ]]; then
+        read -r -p "    Believe X-Forwarded-For from ${TRUSTED[*]}? [y/N] " reply
+        if [[ "${reply,,}" == y* ]]; then
+            add_trusted_proxies "${TRUSTED[@]}" || true
+        else
+            echo "    Left alone. Per-client throttling needs this list, so add it"
+            echo "    later if a proxy really faces the panel (see the README)."
+        fi
+    else
+        echo "    Non-interactive install; add this line to $CONFIG_FILE and"
+        echo "    restart the service (systemctl restart linustart) if it applies:"
+        echo "      \"trusted_proxies\": $TRUSTED_SHOWN"
+    fi
 fi
 
 echo "==> Installing systemd service"
