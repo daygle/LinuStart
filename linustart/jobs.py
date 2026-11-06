@@ -6,7 +6,7 @@ import asyncio
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Set
 
 from .util import now_iso
 
@@ -37,6 +37,9 @@ class Job:
     created_at: str = field(default_factory=now_iso)
     finished_at: Optional[str] = None
     cancel_requested: bool = False
+    # Lines already dropped from the front of ``lines``; ``log_slice`` offsets
+    # count every line ever produced, so trimming must not shift them.
+    dropped: int = 0
     _proc: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
 
     def to_dict(self, *, include_argv: bool = False) -> Dict[str, object]:
@@ -56,7 +59,13 @@ class Job:
         return data
 
     def log_slice(self, after: int = 0) -> List[str]:
-        return self.lines[after:]
+        """Lines the caller has not seen yet.
+
+        ``after`` counts lines produced since the job started, so the oldest
+        lines being dropped (MAX_LOG_LINES) must not shift it: otherwise a
+        client polling past the cap would stop receiving output for good.
+        """
+        return self.lines[max(0, after - self.dropped):]
 
 
 class JobManager:
@@ -65,6 +74,10 @@ class JobManager:
     def __init__(self) -> None:
         self.jobs: Dict[str, Job] = {}
         self._order: List[str] = []
+        # asyncio keeps only a weak reference to a task: without a strong one
+        # here a runner can be garbage-collected mid-job, leaving it "running"
+        # for ever with its subprocess unsupervised.
+        self._tasks: Set["asyncio.Task[None]"] = set()
 
     async def start(
         self,
@@ -83,7 +96,9 @@ class JobManager:
         self._prune()
         self.jobs[job.id] = job
         self._order.append(job.id)
-        asyncio.get_running_loop().create_task(self._runner(job, dict(env or {}), stdin_text))
+        task = asyncio.get_running_loop().create_task(self._runner(job, dict(env or {}), stdin_text))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return job
 
     async def _runner(self, job: Job, env: Mapping[str, str], stdin_text: Optional[str] = None) -> None:
@@ -122,7 +137,9 @@ class JobManager:
                 break
             job.lines.append(line.decode("utf-8", errors="replace").rstrip("\n"))
             if len(job.lines) > MAX_LOG_LINES:
-                del job.lines[: len(job.lines) - MAX_LOG_LINES]
+                trimmed = len(job.lines) - MAX_LOG_LINES
+                del job.lines[:trimmed]
+                job.dropped += trimmed  # keeps polling offsets valid
         job.returncode = await proc.wait()
         job._proc = None
         job.finished_at = now_iso()

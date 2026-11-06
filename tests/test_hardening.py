@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import os
 import pathlib
 import stat
@@ -316,8 +317,8 @@ def test_job_survives_an_overlong_output_line():
 # API authentication and the terminal WebSocket
 # --------------------------------------------------------------------------
 
-@pytest.fixture
-def client(tmp_path, monkeypatch):
+def _test_client(tmp_path, monkeypatch, *, peer=("testclient", 50000), **settings_kwargs):
+    """An app on a scratch state directory, with a chosen transport peer."""
     from fastapi.testclient import TestClient
 
     from linustart import audit
@@ -332,8 +333,13 @@ def client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(metrics_mod, "METRICS_FILE", tmp_path / "metrics.json")
     monkeypatch.setattr(metrics_mod, "ALERTS_FILE", tmp_path / "alerts.json")
-    app = create_app(Settings(token="s3cret-token"))
-    with TestClient(app) as test_client:
+    app = create_app(Settings(token="s3cret-token", **settings_kwargs))
+    return TestClient(app, client=peer)
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    with _test_client(tmp_path, monkeypatch) as test_client:
         yield test_client
 
 
@@ -377,6 +383,9 @@ def test_no_auth_flag_overrides_the_public_bind_refusal(monkeypatch, tmp_path):
     assert not started
     assert cli.main(["--config", missing, "--host", "0.0.0.0", "--no-auth"]) == 0
     assert started and started[0]["host"] == "0.0.0.0"
+    # uvicorn must not apply its own loopback X-Forwarded-For trust on top of
+    # the throttle's --trusted-proxy list
+    assert started[0]["proxy_headers"] is False
 
 
 def test_terminal_ws_origin_check_allows_reverse_proxies(client):
@@ -535,6 +544,79 @@ def test_requests_without_a_token_are_not_counted(client):
     assert client.get("/api/audit", headers={"Authorization": "Bearer s3cret-token"}).status_code == 200
 
 
+def test_client_address_walks_forwarded_for_from_the_right():
+    from linustart.ratelimit import client_address, parse_trusted_proxies
+
+    trusted = parse_trusted_proxies(["127.0.0.1/32", "10.0.0.0/8"])
+    # no trusted proxy configured: the header is ignored, whoever sends it
+    assert client_address("198.51.100.10", "203.0.113.5") == "198.51.100.10"
+    # a trusted peer reports the client
+    assert client_address("127.0.0.1", "203.0.113.5", trusted) == "203.0.113.5"
+    # hops left of the client are that client's own forged header
+    assert client_address("127.0.0.1", "1.2.3.4, 203.0.113.5", trusted) == "203.0.113.5"
+    # an inner trusted proxy is skipped, and its client is used
+    assert client_address("127.0.0.1", "203.0.113.5, 10.0.0.7", trusted) == "203.0.113.5"
+    # only our own proxies in the chain: keep the peer rather than guess
+    assert client_address("127.0.0.1", "10.0.0.7, 10.0.0.8", trusted) == "127.0.0.1"
+    # a garbled chain is not guessed at, but a trailing comma is harmless
+    assert client_address("127.0.0.1", "203.0.113.5, nonsense", trusted) == "127.0.0.1"
+    assert client_address("127.0.0.1", "203.0.113.5,", trusted) == "203.0.113.5"
+    # ports, brackets and IPv4-mapped IPv6 are normalised to one client
+    assert client_address("127.0.0.1", "203.0.113.5:4431", trusted) == "203.0.113.5"
+    assert client_address("::1", "[2001:db8::1]:443", parse_trusted_proxies(["::1"])) == "2001:db8::1"
+    assert client_address("127.0.0.1", "::ffff:203.0.113.5", trusted) == "203.0.113.5"
+
+
+def test_a_bad_trusted_proxy_is_refused():
+    from linustart.ratelimit import parse_trusted_proxies
+
+    assert parse_trusted_proxies(["127.0.0.1/32", "2001:db8::/32"])
+    with pytest.raises(ValueError):
+        parse_trusted_proxies(["not-an-address"])
+
+
+def test_config_and_cli_carry_the_trusted_proxies(tmp_path):
+    from linustart.settings import load_settings
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"trusted_proxies": ["127.0.0.1/32", " "]}))
+    assert load_settings(config_path=path).trusted_proxies == ("127.0.0.1/32",)
+    # the command line overrides the file, like --token does
+    assert load_settings(config_path=path, trusted_proxies=["10.0.0.0/8"]).trusted_proxies == (
+        "10.0.0.0/8",
+    )
+
+
+def test_a_trusted_proxy_gives_each_client_its_own_lockout(tmp_path, monkeypatch):
+    with _test_client(
+        tmp_path, monkeypatch, peer=("127.0.0.1", 40000), trusted_proxies=["127.0.0.1/32"]
+    ) as test_client:
+        bad = {"Authorization": "Bearer guess", "X-Forwarded-For": "203.0.113.5"}
+        for _ in range(10):
+            assert test_client.get("/api/audit", headers=bad).status_code == 401
+        locked = test_client.get(
+            "/api/audit", headers={**bad, "Authorization": "Bearer s3cret-token"}
+        )
+        assert locked.status_code == 429  # that client is locked out
+        other = test_client.get(
+            "/api/audit",
+            headers={"Authorization": "Bearer s3cret-token", "X-Forwarded-For": "203.0.113.6"},
+        )
+        assert other.status_code == 200  # a different client behind it is not
+
+
+def test_forwarded_for_cannot_dodge_a_lockout_from_an_untrusted_peer(tmp_path, monkeypatch):
+    with _test_client(tmp_path, monkeypatch, peer=("198.51.100.10", 40000)) as test_client:
+        for index in range(10):
+            headers = {"Authorization": "Bearer guess", "X-Forwarded-For": f"203.0.113.{index}"}
+            assert test_client.get("/api/audit", headers=headers).status_code == 401
+        moved = test_client.get(
+            "/api/audit",
+            headers={"Authorization": "Bearer s3cret-token", "X-Forwarded-For": "192.0.2.77"},
+        )
+        assert moved.status_code == 429  # a new invented address changes nothing
+
+
 def test_terminal_closes_idle_sessions(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -565,3 +647,163 @@ def test_terminal_closes_idle_sessions(tmp_path, monkeypatch):
             time.sleep(0.1)
     assert kinds[-1] == {"type": "closed", "detail": "idle timeout"}
     assert "idle timeout" in (tmp_path / "audit.log").read_text()
+
+
+# --------------------------------------------------------------------------
+# Long-running state stays bounded and keeps working
+# --------------------------------------------------------------------------
+
+def test_throttle_forgets_expired_lockouts_and_stays_bounded(monkeypatch):
+    from linustart import ratelimit
+
+    monkeypatch.setattr(ratelimit, "MAX_TRACKED", 8)
+    now = [0.0]
+    throttle = ratelimit.AuthThrottle(max_failures=1, window=60, lockout=600, clock=lambda: now[0])
+    # a flood from many addresses, each locked out once by its first guess
+    for index in range(200):
+        throttle.failure(f"10.0.0.{index}")
+    assert len(throttle._locked_until) <= 8
+    assert len(throttle._failures) <= 8
+    # once every lockout has expired, the state is swept instead of kept
+    now[0] += 1000
+    throttle.failure("fresh")
+    assert list(throttle._locked_until) == ["fresh"]
+
+
+def test_job_log_offsets_survive_trimming(monkeypatch):
+    from linustart import jobs
+
+    monkeypatch.setattr(jobs, "MAX_LOG_LINES", 5)
+
+    async def scenario():
+        manager = jobs.JobManager()
+        job = await manager.start(
+            "t", "trim", [sys.executable, "-u", "-c", "for i in range(12): print(i)"]
+        )
+        for _ in range(400):
+            if job.status != "running":
+                break
+            await asyncio.sleep(0.01)
+        return manager, job
+
+    manager, job = asyncio.run(scenario())
+    assert job.status == STATUS_SUCCEEDED and job.lines[-1] == "11"
+    assert job.dropped == 12 - len(job.lines)  # seven oldest lines went
+    # a client that had read ten lines still gets the rest, not an empty page
+    assert job.log_slice(10) == ["10", "11"]
+    assert job.log_slice(12) == []
+    assert job.log_slice(0) == job.lines  # nothing older is available any more
+    assert not manager._tasks  # finished runners are released
+
+
+def test_job_manager_keeps_a_reference_to_its_runners():
+    async def scenario():
+        from linustart.jobs import JobManager
+
+        manager = JobManager()
+        job = await manager.start("t", "sleep", [sys.executable, "-c", "import time; time.sleep(0.2)"])
+        # asyncio itself holds only a weak reference: this is what keeps the
+        # runner alive until it finishes
+        assert manager._tasks
+        while job.status == "running":
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0)
+        return manager, job
+
+    manager, job = asyncio.run(scenario())
+    assert job.status == STATUS_SUCCEEDED
+    assert not manager._tasks
+
+
+def test_a_failed_alert_does_not_stop_the_sampler(tmp_path, monkeypatch):
+    from linustart import audit, metrics
+
+    monkeypatch.setattr(audit, "AUDIT_LOG", tmp_path / "audit.log")
+    monkeypatch.setattr(
+        metrics,
+        "load_alert_config",
+        lambda: {
+            **metrics.DEFAULT_ALERTS, "enabled": True, "cpu": 50,
+            "mem": 100, "disk": 100, "load_per_cpu": 100, "sustain_minutes": 1,
+        },
+    )
+
+    async def failing_mail(_event):
+        raise RuntimeError("the mail relay is down")
+
+    async def scenario():
+        recorder = metrics.MetricsRecorder(interval=60)  # sustain: one sample
+        recorder.sample = lambda: {"t": 1, "cpu": 99.0, "mem": 1.0, "disk": 1.0, "load": 0.0}
+        recorder.task = asyncio.get_running_loop().create_task(recorder.run(failing_mail))
+        await asyncio.sleep(0.05)
+        alive = recorder.task is not None and not recorder.task.done()
+        recorder.persist = lambda: None  # keep the state file out of the real /var/lib
+        if recorder.task:
+            recorder.task.cancel()
+            try:
+                await recorder.task
+            except asyncio.CancelledError:
+                pass
+        return alive
+
+    assert asyncio.run(scenario())  # was: task died with the RuntimeError
+    assert "the mail relay is down" in (tmp_path / "audit.log").read_text()
+
+
+def test_terminal_output_queue_is_bounded_and_reports_drops():
+    from linustart import terminal
+
+    session = terminal.TerminalSession(
+        id="q", user="root", argv=[], cols=80, rows=24, proc=None,  # type: ignore[arg-type]
+        master_fd=-1, log_path="/dev/null",
+    )
+    manager = terminal.TerminalManager()
+    for index in range(terminal.MAX_PENDING_OUTPUT):
+        manager._queue_output(session, f"chunk {index}")
+    assert session.output.qsize() == terminal.MAX_PENDING_OUTPUT
+    # one chunk more: the backlog is dropped, the newest survives and the gap
+    # is reported once
+    manager._queue_output(session, "newest")
+    assert session.output.qsize() <= terminal.MAX_PENDING_OUTPUT
+    assert session.output.get_nowait().startswith(terminal.OUTPUT_DROPPED_NOTICE)
+    assert session.output_dropped
+    for index in range(terminal.MAX_PENDING_OUTPUT * 2):
+        manager._queue_output(session, f"more {index}")
+    assert session.output.qsize() <= terminal.MAX_PENDING_OUTPUT
+
+
+def test_terminal_write_buffers_instead_of_blocking_the_loop():
+    pty_mod = pytest.importorskip("pty")
+    import select
+
+    from linustart import terminal
+
+    async def scenario():
+        master, slave = pty_mod.openpty()
+        os.set_blocking(master, False)
+        session = terminal.TerminalSession(
+            id="w", user="root", argv=[], cols=80, rows=24, proc=None,  # type: ignore[arg-type]
+            master_fd=master, log_path="/dev/null",
+        )
+        manager = terminal.TerminalManager()
+        manager.sessions[session.id] = session
+        try:
+            # nobody reads the slave, so the tty buffer fills after ~4 KiB.
+            # Complete lines, because a canonical tty hands data over per line.
+            manager.write(session.id, ("x" * 1023 + "\n") * 256)
+            pending = len(session.write_pending)
+            # the shell starts reading: what was buffered is flushed again
+            os.set_blocking(slave, False)
+            for _ in range(64):
+                while select.select([slave], [], [], 0)[0]:
+                    os.read(slave, 65536)
+                manager._flush_writes(session)
+            return pending, len(session.write_pending)
+        finally:
+            manager._stop_writes(session)
+            os.close(master)
+            os.close(slave)
+
+    pending, left = asyncio.run(scenario())
+    assert pending > 0  # not lost, and the call returned instead of hanging
+    assert left < pending

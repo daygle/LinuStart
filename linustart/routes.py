@@ -37,7 +37,7 @@ from .modules import sysinfo as sysinfo_mod
 from .modules import timezone as timezone_mod
 from .modules import unattended as unattended_mod
 from .modules import users as users_mod
-from .ratelimit import AuthThrottle, client_key
+from .ratelimit import AuthThrottle, client_address, parse_trusted_proxies
 from .sessions import SessionManager
 from .settings import Settings
 from .terminal import TerminalManager
@@ -275,6 +275,18 @@ def build_router(
         )
 
     throttle = AuthThrottle()
+    # An invalid entry fails app creation rather than silently leaving the
+    # throttle keyed on the proxy, which is what it would look like anyway.
+    trusted_proxies = parse_trusted_proxies(settings.trusted_proxies)
+
+    def client_of(connection: Union[Request, WebSocket]) -> str:
+        """The address the throttle counts, honouring a trusted proxy's
+        X-Forwarded-For report instead of the proxy's own address."""
+        return client_address(
+            connection.client.host if connection.client else None,
+            connection.headers.get("x-forwarded-for"),
+            trusted_proxies,
+        )
 
     def locked_out(key: str) -> int:
         return throttle.retry_after(key)
@@ -291,7 +303,7 @@ def build_router(
     async def require_auth(request: Request, authorization: Optional[str] = Header(None)) -> None:
         if not settings.auth_enabled:
             return
-        key = client_key(request.client.host if request.client else None)
+        key = client_of(request)
         wait = locked_out(key)
         if wait:
             raise HTTPException(
@@ -1589,7 +1601,7 @@ def build_router(
             return
         await websocket.accept()
         if settings.auth_enabled:
-            key = client_key(websocket.client.host if websocket.client else None)
+            key = client_of(websocket)
             if locked_out(key):
                 await websocket.close(code=4429)
                 return

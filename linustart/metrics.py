@@ -194,7 +194,10 @@ class MetricsRecorder:
             sample = self.sample()
             self.samples.append(sample)
             for event in self.evaluate(sample, load_alert_config()):
-                await notify(event)
+                try:
+                    await notify(event)
+                except Exception as exc:  # noqa: BLE001 - one bad email must not stop sampling
+                    audit.record("alert", f"notification failed: {exc}", ok=False)
             self._since_persist += 1
             if self._since_persist >= PERSIST_EVERY:
                 self._since_persist = 0
@@ -212,6 +215,8 @@ class MetricsRecorder:
                 await self.task
             except asyncio.CancelledError:
                 pass
+            except Exception as exc:  # noqa: BLE001 - a dead sampler must not break shutdown
+                audit.record("alert", f"sampler had stopped: {exc}", ok=False)
         self.persist()
 
 
