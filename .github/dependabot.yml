@@ -15,13 +15,16 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     groups:
+      # Every group needs at least one of patterns, dependency-type or
+      # update-types, or Dependabot rejects the whole file.
       pip-security:
         applies-to: security-updates
-        update-types:
-          - "patch"
-      pip-minor-and-major:
-        applies-to: "version-updates"
-        exclude-patterns: []
+        patterns:
+          - "*"
+      pip-version-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
     ignore:
       - dependency-name: "setuptools"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
